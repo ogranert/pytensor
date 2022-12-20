@@ -112,6 +112,22 @@ The current development branch of |Project Name| can be installed from GitHub, a
 
     pip install git+https://github.com/pymc-devs/pytensor
 
+Build Dependency
+------------------
+Packages installed during pip install git... (date 2022/12/20 - pytensor version 'untagged').
+
+* cons-0.4.5
+* etuples-0.3.8
+* filelock-3.8.2
+* logical-unification-0.4.5
+* miniKanren-1.0.3
+* multipledispatch-0.6.0
+* pytensor-2.8.11+62.gd7985536a
+* scipy-1.7.3
+* setuptools-65.6.3
+* six-1.16.0
+* toolz-0.12.0
+* typing-extensions-4.4.0
 
 Contributing
 ============

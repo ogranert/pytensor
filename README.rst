@@ -112,8 +112,11 @@ The current development branch of |Project Name| can be installed from GitHub, a
 
     pip install git+https://github.com/pymc-devs/pytensor
 
-Build Dependency
-------------------
+Build Instructions and Dependency
+---------------------------------
+PyTensor use `setuptools <https://setuptools.pypa.io/en/latest/userguide/index.html>`__ to provide package installation (build) and pip support.
+The setup configuration is read from the pyproject.toml file.
+
 Packages installed during pip install git... (date 2022/12/20 - pytensor version 'untagged').
 
 * cons-0.4.5

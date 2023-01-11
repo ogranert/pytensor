@@ -32,7 +32,7 @@ dependencies:
   - pytest-xdist
   - pytest-benchmark
   # For building docs
-  - sphinx>=5.1.0
+  - sphinx>=5.1.0,<6
   - sphinx_rtd_theme
   - pygments
   - pydot
@@ -50,4 +50,5 @@ dependencies:
   - typing_extensions
   # optional
   - cython
-
+  - graphviz
+  - pydot

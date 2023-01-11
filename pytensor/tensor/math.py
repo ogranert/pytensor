@@ -1385,6 +1385,11 @@ def gammal(k, x):
 
 
 @scalar_elemwise
+def hyp2f1(a, b, c, z):
+    """Gaussian hypergeometric function."""
+
+
+@scalar_elemwise
 def j0(x):
     """Bessel function of the first kind of order 0."""
 
@@ -1416,7 +1421,7 @@ def iv(v, x):
 
 @scalar_elemwise
 def sigmoid(x):
-    """Logistic sigmoid function (1 / (1 + exp(x)), also known as expit or inverse logit"""
+    """Logistic sigmoid function (1 / (1 + exp(-x)), also known as expit or inverse logit"""
 
 
 expit = sigmoid
@@ -3132,4 +3137,5 @@ __all__ = [
     "power",
     "logaddexp",
     "logsumexp",
+    "hyp2f1",
 ]

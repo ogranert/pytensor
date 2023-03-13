@@ -16,7 +16,7 @@ from pytensor.compile.function import function
 from pytensor.compile.mode import Mode, get_default_mode, get_mode
 from pytensor.compile.ops import DeepCopyOp, deep_copy_op
 from pytensor.configdefaults import config
-from pytensor.graph.basic import Apply, Constant, equal_computations
+from pytensor.graph.basic import Apply, equal_computations
 from pytensor.graph.fg import FunctionGraph
 from pytensor.graph.rewriting.basic import (
     SequentialNodeRewriter,
@@ -28,6 +28,7 @@ from pytensor.graph.rewriting.basic import (
 from pytensor.graph.rewriting.db import RewriteDatabaseQuery
 from pytensor.graph.rewriting.utils import is_same_graph, rewrite_graph
 from pytensor.misc.safe_asarray import _asarray
+from pytensor.printing import debugprint
 from pytensor.tensor import inplace
 from pytensor.tensor.basic import Alloc, join, switch
 from pytensor.tensor.blas import Dot22, Gemv
@@ -46,7 +47,6 @@ from pytensor.tensor.math import (
     bitwise_or,
     bitwise_xor,
     conj,
-    cos,
     cosh,
     deg2rad,
     dot,
@@ -59,14 +59,10 @@ from pytensor.tensor.math import (
     ge,
     gt,
     int_div,
-    invert,
-    iround,
     le,
     log,
     log1mexp,
     log1p,
-    log2,
-    log10,
     lt,
 )
 from pytensor.tensor.math import max as at_max
@@ -74,11 +70,20 @@ from pytensor.tensor.math import maximum
 from pytensor.tensor.math import min as at_min
 from pytensor.tensor.math import minimum, mul, neg, neq
 from pytensor.tensor.math import pow as at_pow
-from pytensor.tensor.math import prod, rad2deg, reciprocal
-from pytensor.tensor.math import round as at_round
-from pytensor.tensor.math import sgn, sigmoid, sin, sinh, softplus, sqr, sqrt, sub
+from pytensor.tensor.math import (
+    prod,
+    rad2deg,
+    reciprocal,
+    sigmoid,
+    sign,
+    sinh,
+    softplus,
+    sqr,
+    sqrt,
+    sub,
+)
 from pytensor.tensor.math import sum as at_sum
-from pytensor.tensor.math import tan, tanh, true_div, xor
+from pytensor.tensor.math import tanh, true_div, xor
 from pytensor.tensor.rewriting.elemwise import local_dimshuffle_lift
 from pytensor.tensor.rewriting.math import (
     compute_mul,
@@ -102,7 +107,6 @@ from pytensor.tensor.type import (
     dvector,
     fmatrices,
     fmatrix,
-    fscalar,
     ftensor4,
     fvector,
     imatrices,
@@ -132,9 +136,9 @@ rewrite_mode = get_mode(rewrite_mode)
 
 dimshuffle_lift = out2in(local_dimshuffle_lift)
 
-_stablize_rewrites = RewriteDatabaseQuery(include=["fast_run"])
-_stablize_rewrites.position_cutoff = 1.51
-_stablize_rewrites = optdb.query(_stablize_rewrites)
+_stabilize_rewrites = RewriteDatabaseQuery(include=["fast_run"])
+_stabilize_rewrites.position_cutoff = 1.51
+_stabilize_rewrites = optdb.query(_stabilize_rewrites)
 
 _specialize_rewrites = RewriteDatabaseQuery(include=["fast_run"])
 _specialize_rewrites.position_cutoff = 2.01
@@ -154,7 +158,7 @@ def rewrite(g, level="fast_run"):
     elif level == "specialize":
         _specialize_rewrites.rewrite(g)
     elif level == "stabilize":
-        _stablize_rewrites.rewrite(g)
+        _stabilize_rewrites.rewrite(g)
     else:
         raise ValueError(level)
     return g
@@ -844,7 +848,6 @@ class TestAlgebraicCanonizer:
                 ),
             ]
         ):
-
             if isinstance(out_dtype, dict):
                 out_dtype = out_dtype[config.cast_policy]
             f = function(list(sym_inputs), g, mode=mode)
@@ -874,7 +877,7 @@ class TestAlgebraicCanonizer:
             assert np.isfinite(f(0))
 
         assert len(f.maker.fgraph.toposort()) == 2
-        assert f.maker.fgraph.toposort()[0].op == sgn
+        assert f.maker.fgraph.toposort()[0].op == sign
 
         f = function([x], [(4 * x) / abs(x / 2)], mode=mode)
         f(0.1)
@@ -883,7 +886,7 @@ class TestAlgebraicCanonizer:
             assert np.isfinite(f(0))
 
         assert len(f.maker.fgraph.toposort()) == 2
-        assert f.maker.fgraph.toposort()[0].op == sgn
+        assert f.maker.fgraph.toposort()[0].op == sign
 
     @pytest.mark.skip(
         reason="Current implementation of AlgebraicCanonizer does not "
@@ -908,7 +911,7 @@ class TestAlgebraicCanonizer:
         mode = mode.__class__(linker=mode.linker, optimizer=rewrites)
         # test fail!
         # test x / y / z -> x / (y * z)
-        for (g, sym_inputs, val_inputs, out_dtype) in [
+        for g, sym_inputs, val_inputs, out_dtype in [
             ((dx / dy) / dz, [dx, dy, dz], [dxv, dyv, dzv], "float64"),
             ((fx / fy) / fz, [fx, fy, fz], [fxv, fyv, fzv], "float32"),
         ]:
@@ -923,7 +926,7 @@ class TestAlgebraicCanonizer:
             assert out_dtype == out.dtype
 
         # test x / (y / z) -> (x * z) / y
-        for (g, sym_inputs, val_inputs, out_dtype) in [
+        for g, sym_inputs, val_inputs, out_dtype in [
             (dx / (dy / dz), [dx, dy, dz], [dxv, dyv, dzv], "float64"),
             (fx / (fy / fz), [fx, fy, fz], [fxv, fyv, fzv], "float32"),
         ]:
@@ -1070,745 +1073,6 @@ def test_cast_in_mul_canonizer():
     )
     assert len([n for n in nodes if isinstance(n.op.scalar_op, aes.Cast)]) == 1
     f([1], [1])
-
-
-class TestFusion:
-    rewrites = RewriteDatabaseQuery(
-        include=[
-            "local_elemwise_fusion",
-            "composite_elemwise_fusion",
-            "canonicalize",
-            "inplace",
-        ],
-        exclude=["cxx_only", "BlasOpt"],
-    )
-    mode = Mode(get_default_mode().linker, rewrites)
-    _shared = staticmethod(shared)
-    topo_exclude = ()
-
-    def do(self, mode, shared_fn, shp, nb_repeat=1, assert_len_topo=True, slice=None):
-        """
-        param shared_fn: if None, will use function
-        verify that the elemwise fusion work
-        Test with and without DimShuffle
-        """
-        # TODO: disable the canonizer?
-        def my_init(shp, dtype="float64", num=0):
-            ret = np.zeros(shp, dtype=dtype) + num
-            return ret
-
-        fw, fx, fy, fz = (
-            tensor(dtype="float32", shape=(None,) * len(shp), name=n) for n in "wxyz"
-        )
-        dw, dx, dy, dz = (
-            tensor(dtype="float64", shape=(None,) * len(shp), name=n) for n in "wxyz"
-        )
-        ix, iy, iz = (
-            tensor(dtype="int32", shape=(None,) * len(shp), name=n) for n in "xyz"
-        )
-        fv = fvector("v")
-        fs = fscalar("s")
-
-        fwv = my_init(shp, "float32", 1)
-        fxv = my_init(shp, "float32", 2)
-        fyv = my_init(shp, "float32", 3)
-        fzv = my_init(shp, "float32", 4)
-        fvv = _asarray(np.random.random(shp[0]), dtype="float32")
-        fsv = np.asarray(np.random.random(), dtype="float32")
-        dwv = my_init(shp, "float64", 5)
-        ixv = _asarray(my_init(shp, num=60), dtype="int32")
-        iyv = _asarray(my_init(shp, num=70), dtype="int32")
-        izv = _asarray(my_init(shp, num=70), dtype="int32")
-        fwx = fw + fx
-        ftanx = tan(fx)
-        cases = [
-            (
-                fx + fy + fz,
-                (fx, fy, fz),
-                (fxv, fyv, fzv),
-                1,
-                fxv + fyv + fzv,
-                "float32",
-            ),  # 0
-            (
-                fx * fy * fz,
-                (fx, fy, fz),
-                (fxv, fyv, fzv),
-                1,
-                fxv * fyv * fzv,
-                "float32",
-            ),  # 1
-            (
-                fx + fy * fz,
-                (fx, fy, fz),
-                (fxv, fyv, fzv),
-                1,
-                fxv + fyv * fzv,
-                "float32",
-            ),  # 2
-            (
-                fx * fy + fz,
-                (fx, fy, fz),
-                (fxv, fyv, fzv),
-                1,
-                fxv * fyv + fzv,
-                "float32",
-            ),  # 3
-            (
-                fw + fx + fy + fz,
-                (fw, fx, fy, fz),
-                (fwv, fxv, fyv, fzv),
-                1,
-                fwv + fxv + fyv + fzv,
-                "float32",
-            ),
-            (
-                (fw + fx) + (fy + fz),
-                (fw, fx, fy, fz),
-                (fwv, fxv, fyv, fzv),
-                1,
-                fwv + fxv + fyv + fzv,
-                "float32",
-            ),  # 5
-            (
-                ((fw + fx) + fy) + fz,
-                (fw, fx, fy, fz),
-                (fwv, fxv, fyv, fzv),
-                1,
-                fwv + fxv + fyv + fzv,
-                "float32",
-            ),
-            (
-                (fw + (fx + fy)) + fz,
-                (fw, fx, fy, fz),
-                (fwv, fxv, fyv, fzv),
-                1,
-                fwv + fxv + fyv + fzv,
-                "float32",
-            ),
-            (
-                (fw + (fx + fy) + fz),
-                (fw, fx, fy, fz),
-                (fwv, fxv, fyv, fzv),
-                1,
-                fwv + fxv + fyv + fzv,
-                "float32",
-            ),
-            (
-                fw + (fx + (fy + fz)),
-                (fw, fx, fy, fz),
-                (fwv, fxv, fyv, fzv),
-                1,
-                fwv + fxv + fyv + fzv,
-                "float32",
-            ),
-            (
-                (fw + fx) + (fy + fz),
-                (fw, fx, fy, fz),
-                (fwv, fxv, fyv, fzv),
-                1,
-                fwv + fxv + fyv + fzv,
-                "float32",
-            ),  # 10
-            (
-                fw * fx * fy * fz,
-                (fw, fx, fy, fz),
-                (fwv, fxv, fyv, fzv),
-                1,
-                fwv * fxv * fyv * fzv,
-                "float32",
-            ),
-            (
-                fw + fx * fy * fz,
-                (fw, fx, fy, fz),
-                (fwv, fxv, fyv, fzv),
-                1,
-                fwv + fxv * fyv * fzv,
-                "float32",
-            ),
-            (
-                fx + fy * fz * fx,
-                (fx, fy, fz),
-                (fxv, fyv, fzv),
-                1,
-                fxv + fyv * fzv * fxv,
-                "float32",
-            ),
-            (
-                fx * fy + fz + fy,
-                (fx, fy, fz),
-                (fxv, fyv, fzv),
-                1,
-                fxv * fyv + fzv + fyv,
-                "float32",
-            ),
-            (
-                fx * fy * fz * fw + fx + fy + fz + fw,
-                (fw, fx, fy, fz),
-                (fwv, fxv, fyv, fzv),
-                1,
-                fxv * fyv * fzv * fwv + fxv + fyv + fzv + fwv,
-                "float32",
-            ),  # 15
-            # test with constant
-            (
-                (fw + fx) + (fy + fz) + 2.0,
-                (fw, fx, fy, fz),
-                (fwv, fxv, fyv, fzv),
-                1,
-                fwv + fxv + fyv + fzv + 2,
-                "float32",
-            ),
-            (
-                ((fw + fx) + 2.0 + fy) + fz,
-                (fw, fx, fy, fz),
-                (fwv, fxv, fyv, fzv),
-                1,
-                fwv + fxv + fyv + fzv + 2,
-                "float32",
-            ),
-            (
-                (fw + (fx + 2.0 + fy)) + fz,
-                (fw, fx, fy, fz),
-                (fwv, fxv, fyv, fzv),
-                1,
-                fwv + fxv + fyv + fzv + 2,
-                "float32",
-            ),
-            (
-                (fw + (fx + fy) + 2 + fz),
-                (fw, fx, fy, fz),
-                (fwv, fxv, fyv, fzv),
-                1,
-                fwv + fxv + fyv + fzv + 2,
-                "float32",
-            ),
-            (
-                fw + (fx + (fy + fz) + 2.0),
-                (fw, fx, fy, fz),
-                (fwv, fxv, fyv, fzv),
-                1,
-                fwv + fxv + fyv + fzv + 2,
-                "float32",
-            ),  # 20
-            (
-                2 + (fw + fx) + (fy + fz),
-                (fw, fx, fy, fz),
-                (fwv, fxv, fyv, fzv),
-                1,
-                fwv + fxv + fyv + fzv + 2,
-                "float32",
-            ),
-            # mix float32 and float64
-            (
-                2 + (dw + fx) + (fy + fz),
-                (dw, fx, fy, fz),
-                (dwv, fxv, fyv, fzv),
-                1,
-                dwv + fxv + fyv + fzv + 2,
-                "float64",
-            ),
-            (
-                2 + (fw + dw) + (fy + fz),
-                (fw, dw, fy, fz),
-                (fwv, dwv, fyv, fzv),
-                1,
-                fwv + dwv + fyv + fzv + 2,
-                "float64",
-            ),
-            (
-                2 + (fw + fx) + (dw + fz),
-                (fw, fx, dw, fz),
-                (fwv, fxv, dwv, fzv),
-                1,
-                fwv + fxv + dwv + fzv + 2,
-                "float64",
-            ),
-            (
-                2 + (fw + fx) + (fy + dw),
-                (fw, fx, fy, dw),
-                (fwv, fxv, fyv, dwv),
-                1,
-                fwv + fxv + fyv + dwv + 2,
-                "float64",
-            ),  # 25
-            # test when their is other op then elemwise.
-            (
-                (fwx.sum()) + (fwx) + (fy + fz),
-                (fw, fx, fy, fz),
-                (fwv, fxv, fyv, fzv),
-                4,
-                (fwv + fxv).sum() + fwv + fxv + fyv + fzv,
-                "float32",
-            ),
-            # test other elemwise op
-            (
-                fx + fy + cos(fz),
-                (fx, fy, fz),
-                (fxv, fyv, fzv),
-                1,
-                fxv + fyv + np.cos(fzv),
-                "float32",
-            ),
-            (
-                fx + fy + cosh(fz),
-                (fx, fy, fz),
-                (fxv, fyv, fzv),
-                1,
-                fxv + fyv + np.cosh(fzv),
-                "float32",
-            ),
-            (
-                fx + fy + abs(fz),
-                (fx, fy, fz),
-                (fxv, fyv, fzv),
-                1,
-                fxv + fyv + np.absolute(fzv),
-                "float32",
-            ),
-            (
-                ix + iy + abs(iz),
-                (ix, iy, iz),
-                (ixv, iyv, izv),
-                1,
-                ixv + iyv + np.absolute(izv),
-                "int32",
-            ),  # 30
-            (
-                fx + fy + log(fz),
-                (fx, fy, fz),
-                (fxv, fyv, fzv),
-                1,
-                fxv + fyv + np.log(fzv),
-                "float32",
-            ),
-            (
-                fx + fy + log2(fz),
-                (fx, fy, fz),
-                (fxv, fyv, fzv),
-                1,
-                fxv + fyv + np.log2(fzv),
-                "float32",
-            ),
-            (
-                fx + fy + log10(fz),
-                (fx, fy, fz),
-                (fxv, fyv, fzv),
-                1,
-                fxv + fyv + np.log10(fzv),
-                "float32",
-            ),
-            (
-                fx + fy**fz,
-                (fx, fy, fz),
-                (fxv, fyv, fzv),
-                1,
-                fxv + fyv**fzv,
-                "float32",
-            ),  # pow
-            (
-                fx + fy + exp(fz),
-                (fx, fy, fz),
-                (fxv, fyv, fzv),
-                1,
-                fxv + fyv + np.exp(fzv),
-                "float32",
-            ),  # 35
-            (
-                fx - fy - fz,
-                (fx, fy, fz),
-                (fxv, fyv, fzv),
-                1,
-                fxv - fyv - fzv,
-                "float32",
-            ),
-            (
-                fx - (fy / fz),
-                (fx, fy, fz),
-                (fxv, fyv, fzv),
-                1,
-                fxv - (fyv / fzv),
-                "float32",
-            ),
-            (
-                fx - true_div(fy, 2),
-                (fx, fy),
-                (fxv, fyv),
-                1,
-                fxv - (fyv / 2),
-                "float32",
-            ),
-            (
-                fx - true_div(fy, fz),
-                (fx, fy, fz),
-                (fxv, fyv, fzv),
-                1,
-                fxv - (fyv / fzv),
-                "float32",
-            ),
-            (
-                fx - int_div(ix * 100, iy * 1000),
-                (fx, ix, iy),
-                (fxv, ixv, iyv),
-                1,
-                fxv - ((ixv * 100) // (iyv * 1000)),
-                {
-                    "custom": "float64",
-                    "numpy + floatX": config.floatX,
-                    "numpy": "float64",
-                },
-            ),  # 40
-            (fx - (fy / 2), (fx, fy), (fxv, fyv), 1, fxv - (fyv / 2), "float32"),
-            (
-                fx - (fy % fz),
-                (fx, fy, fz),
-                (fxv, fyv, fzv),
-                1,
-                fxv - (fyv % fzv),
-                "float32",
-            ),
-            (
-                fx - (fy > fz),
-                (fx, fy, fz),
-                (fxv, fyv, fzv),
-                1,
-                fxv - (fyv > fzv),
-                "float32",
-            ),
-            (
-                fx - (fy >= fz),
-                (fx, fy, fz),
-                (fxv, fyv, fzv),
-                1,
-                fxv - (fyv >= fzv),
-                "float32",
-            ),
-            (
-                fx - (fy < fz),
-                (fx, fy, fz),
-                (fxv, fyv, fzv),
-                1,
-                fxv - (fyv < fzv),
-                "float32",
-            ),  # 45
-            (
-                fx - (fy <= fz),
-                (fx, fy, fz),
-                (fxv, fyv, fzv),
-                1,
-                fxv - (fyv <= fzv),
-                "float32",
-            ),
-            (
-                fx - eq(fy, fz),
-                (fx, fy, fz),
-                (fxv, fyv, fzv),
-                1,
-                fxv - (fyv == fzv),
-                "float32",
-            ),
-            (
-                fx - neq(fy, fz),
-                (fx, fy, fz),
-                (fxv, fyv, fzv),
-                1,
-                fxv - (fyv != fzv),
-                "float32",
-            ),
-            (
-                fx - fy + tan(fz),
-                (fx, fy, fz),
-                (fxv, fyv, fzv),
-                1,
-                fxv - fyv + np.tan(fzv),
-                "float32",
-            ),
-            (
-                fx - fy + tanh(fz),
-                (fx, fy, fz),
-                (fxv, fyv, fzv),
-                1,
-                fxv - fyv + np.tanh(fzv),
-                "float32",
-            ),  # 50
-            (
-                fx - fy + sin(fz),
-                (fx, fy, fz),
-                (fxv, fyv, fzv),
-                1,
-                fxv - fyv + np.sin(fzv),
-                "float32",
-            ),
-            (
-                fx - fy + sinh(fz),
-                (fx, fy, fz),
-                (fxv, fyv, fzv),
-                1,
-                fxv - fyv + np.sinh(fzv),
-                "float32",
-            ),
-            (
-                fx - fy + sqr(fz),
-                (fx, fy, fz),
-                (fxv, fyv, fzv),
-                1,
-                fxv - fyv + (fzv * fzv),
-                "float32",
-            ),
-            (
-                fx - fy + sqrt(fz),
-                (fx, fy, fz),
-                (fxv, fyv, fzv),
-                1,
-                fxv - fyv + np.sqrt(fzv),
-                "float32",
-            ),
-            (
-                fx - fy + reciprocal(fz),
-                (fx, fy, fz),
-                (fxv, fyv, fzv),
-                1,
-                fxv - fyv + (1 / fzv),
-                "float32",
-            ),  # 55
-            (
-                fx - fy + neg(fz),
-                (fx, fy, fz),
-                (fxv, fyv, fzv),
-                1,
-                fxv - fyv + (-fzv),
-                "float32",
-            ),
-            (
-                fx - fy + at_round(fz),
-                (fx, fy, fz),
-                (fxv, fyv, fzv),
-                1,
-                fxv - fyv + np.round(fzv),
-                "float32",
-            ),
-            (
-                ix - iy + iround(fz),
-                (ix, iy, fz),
-                (ixv, iyv, fzv),
-                1,
-                ixv - iyv + np.round(fzv),
-                "int64",
-            ),
-            # Bit op
-            (
-                fx - bitwise_or(iy, iz),
-                (fx, iy, iz),
-                (fxv, iyv, izv),
-                1,
-                fxv - (iyv | izv),
-                {
-                    "custom": "float64",
-                    "numpy + floatX": config.floatX,
-                    "numpy": "float64",
-                },
-            ),
-            (
-                fx - xor(iy, iz),
-                (fx, iy, iz),
-                (fxv, iyv, izv),
-                1,
-                fxv - (iyv ^ izv),
-                {
-                    "custom": "float64",
-                    "numpy + floatX": config.floatX,
-                    "numpy": "float64",
-                },
-            ),  # 60
-            (
-                fx - bitwise_and(iy, iz),
-                (fx, iy, iz),
-                (fxv, iyv, izv),
-                1,
-                fxv - (iyv & izv),
-                {
-                    "custom": "float64",
-                    "numpy + floatX": config.floatX,
-                    "numpy": "float64",
-                },
-            ),
-            (
-                fx - invert(iy),
-                (fx, iy),
-                (fxv, iyv),
-                1,
-                fxv - (~iyv),
-                {
-                    "custom": "float64",
-                    "numpy + floatX": config.floatX,
-                    "numpy": "float64",
-                },
-            ),
-            (
-                fx - at.cast(fy, dtype="float64"),
-                (fx, fy),
-                (fxv, fyv),
-                1,
-                fxv - np.asarray(fyv, "float64"),
-                "float64",
-            ),
-            (
-                at_pow(fx * fy + fz, fx * fy),
-                (fx, fy, fz),
-                (fxv, fyv, fzv),
-                1,
-                np.power(fxv * fyv + fzv, fxv * fyv),
-                "float32",
-            ),
-            (
-                fv + fy**fz,
-                (fv, fy, fz),
-                (fvv, fyv, fzv),
-                2,
-                fvv + fyv**fzv,
-                "float32",
-            ),  # fused with a dimshuffle #65
-            (
-                fv - fy + tanh(fz),
-                (fv, fy, fz),
-                (fvv, fyv, fzv),
-                2,
-                fvv - fyv + np.tanh(fzv),
-                "float32",
-            ),  # fused with a dimshuffle
-            # Cases where the same input is reused many times.
-            (
-                mul(fx, fx, fx, fx),
-                (fx,),
-                (fxv,),
-                1,
-                fxv * fxv * fxv * fxv,
-                "float32",
-            ),
-            (
-                mul(fx, ftanx, ftanx),
-                (fx,),
-                (fxv,),
-                1,
-                fxv * np.tan(fxv) * np.tan(fxv),
-                "float32",
-            ),
-            (
-                mul(fx, ftanx, ftanx, fx),
-                (fx,),
-                (fxv,),
-                1,
-                fxv * np.tan(fxv) * np.tan(fxv) * fxv,
-                "float32",
-            ),
-            (
-                mul(ftanx, ftanx, fx + fy),
-                (fx, fy),
-                (fxv, fyv),
-                1,
-                np.tan(fxv) * np.tan(fxv) * (fxv + fyv),
-                "float32",
-            ),  # 70
-            # Cases with different broadcast pattern. They should not
-            # be merged as this would duplicate computation
-            # The graph should have 2 elemwise and 1 dimshuffle
-            (
-                fx * sin(fs),
-                (fx, fs),
-                (fxv, fsv),
-                3,
-                fxv * np.sin(fsv),
-                "float32",
-            ),
-        ]
-        if slice:
-            cases = cases[slice]
-        times = np.zeros(len(cases))
-        fail1 = []
-        fail2 = []
-        fail3 = []
-        fail4 = []
-        for (
-            id,
-            [g, sym_inputs, val_inputs, nb_elemwise, answer, out_dtype],
-        ) in enumerate(cases):
-            if isinstance(out_dtype, dict):
-                out_dtype = out_dtype[config.cast_policy]
-
-            if shared_fn is None:
-                f = function(list(sym_inputs), g, mode=mode)
-                for x in range(nb_repeat):
-                    out = f(*val_inputs)
-                t1 = time.perf_counter()
-            else:
-                out = shared_fn(np.zeros(shp, dtype=out_dtype), "out")
-                assert out.dtype == g.dtype
-                f = function(sym_inputs, [], updates=[(out, g)], mode=mode)
-                t0 = time.perf_counter()
-                for x in range(nb_repeat):
-                    f(*val_inputs)
-                t1 = time.perf_counter()
-                out = out.get_value()
-
-            times[id] = t1 - t0
-            atol = 1e-8
-            if out_dtype == "float32":
-                atol = 1e-6
-            if not np.allclose(out, answer * nb_repeat, atol=atol):
-                fail1.append(id)
-            topo = f.maker.fgraph.toposort()
-            topo_ = [n for n in topo if not isinstance(n.op, self.topo_exclude)]
-            if assert_len_topo:
-                if len(topo_) != nb_elemwise:
-                    fail3.append((id, topo_, nb_elemwise))
-                if nb_elemwise == 1:
-                    # if no variable appears multiple times in the
-                    # input of g,
-                    # check that the number of input to the Composite
-                    # Elemwise is ok
-                    if len(set(g.owner.inputs)) == len(g.owner.inputs):
-                        expected_len_sym_inputs = sum(
-                            not isinstance(x, Constant) for x in topo_[0].inputs
-                        )
-                        assert expected_len_sym_inputs == len(sym_inputs)
-
-            if out_dtype != out.dtype:
-                fail4.append((id, out_dtype, out.dtype))
-
-        assert len(fail1 + fail2 + fail3 + fail4) == 0
-
-        return times
-
-    def test_add_mul_fusion_inplace(self):
-
-        rewrites_query = RewriteDatabaseQuery(
-            include=[
-                "local_elemwise_fusion",
-                "composite_elemwise_fusion",
-                "canonicalize",
-                "inplace",
-            ],
-            exclude=["cxx_only", "BlasOpt"],
-        )
-
-        mode = Mode(self.mode.linker, rewrites_query)
-
-        x, y, z = dmatrices("xyz")
-        out = dot(x, y) + x + y + z
-        f = function([x, y, z], out, mode=mode)
-        topo = [n for n in f.maker.fgraph.toposort()]
-        assert len(topo) == 2
-        assert topo[-1].op.inplace_pattern
-
-        new_out = f.maker.fgraph.outputs[0]
-        assert isinstance(new_out.owner.op, Elemwise)
-        assert isinstance(new_out.owner.op.scalar_op, aes.basic.Add)
-        assert len(new_out.owner.inputs) == 4
-
-        # TODO: Do we really need to do this?
-        _ = f(
-            np.random.random((5, 5)), np.random.random((5, 5)), np.random.random((5, 5))
-        )
 
 
 @utt.assertFailure_fast
@@ -2989,7 +2253,7 @@ class TestLocalErfc:
 
         # TODO: fix this problem: The python code upcast somewhere internally
         #  some value of float32 to python float for part of its computation.
-        #  That makes the c and python code generate sligtly different values
+        #  That makes the c and python code generate slightly different values
         if not (
             config.floatX == "float32" and config.mode in ["DebugMode", "DEBUG_MODE"]
         ):
@@ -3111,7 +2375,6 @@ class TestLocalErfc:
         assert f.maker.fgraph.outputs[0].dtype == config.floatX
 
     def speed_local_log_erfc(self):
-
         val = np.random.random(1e6)
         x = vector()
         mode = get_mode("FAST_RUN")
@@ -3152,7 +2415,7 @@ class TestLocalMergeSwitchSameCond:
             at_pow,
         ):
             g = rewrite(FunctionGraph(mats, [op(s1, s2)]))
-            assert str(g).count("Switch") == 1
+            assert debugprint(g, file="str").count("Switch") == 1
         # integer Ops
         mats = imatrices("cabxy")
         c, a, b, x, y = mats
@@ -3164,13 +2427,13 @@ class TestLocalMergeSwitchSameCond:
             bitwise_xor,
         ):
             g = rewrite(FunctionGraph(mats, [op(s1, s2)]))
-            assert str(g).count("Switch") == 1
+            assert debugprint(g, file="str").count("Switch") == 1
         # add/mul with more than two inputs
         u, v = matrices("uv")
         s3 = at.switch(c, u, v)
         for op in (add, mul):
             g = rewrite(FunctionGraph(mats + [u, v], [op(s1, s2, s3)]))
-            assert str(g).count("Switch") == 1
+            assert debugprint(g, file="str").count("Switch") == 1
 
 
 class TestLocalSumProd:
@@ -4012,6 +3275,161 @@ def test_local_sumsqr2dot():
         )
         for n in f.maker.fgraph.toposort()
     )
+
+
+def test_local_mul_exp_to_exp_add():
+    # Default and FAST_RUN modes put a Composite op into the final graph,
+    # whereas FAST_COMPILE doesn't.  To unify the graph the test cases analyze across runs,
+    # we'll avoid the insertion of Composite ops in each mode by skipping Fusion rewrites
+    mode = get_default_mode().excluding("fusion").including("local_mul_exp_to_exp_add")
+
+    x = scalar("x")
+    y = scalar("y")
+    z = scalar("z")
+    w = scalar("w")
+    expx = exp(x)
+    expy = exp(y)
+    expz = exp(z)
+    expw = exp(w)
+
+    # e^x * e^y * e^z * e^w = e^(x+y+z+w)
+    op = expx * expy * expz * expw
+    f = function([x, y, z, w], op, mode)
+    pytensor.dprint(f)
+    utt.assert_allclose(f(3, 4, 5, 6), np.exp(3 + 4 + 5 + 6))
+    graph = f.maker.fgraph.toposort()
+    assert all(isinstance(n.op, Elemwise) for n in graph)
+    assert any(isinstance(n.op.scalar_op, aes.Add) for n in graph)
+    assert not any(isinstance(n.op.scalar_op, aes.Mul) for n in graph)
+
+    # e^x * e^y * e^z / e^w = e^(x+y+z-w)
+    op = expx * expy * expz / expw
+    f = function([x, y, z, w], op, mode)
+    utt.assert_allclose(f(3, 4, 5, 6), np.exp(3 + 4 + 5 - 6))
+    graph = f.maker.fgraph.toposort()
+    assert all(isinstance(n.op, Elemwise) for n in graph)
+    assert any(isinstance(n.op.scalar_op, aes.Add) for n in graph)
+    assert any(isinstance(n.op.scalar_op, aes.Sub) for n in graph)
+    assert not any(isinstance(n.op.scalar_op, aes.Mul) for n in graph)
+    assert not any(isinstance(n.op.scalar_op, aes.TrueDiv) for n in graph)
+
+    # e^x * e^y / e^z * e^w = e^(x+y-z+w)
+    op = expx * expy / expz * expw
+    f = function([x, y, z, w], op, mode)
+    utt.assert_allclose(f(3, 4, 5, 6), np.exp(3 + 4 - 5 + 6))
+    graph = f.maker.fgraph.toposort()
+    assert all(isinstance(n.op, Elemwise) for n in graph)
+    assert any(isinstance(n.op.scalar_op, aes.Add) for n in graph)
+    assert any(isinstance(n.op.scalar_op, aes.Sub) for n in graph)
+    assert not any(isinstance(n.op.scalar_op, aes.Mul) for n in graph)
+    assert not any(isinstance(n.op.scalar_op, aes.TrueDiv) for n in graph)
+
+    # e^x / e^y / e^z = (e^x / e^y) / e^z = e^(x-y-z)
+    op = expx / expy / expz
+    f = function([x, y, z], op, mode)
+    utt.assert_allclose(f(3, 4, 5), np.exp(3 - 4 - 5))
+    graph = f.maker.fgraph.toposort()
+    assert all(isinstance(n.op, Elemwise) for n in graph)
+    assert any(isinstance(n.op.scalar_op, aes.Sub) for n in graph)
+    assert not any(isinstance(n.op.scalar_op, aes.TrueDiv) for n in graph)
+
+    # e^x * y * e^z * w = e^(x+z) * y * w
+    op = expx * y * expz * w
+    f = function([x, y, z, w], op, mode)
+    utt.assert_allclose(f(3, 4, 5, 6), np.exp(3 + 5) * 4 * 6)
+    graph = f.maker.fgraph.toposort()
+    assert all(isinstance(n.op, Elemwise) for n in graph)
+    assert any(isinstance(n.op.scalar_op, aes.Add) for n in graph)
+    assert any(isinstance(n.op.scalar_op, aes.Mul) for n in graph)
+
+    # expect same for matrices as well
+    mx = matrix("mx")
+    my = matrix("my")
+    f = function([mx, my], exp(mx) * exp(my), mode, allow_input_downcast=True)
+    M1 = np.array([[1.0, 2.0], [3.0, 4.0]])
+    M2 = np.array([[5.0, 6.0], [7.0, 8.0]])
+    utt.assert_allclose(f(M1, M2), np.exp(M1 + M2))
+    graph = f.maker.fgraph.toposort()
+    assert all(isinstance(n.op, Elemwise) for n in graph)
+    assert any(isinstance(n.op.scalar_op, aes.Add) for n in graph)
+    assert not any(isinstance(n.op.scalar_op, aes.Mul) for n in graph)
+
+    # checking whether further rewrites can proceed after this one as one would expect
+    # e^x * e^(-x) = e^(x-x) = e^0 = 1
+    f = function([x], expx * exp(neg(x)), mode)
+    utt.assert_allclose(f(42), 1)
+    graph = f.maker.fgraph.toposort()
+    assert isinstance(graph[0].inputs[0], TensorConstant)
+
+    # e^x / e^x = e^(x-x) = e^0 = 1
+    f = function([x], expx / expx, mode)
+    utt.assert_allclose(f(42), 1)
+    graph = f.maker.fgraph.toposort()
+    assert isinstance(graph[0].inputs[0], TensorConstant)
+
+
+def test_local_mul_pow_to_pow_add():
+    # Default and FAST_RUN modes put a Composite op into the final graph,
+    # whereas FAST_COMPILE doesn't.  To unify the graph the test cases analyze across runs,
+    # we'll avoid the insertion of Composite ops in each mode by skipping Fusion rewrites
+    mode = (
+        get_default_mode()
+        .excluding("fusion")
+        .including("local_mul_exp_to_exp_add")
+        .including("local_mul_pow_to_pow_add")
+    )
+
+    x = scalar("x")
+    y = scalar("y")
+    z = scalar("z")
+    w = scalar("w")
+    v = scalar("v")
+    u = scalar("u")
+    t = scalar("t")
+    s = scalar("s")
+    a = scalar("a")
+    b = scalar("b")
+    c = scalar("c")
+
+    # 2^x * 2^y * 2^z * 2^w = 2^(x+y+z+w)
+    op = 2**x * 2**y * 2**z * 2**w
+    f = function([x, y, z, w], op, mode)
+    utt.assert_allclose(f(3, 4, 5, 6), 2 ** (3 + 4 + 5 + 6))
+    graph = f.maker.fgraph.toposort()
+    assert all(isinstance(n.op, Elemwise) for n in graph)
+    assert any(isinstance(n.op.scalar_op, aes.Add) for n in graph)
+    assert not any(isinstance(n.op.scalar_op, aes.Mul) for n in graph)
+
+    # 2^x * a^y * 2^z * b^w * c^v * a^u * s * b^t = 2^(x+z) * a^(y+u) * b^(w+t) * c^v * s
+    op = 2**x * a**y * 2**z * b**w * c**v * a**u * s * b**t
+    f = function([x, y, z, w, v, u, t, s, a, b, c], op, mode)
+    utt.assert_allclose(
+        f(4, 5, 6, 7, 8, 9, 10, 11, 2.5, 3, 3.5),
+        2 ** (4 + 6) * 2.5 ** (5 + 9) * 3 ** (7 + 10) * 3.5**8 * 11,
+    )
+    graph = f.maker.fgraph.toposort()
+    assert all(isinstance(n.op, Elemwise) for n in graph)
+    assert len([True for n in graph if isinstance(n.op.scalar_op, aes.Add)]) == 3
+    assert len([True for n in graph if isinstance(n.op.scalar_op, aes.Pow)]) == 4
+    assert any(isinstance(n.op.scalar_op, aes.Mul) for n in graph)
+
+    # (2^x / 2^y) * (a^z / a^w) = 2^(x-y) * a^(z-w)
+    op = 2**x / 2**y * (a**z / a**w)
+    f = function([x, y, z, w, a], op, mode)
+    utt.assert_allclose(f(3, 5, 6, 4, 7), 2 ** (3 - 5) * 7 ** (6 - 4))
+    graph = f.maker.fgraph.toposort()
+    assert all(isinstance(n.op, Elemwise) for n in graph)
+    assert len([True for n in graph if isinstance(n.op.scalar_op, aes.Sub)]) == 2
+    assert any(isinstance(n.op.scalar_op, aes.Mul) for n in graph)
+
+    # a^x * a^y * exp(z) * exp(w) = a^(x+y) * exp(z+w)
+    op = a**x * a**y * exp(z) * exp(w)
+    f = function([x, y, z, w, a], op, mode)
+    utt.assert_allclose(f(3, 4, 5, 6, 2), 2 ** (3 + 4) * np.exp(5 + 6))
+    graph = f.maker.fgraph.toposort()
+    assert all(isinstance(n.op, Elemwise) for n in graph)
+    assert len([True for n in graph if isinstance(n.op.scalar_op, aes.Add)]) == 2
+    assert any(isinstance(n.op.scalar_op, aes.Mul) for n in graph)
 
 
 def test_local_expm1():

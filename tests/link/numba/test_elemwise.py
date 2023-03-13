@@ -11,6 +11,7 @@ import pytensor.tensor.math as aem
 from pytensor import config, function
 from pytensor.compile.ops import deep_copy_op
 from pytensor.compile.sharedvalue import SharedVariable
+from pytensor.gradient import grad
 from pytensor.graph.basic import Constant
 from pytensor.graph.fg import FunctionGraph
 from pytensor.tensor import elemwise as at_elemwise
@@ -107,7 +108,6 @@ rng = np.random.default_rng(42849)
     ],
 )
 def test_Elemwise(inputs, input_vals, output_fn, exc):
-
     outputs = output_fn(*inputs)
 
     out_fg = FunctionGraph(
@@ -208,6 +208,14 @@ def test_Dimshuffle(v, new_order):
             if not isinstance(i, (SharedVariable, Constant))
         ],
     )
+
+
+def test_Dimshuffle_returns_array():
+    x = at.vector("x", shape=(1,))
+    y = 2 * at_elemwise.DimShuffle([True], [])(x)
+    func = pytensor.function([x], y, mode="NUMBA")
+    out = func(np.zeros(1, dtype=config.floatX))
+    assert out.ndim == 0
 
 
 @pytest.mark.parametrize(
@@ -539,7 +547,6 @@ def test_MaxAndArgmax(x, axes, exc):
 @pytest.mark.parametrize("size", [(10, 10), (1000, 1000), (10000, 10000)])
 @pytest.mark.parametrize("axis", [0, 1])
 def test_logsumexp_benchmark(size, axis, benchmark):
-
     X = at.matrix("X")
     X_max = at.max(X, axis=axis, keepdims=True)
     X_max = at.switch(at.isinf(X_max), 0, X_max)
@@ -548,10 +555,25 @@ def test_logsumexp_benchmark(size, axis, benchmark):
     rng = np.random.default_rng(23920)
     X_val = rng.normal(size=size)
 
-    X_lse_fn = pytensor.function([X], X_lse, mode="JAX")
+    X_lse_fn = pytensor.function([X], X_lse, mode="NUMBA")
 
     # JIT compile first
     _ = X_lse_fn(X_val)
     res = benchmark(X_lse_fn, X_val)
     exp_res = scipy.special.logsumexp(X_val, axis=axis, keepdims=True)
     np.testing.assert_array_almost_equal(res, exp_res)
+
+
+def test_fused_elemwise_benchmark(benchmark):
+    rng = np.random.default_rng(123)
+    size = 100_000
+    x = pytensor.shared(rng.normal(size=size), name="x")
+    mu = pytensor.shared(rng.normal(size=size), name="mu")
+
+    logp = -((x - mu) ** 2) / 2
+    grad_logp = grad(logp.sum(), x)
+
+    func = pytensor.function([], [logp, grad_logp], mode="NUMBA")
+    # JIT compile first
+    func()
+    benchmark(func)

@@ -104,7 +104,7 @@ def log10_inplace(a):
 
 
 @scalar_elemwise
-def sgn_inplace(a):
+def sign_inplace(a):
     """sign of `a` (inplace on `a`)"""
 
 
@@ -315,7 +315,7 @@ def iv_inplace(v, x):
 
 @scalar_elemwise
 def sigmoid_inplace(x):
-    """Logistic sigmoid function (1 / (1 + exp(x)), also known as expit or inverse logit"""
+    """Logistic sigmoid function (1 / (1 + exp(-x)), also known as expit or inverse logit"""
 
 
 @scalar_elemwise

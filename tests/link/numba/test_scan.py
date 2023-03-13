@@ -251,7 +251,6 @@ def test_scan_multiple_output(benchmark):
 
 @config.change_flags(compute_test_value="raise")
 def test_scan_tap_output():
-
     a_at = at.scalar("a")
     a_at.tag.test_value = 10.0
 
@@ -397,7 +396,6 @@ def test_grad_sitsot():
 
 
 def test_mitmots_basic():
-
     init_x = at.dvector()
     seq = at.dvector()
 
@@ -435,9 +433,9 @@ def test_inner_graph_optimized():
 
     # Disable scan pushout, in which case the whole scan is replaced by an Elemwise
     f = function([xs], seq, mode=get_mode("NUMBA").excluding("scan_pushout"))
-    (scan_node,) = [
+    (scan_node,) = (
         node for node in f.maker.fgraph.apply_nodes if isinstance(node.op, Scan)
-    ]
+    )
     inner_scan_nodes = scan_node.op.fgraph.apply_nodes
     assert len(inner_scan_nodes) == 1
     (inner_scan_node,) = scan_node.op.fgraph.apply_nodes

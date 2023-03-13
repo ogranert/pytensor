@@ -57,7 +57,7 @@ def numba_funcify_Scan(op, node, **kwargs):
     # Apply inner rewrites
     # TODO: Not sure this is the right place to do this, should we have a rewrite that
     #  explicitly triggers the optimization of the inner graphs of Scan?
-    #  The C-code deffers it to the make_thunk phase
+    #  The C-code defers it to the make_thunk phase
     rewriter = op.mode_instance.optimizer
     rewriter(op.fgraph)
 
@@ -168,7 +168,6 @@ def numba_funcify_Scan(op, node, **kwargs):
     def add_output_storage_post_proc_stmt(
         outer_in_name: str, tap_sizes: Tuple[int, ...], storage_size: str
     ):
-
         tap_size = max(tap_sizes)
 
         if op.info.as_while:
@@ -220,7 +219,6 @@ def numba_funcify_Scan(op, node, **kwargs):
         outer_in_var = outer_in_names_to_vars[outer_in_name]
 
         if outer_in_name not in outer_in_nit_sot_names:
-
             storage_name = outer_in_to_storage_name[outer_in_name]
 
             is_tensor_type = isinstance(outer_in_var.type, TensorType)

@@ -2,10 +2,9 @@ from collections.abc import Sequence
 from functools import wraps
 from itertools import zip_longest
 from types import ModuleType
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Literal, Optional, Union
 
 import numpy as np
-from typing_extensions import Literal
 
 from pytensor.compile.sharedvalue import shared
 from pytensor.graph.basic import Constant, Variable
@@ -190,7 +189,6 @@ class RandomStream:
         self.gen_seedgen = np.random.SeedSequence(seed)
 
         if isinstance(rng_ctor, type) and issubclass(rng_ctor, np.random.RandomState):
-
             # The legacy state does not accept `SeedSequence`s directly
             def rng_ctor(seed):
                 return np.random.RandomState(np.random.MT19937(seed))
@@ -198,7 +196,6 @@ class RandomStream:
         self.rng_ctor = rng_ctor
 
     def __getattr__(self, obj):
-
         ns_obj = next(
             (getattr(ns, obj) for ns in self.namespaces if hasattr(ns, obj)), None
         )

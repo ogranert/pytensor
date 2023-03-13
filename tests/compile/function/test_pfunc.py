@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 
 import pytensor.tensor as at
-from pytensor.compile import UnusedInputError
+from pytensor.compile import UnusedInputError, get_mode
 from pytensor.compile.function import function, pfunc
 from pytensor.compile.function.pfunc import rebuild_collect_shared
 from pytensor.compile.io import In
@@ -79,7 +79,6 @@ class TestPfunc:
         assert f2(4) == 32
 
     def test_shared(self):
-
         # CHECK: two functions (f1 and f2) can share w
         w = shared(np.random.random((2, 2)), "w")
         wval = w.get_value(borrow=False)
@@ -138,7 +137,6 @@ class TestPfunc:
         assert f() == 1
 
     def test_param_strict(self):
-
         a = dvector()
         b = shared(7)
         out = a + b
@@ -200,7 +198,12 @@ class TestPfunc:
         bval = np.arange(5)
         b.set_value(bval, borrow=True)
         bval = data_of(b)
-        f = pfunc([], [b_out], updates=[(b, (b_out + 3))], mode="FAST_RUN")
+        f = pfunc(
+            [],
+            [b_out],
+            updates=[(b, (b_out + 3))],
+            mode=get_mode("FAST_RUN").excluding("fusion"),
+        )
         assert (f() == (np.arange(5) * 2)).all()
         # because of the update
         assert (b.get_value(borrow=True) == ((np.arange(5) * 2) + 3)).all()
@@ -808,7 +811,6 @@ class TestAliasingRules:
         assert np.allclose(vals.todense(), bogus_vals.todense())
 
     def test_input_aliasing_affecting_inplace_operations(self):
-
         # Note: to trigger this bug with pytensor rev 4586:2bc6fc7f218b,
         #        you need to make in inputs mutable (so that inplace
         #        operations are used) and to break the elemwise composition
@@ -862,7 +864,6 @@ class TestAliasingRules:
         assert np.allclose(vals, bogus_vals)
 
     def test_partial_input_aliasing_affecting_inplace_operations(self):
-
         # Note: to trigger this bug with pytensor rev 4586:2bc6fc7f218b,
         #        you need to make in inputs mutable ( so that inplace
         #        operations are used) and to break the elemwise composition
@@ -909,7 +910,6 @@ class TestAliasingRules:
         assert np.allclose(vals, bogus_vals)
 
     def test_potential_output_aliasing_induced_by_updates(self):
-
         A = self.shared(np.zeros((2, 2)))
         B = self.shared(np.zeros((2, 2)))
         C = np.zeros((2, 2))
@@ -1066,7 +1066,6 @@ class TestRebuildStrict:
 
 
 def test_rebuild_collect_shared():
-
     x, y = ivectors("x", "y")
     z = x * y
 

@@ -142,15 +142,10 @@ class MaxAndArgmax(COp):
     def make_node(self, x):
         x = as_tensor_variable(x)
 
-        # We keep the original broadcastable flags for dimensions on which
-        # we do not perform the max / argmax.
+        # Keep the original shapes for axes on which we do not perform the max/argmax.
         all_axes = set(self.axis)
         inputs = [x]
-        out_shape = tuple(
-            1 if s == 1 else None
-            for i, s in enumerate(x.type.shape)
-            if i not in all_axes
-        )
+        out_shape = tuple(s for i, s in enumerate(x.type.shape) if i not in all_axes)
         outputs = [
             tensor(dtype=x.type.dtype, shape=out_shape, name="max"),
             tensor(dtype="int64", shape=out_shape, name="argmax"),
@@ -987,7 +982,7 @@ def isclose(a, b, rtol=1.0e-5, atol=1.0e-8, equal_nan=False):
     # deal with signed inf values. this will make an array inf_eq of 0's
     # except where inf values have the same sign.
     both_infs = bitwise_and(a_inf, b_inf)
-    inf_signs_eq = eq(a_inf * sgn(a), b_inf * sgn(b))
+    inf_signs_eq = eq(a_inf * sign(a), b_inf * sign(b))
     inf_eq = bitwise_and(both_infs, inf_signs_eq)
 
     # now create the potential result combining close and inf_eq
@@ -1097,8 +1092,18 @@ def log1p(a):
 
 
 @scalar_elemwise
+def sign(a):
+    """sign of a"""
+
+
 def sgn(a):
     """sign of a"""
+
+    warnings.warn(
+        "sgn is deprecated and will stop working in the future, use sign instead.",
+        FutureWarning,
+    )
+    return sign(a)
 
 
 @scalar_elemwise
@@ -1521,7 +1526,6 @@ class Mean(CAReduce):
         output[0] = np.asarray(np.mean(input, dtype="float64", axis=axis))
 
     def c_code(self, node, name, inames, onames, sub):
-
         ret = super().c_code(node, name, inames, onames, sub)
 
         if self.axis is not None:
@@ -1940,7 +1944,6 @@ class Dot(Op):
         z[0] = np.asarray(np.dot(x, y))
 
     def grad(self, inp, grads):
-
         x, y = inp
         (gz,) = grads
         xdim, ydim, gdim = x.type.ndim, y.type.ndim, gz.type.ndim
@@ -2631,7 +2634,6 @@ class Prod(CAReduce):
             # this handles inputs with zeros, but only certain input shapes
             return [grad_case_without_zeros]
         else:
-
             where_zeros = eq(prod_in, 0.0)
             sum_where_zeros = sum(where_zeros, axis=self.axis)
             groups_with_single_zero = eq(sum_where_zeros, 1).dimshuffle(new_dims)
@@ -2924,7 +2926,6 @@ class MatMul(Op):
                 )
             return x2_shape[:-2] + x1_shape[-2:-1] + x2_shape[-1:]
         else:
-
             if validate:
                 from pytensor.tensor.random.basic import broadcast_shapes
 
@@ -3047,6 +3048,7 @@ __all__ = [
     "log10",
     "log1p",
     "sgn",
+    "sign",
     "ceil",
     "floor",
     "trunc",

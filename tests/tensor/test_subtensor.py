@@ -986,7 +986,7 @@ class TestSubtensor(utt.OptimizationTestMixin):
     def test_shape_i_const(self):
         # Each axis is treated independently by shape_i/shape operators
 
-        mode_opt = self.mode.including("fast_run")
+        mode_opt = self.mode
         data = self.shared(np.array(np.arange(5), dtype=self.dtype))
         for start in [None] + [-8, -5, -1, 0, 1, 5, 8]:
             outs = []
@@ -1004,7 +1004,7 @@ class TestSubtensor(utt.OptimizationTestMixin):
     def test_shape_i_scalar(self):
         # Each axis is treated independently by shape_i/shape operators
 
-        mode_opt = self.mode.including("fast_run")
+        mode_opt = self.mode
 
         v_data = np.array(np.arange(5), dtype=self.dtype)
         t_data = self.shared(v_data)
@@ -1443,13 +1443,12 @@ class TestIncSubtensor:
         sl2 = slice(sl2_end)
 
         for do_set in [False, True]:
-
             if do_set:
-                resut = set_subtensor(a[sl1, sl2], increment)
+                result = set_subtensor(a[sl1, sl2], increment)
             else:
-                resut = inc_subtensor(a[sl1, sl2], increment)
+                result = inc_subtensor(a[sl1, sl2], increment)
 
-            f = pytensor.function([a, increment, sl2_end], resut)
+            f = pytensor.function([a, increment, sl2_end], result)
 
             val_a = np.ones((5, 5))
             val_inc = 2.3
@@ -1516,9 +1515,8 @@ class TestIncSubtensor:
         val_sl2_end = 2
 
         for method in [set_subtensor, inc_subtensor]:
-
-            resut = method(a[sl1, sl3, sl2], increment)
-            f = pytensor.function([a, increment, sl2_end], resut)
+            result = method(a[sl1, sl3, sl2], increment)
+            f = pytensor.function([a, increment, sl2_end], result)
 
             expected_result = np.copy(val_a)
             result = f(val_a, val_inc, val_sl2_end)
@@ -1531,9 +1529,9 @@ class TestIncSubtensor:
             utt.assert_allclose(result, expected_result)
 
             # Test when we broadcast the result
-            resut = method(a[sl1, sl2], increment)
+            result = method(a[sl1, sl2], increment)
 
-            f = pytensor.function([a, increment, sl2_end], resut)
+            f = pytensor.function([a, increment, sl2_end], result)
 
             expected_result = np.copy(val_a)
             result = f(val_a, val_inc, val_sl2_end)

@@ -685,7 +685,6 @@ class GammaIncDer(BinaryScalarOp):
     """
 
     def impl(self, k, x):
-
         if x == 0:
             return 0
 
@@ -1090,7 +1089,7 @@ i0 = I0(upgrade_to_float, name="i0")
 
 class Sigmoid(UnaryScalarOp):
     """
-    Logistic sigmoid function (1 / (1 + exp(x)), also known as expit or inverse logit
+    Logistic sigmoid function (1 / (1 + exp(-x)), also known as expit or inverse logit
     """
 
     nfunc_spec = ("scipy.special.expit", 1, 1)
@@ -1638,9 +1637,9 @@ class Hyp2F1Der(ScalarOp):
 
         return compute_grad_2f1(a, b, c, z, wrt=wrt)
 
-    def __call__(self, a, b, c, z, wrt):
+    def __call__(self, a, b, c, z, wrt, **kwargs):
         # This allows wrt to be a keyword argument
-        return super().__call__(a, b, c, z, wrt)
+        return super().__call__(a, b, c, z, wrt, **kwargs)
 
     def c_code(self, *args, **kwargs):
         raise NotImplementedError()

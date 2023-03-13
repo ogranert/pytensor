@@ -1,26 +1,31 @@
-import contextlib
+import warnings
 
 import numpy as np
 import pytest
 
 import pytensor
-import pytensor.scalar as aes
-import pytensor.tensor as at
+from pytensor import In
+from pytensor import scalar as aes
 from pytensor import shared
+from pytensor import tensor as at
 from pytensor.compile.function import function
 from pytensor.compile.mode import Mode, get_default_mode
 from pytensor.configdefaults import config
+from pytensor.gradient import grad
 from pytensor.graph.basic import Constant
 from pytensor.graph.fg import FunctionGraph
 from pytensor.graph.rewriting.basic import check_stack_trace, out2in
 from pytensor.graph.rewriting.db import RewriteDatabaseQuery
 from pytensor.graph.rewriting.utils import rewrite_graph
 from pytensor.misc.safe_asarray import _asarray
+from pytensor.raise_op import assert_op
 from pytensor.scalar.basic import Composite
 from pytensor.tensor.basic import MakeVector
 from pytensor.tensor.elemwise import DimShuffle, Elemwise
+from pytensor.tensor.math import abs as at_abs
+from pytensor.tensor.math import add
+from pytensor.tensor.math import all as at_all
 from pytensor.tensor.math import (
-    add,
     bitwise_and,
     bitwise_or,
     cos,
@@ -28,10 +33,12 @@ from pytensor.tensor.math import (
     dot,
     eq,
     exp,
+    ge,
     int_div,
     invert,
     iround,
     log,
+    log1mexp,
     log2,
     log10,
     mul,
@@ -44,7 +51,7 @@ from pytensor.tensor.math import round as at_round
 from pytensor.tensor.math import sin, sinh, sqr, sqrt
 from pytensor.tensor.math import sum as at_sum
 from pytensor.tensor.math import tan, tanh, true_div, xor
-from pytensor.tensor.rewriting.elemwise import local_dimshuffle_lift
+from pytensor.tensor.rewriting.elemwise import FusionOptimizer, local_dimshuffle_lift
 from pytensor.tensor.rewriting.shape import local_useless_dimshuffle_in_reshape
 from pytensor.tensor.shape import reshape
 from pytensor.tensor.type import (
@@ -263,9 +270,8 @@ def test_local_useless_dimshuffle_in_reshape():
 class TestFusion:
     rewrites = RewriteDatabaseQuery(
         include=[
-            "local_elemwise_fusion",
-            "composite_elemwise_fusion",
             "canonicalize",
+            "fusion",
             "inplace",
         ],
         exclude=["cxx_only", "BlasOpt"],
@@ -298,6 +304,29 @@ class TestFusion:
     izv = _asarray(my_init(num=70), dtype="int32")
     fwx = fw + fx
     ftanx = tan(fx)
+
+    def large_fuseable_graph(self, n):
+        factors = []
+        sd = dscalar()
+        means = dvector()
+
+        cst_05 = at.constant(0.5)
+        cst_m05 = at.constant(-0.5)
+        cst_2 = at.constant(2)
+        cst_m2 = at.constant(-2)
+        ones = at.constant(np.ones(10))
+
+        for i in range(n):
+            f = cst_m05 * sd**cst_m2 * (ones - means[i]) ** cst_2 + cst_05 * log(
+                cst_05 * (sd**cst_m2) / np.pi
+            )
+            factors.append(at_sum(f))
+
+        logp = add(*factors)
+
+        vars = [sd, means]
+        dlogp = [pytensor.grad(logp, v) for v in vars]
+        return vars, dlogp
 
     @pytest.mark.parametrize(
         "case",
@@ -880,6 +909,7 @@ class TestFusion:
                 1,
                 fxv * np.tan(fxv) * np.tan(fxv) * fxv,
                 "float32",
+                1e-5,
             ),
             (
                 mul(ftanx, ftanx, fx + fy),
@@ -888,6 +918,7 @@ class TestFusion:
                 1,
                 np.tan(fxv) * np.tan(fxv) * (fxv + fyv),
                 "float32",
+                1e-5,
             ),  # 70
             # Cases with different broadcast pattern. They should not
             # be merged as this would duplicate computation
@@ -900,38 +931,119 @@ class TestFusion:
                 fxv * np.sin(fsv),
                 "float32",
             ),
+            # Multiple output cases  # 72
+            (
+                (
+                    # sum(logp)
+                    at_sum(-((fx - fy) ** 2) / 2),
+                    # grad(logp)
+                    at.grad(at_sum(-((fx - fy) ** 2) / 2), wrt=fx),
+                ),
+                (fx, fy),
+                (fxv, fyv),
+                3,
+                (
+                    np.sum(-((fxv - fyv) ** 2) / 2),
+                    -(fxv - fyv),
+                ),
+                ("float32", "float32"),
+            ),
+            # Two Composite graphs that share the same input, but are split by
+            # a non-elemwise operation (Assert)
+            (
+                (
+                    log(
+                        ge(
+                            assert_op(
+                                at_abs(fx),
+                                at_all(ge(at_abs(fx), 0)),
+                            ),
+                            0,
+                        )
+                    ),
+                ),
+                (fx,),
+                (fxv,),
+                4,
+                (np.zeros_like(fxv),),
+                ("float32",),
+            ),
+            # Two subgraphs that share the same non-fuseable input, but are otherwise
+            # completely independent
+            (
+                (
+                    true_div(
+                        mul(
+                            at_sum(fx + 5),  # breaks fusion
+                            exp(fx),
+                        ),
+                        (fx + 5),
+                    ),
+                ),
+                (fx,),
+                (fxv,),
+                4,
+                (np.sum(fxv + 5) * np.exp(fxv) / (fxv + 5),),
+                ("float32",),
+            ),
+            pytest.param(
+                (
+                    (sin(exp(fx)), exp(sin(fx))),
+                    (fx,),
+                    (fxv,),
+                    1,
+                    (np.sin(np.exp(fxv)), np.exp(np.sin(fxv))),
+                    ("float32", "float32"),
+                ),
+                marks=pytest.mark.xfail,  # Not implemented yet
+            ),
         ],
     )
     def test_elemwise_fusion(self, case, nb_repeat=1, assert_len_topo=True):
         """Verify that `Elemwise` fusion works."""
 
-        g, sym_inputs, val_inputs, nb_elemwise, answer, out_dtype = case
+        if len(case) == 6:
+            g, sym_inputs, val_inputs, nb_elemwise, answer, out_dtype = case
+            atol = None
+        else:
+            g, sym_inputs, val_inputs, nb_elemwise, answer, out_dtype, atol = case
 
         if isinstance(out_dtype, dict):
             out_dtype = out_dtype[config.cast_policy]
+
+        if not isinstance(g, (tuple, list)):
+            g = (g,)
+            answer = (answer,)
+            out_dtype = (out_dtype,)
 
         if self._shared is None:
             f = function(list(sym_inputs), g, mode=self.mode)
             for x in range(nb_repeat):
                 out = f(*val_inputs)
+            if not isinstance(out, list):
+                out = (out,)
         else:
-            out = self._shared(np.zeros((5, 5), dtype=out_dtype), "out")
-            assert out.dtype == g.dtype
-            f = function(sym_inputs, [], updates=[(out, g)], mode=self.mode)
+            out = [
+                self._shared(np.zeros((5,) * g_.ndim, dtype=od), "out")
+                for g_, od in zip(g, out_dtype)
+            ]
+            assert all(o.dtype == g_.dtype for o, g_ in zip(out, g))
+            f = function(sym_inputs, [], updates=list(zip(out, g)), mode=self.mode)
             for x in range(nb_repeat):
                 f(*val_inputs)
-            out = out.get_value()
+            out = [o.get_value() for o in out]
 
-        atol = 1e-8
-        if out_dtype == "float32":
-            atol = 1e-6
+        if atol is None:
+            atol = 1e-8
+            if any(o == "float32" for o in out_dtype):
+                atol = 1e-6
 
-        assert np.allclose(out, answer * nb_repeat, atol=atol)
+        for o, a in zip(out, answer):
+            np.testing.assert_allclose(o, a * nb_repeat, atol=atol)
 
         topo = f.maker.fgraph.toposort()
         topo_ = [n for n in topo if not isinstance(n.op, self.topo_exclude)]
         if assert_len_topo:
-
             assert len(topo_) == nb_elemwise
 
             if nb_elemwise == 1:
@@ -939,13 +1051,15 @@ class TestFusion:
                 # input of g,
                 # check that the number of input to the Composite
                 # Elemwise is ok
-                if len(set(g.owner.inputs)) == len(g.owner.inputs):
-                    expected_len_sym_inputs = sum(
-                        not isinstance(x, Constant) for x in topo_[0].inputs
-                    )
-                    assert expected_len_sym_inputs == len(sym_inputs)
+                for g_ in g:
+                    if len(set(g_.owner.inputs)) == len(g_.owner.inputs):
+                        expected_len_sym_inputs = sum(
+                            not isinstance(x, Constant) for x in topo_[0].inputs
+                        )
+                        assert expected_len_sym_inputs == len(sym_inputs)
 
-        assert out_dtype == out.dtype
+        for od, o in zip(out_dtype, out):
+            assert od == o.dtype
 
     def test_fusion_35_inputs(self):
         r"""Make sure we don't fuse too many `Op`\s and go past the 31 function arguments limit."""
@@ -970,35 +1084,9 @@ class TestFusion:
 
     @pytest.mark.skipif(not config.cxx, reason="No cxx compiler")
     def test_big_fusion(self):
-        # In the past, pickle of Composite generated in that case
-        # crashed with max recursion limit. So we were not able to
-        # generate C code in that case.
-        factors = []
-        sd = dscalar()
-        means = dvector()
-
-        cst_05 = at.constant(0.5)
-        cst_m05 = at.constant(-0.5)
-        cst_2 = at.constant(2)
-        cst_m2 = at.constant(-2)
-        ones = at.constant(np.ones(10))
-        n = 85
-        if config.mode in ["DebugMode", "DEBUG_MODE"]:
-            n = 10
-
-        for i in range(n):
-            f = cst_m05 * sd**cst_m2 * (ones - means[i]) ** cst_2 + cst_05 * log(
-                cst_05 * (sd**cst_m2) / np.pi
-            )
-            factors.append(at_sum(f))
-
-        logp = add(*factors)
-
-        vars = [sd, means]
-
         # Make sure that C compilation is used
         mode = Mode("cvm", self.rewrites)
-        dlogp = function(vars, [pytensor.grad(logp, v) for v in vars], mode=mode)
+        dlogp = function(*self.large_fuseable_graph(n=85), mode=mode)
 
         # Make sure something was fused
         assert any(
@@ -1006,23 +1094,35 @@ class TestFusion:
             for node in dlogp.maker.fgraph.toposort()
         )
 
+    @pytest.mark.xfail(reason="Fails due to #1244")
+    def test_add_mul_fusion_precedence(self):
+        """Test that additions and multiplications are "fused together" before
+        a `Composite` `Op` is introduced. This fusion is done by canonicalization
+        """
+        x, y, z = vectors("x", "y", "z")
+        out = log((x + y + z) / (x * y * z))
+        f = pytensor.function([x, y, z], out, mode=self.mode)
+        # There should be a single Composite Op
+        nodes = f.maker.fgraph.apply_nodes
+        assert len(nodes) == 1
+        (node,) = nodes
+        assert isinstance(node.op, Elemwise)
+        scalar_op = node.op.scalar_op
+        assert isinstance(scalar_op, Composite)
+        assert [node.op for node in scalar_op.fgraph.toposort()] == [
+            # There should be a single mul
+            aes.mul,
+            # There should be a single add
+            aes.add,
+            aes.true_div,
+            aes.log,
+        ]
+
     def test_add_mul_fusion_inplace(self):
-
-        rewrites = RewriteDatabaseQuery(
-            include=[
-                "local_elemwise_fusion",
-                "composite_elemwise_fusion",
-                "canonicalize",
-                "inplace",
-            ],
-            exclude=["cxx_only", "BlasOpt"],
-        )
-
-        mode = Mode(self.mode.linker, rewrites)
-
         x, y, z = dmatrices("xyz")
         out = dot(x, y) + x + y + z
-        f = function([x, y, z], out, mode=mode)
+
+        f = function([x, y, z], out, mode=self.mode)
         topo = [n for n in f.maker.fgraph.toposort()]
         assert len(topo) == 2
         assert topo[-1].op.inplace_pattern
@@ -1037,6 +1137,34 @@ class TestFusion:
             np.random.random((5, 5)), np.random.random((5, 5)), np.random.random((5, 5))
         )
 
+    def test_fusion_multiout_inplace(self):
+        x = vector("x")
+
+        # Create Composite where inplacing the first non-constant output would corrupt the second output
+        xs = aes.float64("xs")
+        outs = (
+            Elemwise(Composite([xs], [xs + 1, aes.cos(xs + 1) + xs]))
+            .make_node(x)
+            .outputs
+        )
+
+        f = pytensor.function(
+            [In(x, mutable=True)],
+            outs,
+            mode=self.mode.including("inplace"),
+        )
+        (composite_node,) = f.maker.fgraph.apply_nodes
+
+        # Destroy map must be None or the last toposorted output
+        destroy_map = composite_node.op.destroy_map
+        assert (destroy_map == {}) or (
+            destroy_map == {1: [composite_node.inputs.index(x)]}
+        )
+
+        res = f([0, 1, 2])
+        assert np.allclose(res[0], [1, 2, 3])
+        assert np.allclose(res[1], np.cos([1, 2, 3]) + np.array([0, 1, 2]))
+
     @pytest.mark.skipif(not config.cxx, reason="No cxx compiler")
     def test_no_c_code(self):
         r"""Make sure we avoid fusions for `Op`\s without C code implementations."""
@@ -1050,8 +1178,7 @@ class TestFusion:
 
         mode = Mode(linker="cvm")
         mode._optimizer = mode._optimizer.including(
-            "local_elemwise_fusion",
-            "composite_elemwise_fusion",
+            "fusion",
             "canonicalize",
             "inplace",
         )
@@ -1067,51 +1194,29 @@ class TestFusion:
 
     @pytest.mark.parametrize("test_value", [np.c_[[1.0]], np.c_[[]]])
     def test_test_values(self, test_value):
-        """Make sure that `local_elemwise_fusion_op` uses test values correctly when they have zero dimensions.
-
-        The test values we're talking about are the ones used when C implementations
-        are checked.
-
+        """Make sure that `local_elemwise_fusion_op` uses test values correctly
+        when they have zero dimensions.
         """
-
-        rewrites = RewriteDatabaseQuery(
-            include=[
-                "local_elemwise_fusion",
-                "composite_elemwise_fusion",
-                "canonicalize",
-            ],
-            exclude=["cxx_only", "BlasOpt"],
-        )
-
-        mode = Mode(self.mode.linker, rewrites)
-
         x, y, z = dmatrices("xyz")
 
         x.tag.test_value = test_value
         y.tag.test_value = test_value
         z.tag.test_value = test_value
 
-        if test_value.size == 0:
-            cm = pytest.raises(ValueError)
-        else:
-            cm = contextlib.suppress()
-
         with config.change_flags(
             compute_test_value="raise", compute_test_value_opt="raise"
         ):
             out = x * y + z
-            with cm:
-                f = function([x, y, z], out, mode=mode)
+            f = function([x, y, z], out, mode=self.mode)
 
-        if test_value.size != 0:
-            # Confirm that the fusion happened
-            assert isinstance(f.maker.fgraph.outputs[0].owner.op.scalar_op, Composite)
-            assert len(f.maker.fgraph.toposort()) == 1
+        # Confirm that the fusion happened
+        assert isinstance(f.maker.fgraph.outputs[0].owner.op.scalar_op, Composite)
+        assert len(f.maker.fgraph.toposort()) == 1
 
-            x_c, y_c, z_c = f.maker.fgraph.outputs[0].owner.inputs
-            assert np.array_equal(
-                f.maker.fgraph.outputs[0].tag.test_value, np.c_[[2.0]]
-            )
+        assert np.array_equal(
+            f.maker.fgraph.outputs[0].tag.test_value,
+            np.full_like(test_value, 2.0),
+        )
 
     @pytest.mark.parametrize("linker", ["cvm", "py"])
     @pytest.mark.parametrize("axis", [None, 0, 1, (0, 1), (0, 1, 2)])
@@ -1193,6 +1298,96 @@ class TestFusion:
         assert out_val.shape == exp_res.shape
         assert np.allclose(out_val, exp_res)
 
+    def test_not_fusing_broadcasted_subgraphs(self):
+        """Test that broadcasted Elemwise subgraphs are not fused in a single Elemwise Composite Op.
+
+        There are some cases in self.test_elemwise_fusion, but this test confirms that the
+        fused subgraphs are exactly the expected ones.
+        """
+        xs = vector("xm")
+        xm = matrix("xs")
+
+        es = log(xs + 5)
+        em = exp(xm * 5)
+        esm = es - em
+
+        f = pytensor.function([xs, xm], esm, mode=self.mode)
+        apply_nodes = f.maker.fgraph.toposort()
+        assert len(apply_nodes) == 3
+        assert isinstance(apply_nodes[0].op, DimShuffle)
+        # Inner Vector output Composite
+        assert isinstance(apply_nodes[1].op.scalar_op, Composite)
+        assert {node.op for node in apply_nodes[1].op.scalar_op.fgraph.apply_nodes} == {
+            aes.add,
+            aes.log,
+        }
+        # Outer Matrix output Composite
+        assert isinstance(apply_nodes[2].op.scalar_op, Composite)
+        assert {node.op for node in apply_nodes[2].op.scalar_op.fgraph.apply_nodes} == {
+            aes.sub,
+            aes.exp,
+            aes.mul,
+        }
+
+    def test_multiple_outputs_fused_root_elemwise(self):
+        """Test that a root elemwise output (single layer) is reused when
+        there is another fused output"""
+
+        # By default, we do not introduce Composite for single layers of Elemwise
+        x = at.vector("x")
+        out1 = at.cos(x)
+        f = pytensor.function([x], out1, mode=self.mode)
+        nodes = tuple(f.maker.fgraph.apply_nodes)
+        assert len(nodes) == 1
+        assert isinstance(nodes[0].op.scalar_op, aes.Cos)
+
+        # However, when it can be composed with another output, we should not
+        # compute that root Elemwise twice
+        out2 = at.log(out1)
+        f = pytensor.function([x], [out1, out2], mode=self.mode)
+        nodes = tuple(f.maker.fgraph.apply_nodes)
+        assert len(nodes) == 1
+        assert isinstance(nodes[0].op.scalar_op, Composite)
+
+    def test_eval_benchmark(self, benchmark):
+        rng = np.random.default_rng(123)
+        size = 100_000
+        x = pytensor.shared(rng.normal(size=size), name="x")
+        mu = pytensor.shared(rng.normal(size=size), name="mu")
+
+        logp = -((x - mu) ** 2) / 2
+        grad_logp = grad(logp.sum(), x)
+
+        func = pytensor.function([], [logp, grad_logp], mode="FAST_RUN")
+        benchmark(func)
+
+    @pytest.mark.skipif(not config.cxx, reason="No cxx compiler")
+    def test_rewrite_benchmark(self, benchmark):
+        inps, outs = self.large_fuseable_graph(n=25)
+        fg = FunctionGraph(inps, outs)
+        opt = FusionOptimizer()
+
+        def rewrite_func():
+            nb_replacement = opt.apply(fg.clone())[2]
+            return nb_replacement
+
+        assert benchmark(rewrite_func) == 103
+
+    def test_no_warning_from_old_client(self):
+        # There used to be a warning issued when creating fuseable mapping
+        # for nodes that are no longer in the FunctionGraph
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            # The -2 integer array cannot be passed directly to the C method
+            # of log1mexp as that can only handle floats. There is a rewrite
+            # that casts it to a float, but the FunctionGraph client retains
+            # the original log1mexp of the integer input, which caused
+            # a misleading warning for non C implementation in the FusionRewrite
+            assert np.isclose(
+                log1mexp(np.array(-2, dtype="int64")).eval(),
+                np.log(1 - np.exp(-2)),
+            )
+
 
 class TimesN(aes.basic.UnaryScalarOp):
     """
@@ -1258,22 +1453,37 @@ class TestCompositeCodegen:
 
     def test_local_useless_composite(self):
         x = aes.float32()
-        c = aes.Composite([x], [x + 1, x - 1])
-        X = matrix()
-        o = Elemwise(scalar_op=c)(X)
+        y = aes.float32()
+        z = aes.float32()
+        c = aes.Composite([x, y, z], [x + 1, y - 1])
+        X = matrix("X")
+        Y = matrix("Y")
+        Z = matrix("Z")
+        o1, o2 = Elemwise(scalar_op=c)(X, Y, Z)
         mode = get_default_mode().including("local_useless_composite")
 
-        f = function([X], o[0], mode=mode)
+        f = function([X, Y, Z], [o1, o2], mode=mode)
         topo = f.maker.fgraph.toposort()
         assert len(topo) == 1
-        assert len(topo[0].outputs) == 1
-        utt.assert_allclose(f([[1.0]]), [[2.0]])
+        assert len(topo[0].inputs) == 2
+        assert len(topo[0].outputs) == 2
+        res1, res2 = f([[1.0]], [[1.0]], [[np.nan]])
+        utt.assert_allclose(res1, [[2.0]])
+        utt.assert_allclose(res2, [[0.0]])
 
-        f = function([X], o[1], mode=mode)
+        f = function([X, Y, Z], o1, mode=mode)
         topo = f.maker.fgraph.toposort()
         assert len(topo) == 1
+        assert len(topo[0].inputs) == 1
         assert len(topo[0].outputs) == 1
-        utt.assert_allclose(f([[1.0]]), [[0.0]])
+        utt.assert_allclose(f([[1.0]], [[np.nan]], [[np.nan]]), [[2.0]])
+
+        f = function([X, Y, Z], o2, mode=mode)
+        topo = f.maker.fgraph.toposort()
+        assert len(topo) == 1
+        assert len(topo[0].inputs) == 1
+        assert len(topo[0].outputs) == 1
+        utt.assert_allclose(f([[np.nan]], [[1.0]], [[np.nan]]), [[0.0]])
 
 
 def test_local_useless_dimshuffle_makevector():

@@ -443,7 +443,7 @@ def local_subtensor_lift(fgraph, node):
             # i indexes broadcastable pattern before subtensor
             # j indexes broadcastable pattern after subtensor
             j = 0
-            for (i, x) in enumerate(node.op.idx_list):
+            for i, x in enumerate(node.op.idx_list):
                 # if it is not a slice, it will reduce the dimension, should
                 # not appear in the broascastable dimensions
                 if isinstance(x, slice):
@@ -479,6 +479,7 @@ def local_subtensor_merge(fgraph, node):
     expresses all slices in a canonical form, and then merges them together.
 
     """
+    from pytensor.scan.op import Scan
 
     if isinstance(node.op, Subtensor):
         u = node.inputs[0]
@@ -489,6 +490,16 @@ def local_subtensor_merge(fgraph, node):
             # slices of the first applied subtensor
             slices1 = get_idx_list(u.owner.inputs, u.owner.op.idx_list)
             slices2 = get_idx_list(node.inputs, node.op.idx_list)
+
+            # Don't try to do the optimization on do-while scan outputs,
+            # as it will create a dependency on the shape of the outputs
+            if (
+                x.owner is not None
+                and isinstance(x.owner.op, Scan)
+                and x.owner.op.info.as_while
+            ):
+                return None
+
             # Get the shapes of the vectors !
             try:
                 # try not to introduce new shape into the graph
@@ -819,7 +830,6 @@ def local_useless_inc_subtensor(fgraph, node):
         )
         for e in idx_cst
     ):
-
         # `IncSubtensor` broadcasts `x` on `y` based on run-time shapes, so we
         # must check that they are the same
         if not fgraph.shape_feature.same_shape(x, y):
@@ -1375,7 +1385,6 @@ def local_setsubtensor_of_constants(fgraph, node):
             return
 
         if replace_x == replace_y:
-
             # No need to copy over the stacktrace,
             # because x should already have a stacktrace
             return [x]
@@ -1733,7 +1742,6 @@ def local_join_subtensors(fgraph, node):
             )
             if i != axis
         ):
-
             base_tensor = subtensor1.owner.inputs[0]
             new_idxs = list(idxs_subtensor1)
             new_idxs[axis] = slice(start_subtensor1, stop_subtensor2, step_subtensor1)
@@ -1775,7 +1783,6 @@ def local_uint_constant_indices(fgraph, node):
     has_new_index = False
 
     for i, index in enumerate(new_indices):
-
         if not isinstance(index, Constant):
             continue
 

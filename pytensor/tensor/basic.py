@@ -130,7 +130,6 @@ def _as_tensor_Variable(x, name, ndim, **kwargs):
 @_as_tensor_variable.register(list)
 @_as_tensor_variable.register(tuple)
 def _as_tensor_Sequence(x, name, ndim, dtype=None, **kwargs):
-
     if len(x) == 0:
         return constant(x, name=name, ndim=ndim, dtype=dtype)
 
@@ -470,7 +469,6 @@ def get_scalar_constant_value(
                     )
                     and len(v.owner.op.idx_list) == 1
                 ):
-
                     idx = v.owner.op.idx_list[0]
                     if isinstance(idx, Type):
                         idx = get_scalar_constant_value(
@@ -531,7 +529,6 @@ def get_scalar_constant_value(
 
 
 class TensorFromScalar(COp):
-
     __props__ = ()
 
     def make_node(self, s):
@@ -588,7 +585,6 @@ tensor_from_scalar = TensorFromScalar()
 
 
 class ScalarFromTensor(COp):
-
     __props__ = ()
 
     def __call__(self, *args, **kwargs) -> ScalarVariable:
@@ -647,7 +643,7 @@ def _conversion(real_value: Op, name: str) -> Op:
     return real_value
 
 
-# These _conver_to_<type> functions have leading underscores to indicate that
+# These _convert_to_<type> functions have leading underscores to indicate that
 # they should not be called directly.  They do not perform sanity checks about
 # what types you are casting to what.  That logic is implemented by the
 # `cast()` function below.
@@ -973,7 +969,6 @@ def nonzero_values(a):
 
 
 class Tri(Op):
-
     __props__ = ("dtype",)
 
     def __init__(self, dtype=None):
@@ -1249,7 +1244,6 @@ def triu_indices_from(
 
 
 class Eye(Op):
-
     __props__ = ("dtype",)
 
     def __init__(self, dtype=None):
@@ -1485,7 +1479,6 @@ class Alloc(COp):
         return [node.inputs[1:]]
 
     def connection_pattern(self, node):
-
         rval = [[True]]
 
         for ipt in node.inputs[1:]:
@@ -1925,30 +1918,18 @@ class Split(COp):
     def perform(self, node, inputs, outputs):
         x, axis, splits = inputs
 
-        len_along_axis = x.shape[axis]
-
         if len(splits) != self.len_splits:
-            raise ValueError("Length of `splits` is not equal to `len_splits`")
-        if np.sum(splits) != len_along_axis:
+            raise ValueError("Length of splits is not equal to n_splits")
+        if np.sum(splits) != x.shape[axis]:
             raise ValueError(
-                f"The splits sum to {np.sum(splits)}; expected {len_along_axis}"
+                f"Split sizes sum to {np.sum(splits)}; expected {x.shape[axis]}"
             )
-        if builtins.any(nb < 0 for nb in splits):
-            raise ValueError(
-                "Attempted to make an array with a negative number of elements"
-            )
+        if np.any(splits < 0):
+            raise ValueError("Split sizes cannot be negative")
 
-        # Checking is done, let's roll the splitting algorithm!
-        # Basically we step along the given axis of x, extracting
-        # subtensors of size splits[i] as we go along.
-
-        general_key = [slice(None, None, None) for s in x.shape]
-        lower_idx = 0
-        for i in range(self.len_splits):
-            upper_idx = lower_idx + splits[i]
-            general_key[axis] = slice(lower_idx, upper_idx, None)
-            outputs[i][0] = x.__getitem__(tuple(general_key)).copy()
-            lower_idx = upper_idx
+        split_outs = np.split(x, np.cumsum(splits[:-1]), axis=axis)
+        for i, out in enumerate(split_outs):
+            outputs[i][0] = out.copy()
 
     def infer_shape(self, fgraph, node, in_shapes):
         axis = node.inputs[1]
@@ -2559,17 +2540,17 @@ def roll(x, shift, axis=None):
     )
 
 
-def stack(tensors: Sequence[TensorVariable], axis: int = 0):
+def stack(tensors: Sequence["TensorLike"], axis: int = 0):
     """Stack tensors in sequence on given axis (default is 0).
 
-    Take a sequence of tensors and stack them on given axis to make a single
-    tensor. The size in dimension `axis` of the result will be equal to the number
-    of tensors passed.
+    Take a sequence of tensors or tensor-like constant and stack them on
+    given axis to make a single tensor. The size in dimension `axis` of the
+    result will be equal to the number of tensors passed.
 
     Parameters
     ----------
-    tensors : Sequence[TensorVariable]
-        A list of tensors to be stacked.
+    tensors : Sequence[TensorLike]
+        A list of tensors or tensor-like constants to be stacked.
     axis : int
         The index of the new axis. Default value is 0.
 
@@ -2604,11 +2585,11 @@ def stack(tensors: Sequence[TensorVariable], axis: int = 0):
     (2, 2, 2, 3, 2)
     """
     if not isinstance(tensors, Sequence):
-        raise TypeError("First argument should be Sequence[TensorVariable]")
+        raise TypeError("First argument should be a Sequence.")
     elif len(tensors) == 0:
-        raise ValueError("No tensor arguments provided")
+        raise ValueError("No tensor arguments provided.")
 
-    # If all tensors are scalars of the same type, call make_vector.
+    # If all tensors are scalars, call make_vector.
     # It makes the graph simpler, by not adding DimShuffles and SpecifyShapes
 
     # This should be an optimization!
@@ -2618,12 +2599,13 @@ def stack(tensors: Sequence[TensorVariable], axis: int = 0):
     # optimization.
     # See ticket #660
     if all(
-        # In case there are explicit ints in tensors
-        isinstance(t, (np.number, float, int, builtins.complex))
+        # In case there are explicit scalars in tensors
+        isinstance(t, Number)
+        or (isinstance(t, np.ndarray) and t.ndim == 0)
         or (isinstance(t, Variable) and isinstance(t.type, TensorType) and t.ndim == 0)
         for t in tensors
     ):
-        # in case there is direct int
+        # In case there is direct scalar
         tensors = list(map(as_tensor_variable, tensors))
         dtype = aes.upcast(*[i.dtype for i in tensors])
         return MakeVector(dtype)(*tensors)
@@ -2927,7 +2909,6 @@ class ARange(Op):
         out[0] = np.arange(start, stop, step, dtype=self.dtype)
 
     def connection_pattern(self, node):
-
         return [[True], [False], [True]]
 
     def L_op(self, inputs, outputs, grads):
@@ -3057,7 +3038,6 @@ class _nd_grid:
         self.sparse = sparse
 
     def __getitem__(self, *args):
-
         if isinstance(args[0], slice):
             sl = args[0]
             return arange(sl.start or 0, sl.stop, sl.step or 1)
@@ -3762,7 +3742,6 @@ class Choose(Op):
         self.mode = mode
 
     def infer_shape(self, fgraph, node, shapes):
-
         a_shape, choices_shape = shapes
         out_shape = pytensor.tensor.extra_ops.broadcast_shape(
             a_shape, choices_shape[1:], arrays_are_shapes=True
@@ -3844,7 +3823,7 @@ class AllocEmpty(COp):
         # False and it is set to true only in DebugMode.
         # We can't set it in the type as other make_node can reuse the type.
         # We can't set it in the variable as it isn't copied when we copy
-        # the variale. So we set it in the tag.
+        # the variable. So we set it in the tag.
         output.tag.nan_guard_mode_check = False
         return Apply(self, _shape, [output])
 

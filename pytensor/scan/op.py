@@ -110,7 +110,7 @@ err_msg1 = (
     "that scan uses in each of its iterations. "
     "In order to solve this issue if the two variable currently "
     "have the same dimensionality, you can increase the "
-    "dimensionality of the varialbe in the initial state of scan "
+    "dimensionality of the variable in the initial state of scan "
     "by using dimshuffle or shape_padleft. "
 )
 err_msg2 = (
@@ -138,7 +138,7 @@ err_msg3 = (
     "The first dimension of this "
     "matrix corresponds to the number of previous time-steps "
     "that scan uses in each of its iterations. "
-    "In order to solve this issue if the two varialbe currently "
+    "In order to solve this issue if the two variable currently "
     "have the same dimensionality, you can increase the "
     "dimensionality of the variable in the initial state of scan "
     "by using dimshuffle or shape_padleft. "
@@ -571,13 +571,12 @@ class ScanMethodsMixin:
             "outer_out_from_inner_out": {},
         }
 
-        for (oinp, iinp, iout, oout) in zip(
+        for oinp, iinp, iout, oout in zip(
             outer_input_indices,
             inner_input_indices,
             inner_output_indices,
             outer_output_indices,
         ):
-
             if oout != -1:
                 mappings["outer_inp_from_outer_out"][oout] = oinp
                 mappings["inner_inp_from_outer_out"][oout] = iinp
@@ -615,12 +614,10 @@ class ScanMethodsMixin:
         var_mappings = self.get_oinp_iinp_iout_oout_mappings()
 
         for outer_oidx in range(nb_recurr_outputs):
-
             inner_iidxs = var_mappings["inner_inp_from_outer_out"][outer_oidx]
             inner_oidxs = var_mappings["inner_out_from_outer_out"][outer_oidx]
 
-            for (inner_iidx, inner_oidx) in product(inner_iidxs, inner_oidxs):
-
+            for inner_iidx, inner_oidx in product(inner_iidxs, inner_oidxs):
                 type_input = self.inner_inputs[inner_iidx].type
                 type_output = self.inner_outputs[inner_oidx].type
                 if (
@@ -677,7 +674,6 @@ class Scan(Op, ScanMethodsMixin, HasInnerGraph):
         typeConstructor: Optional[TensorConstructorType] = None,
         truncate_gradient: int = -1,
         name: Optional[str] = None,
-        as_while: bool = False,
         profile: Optional[Union[str, bool]] = None,
         allow_gc: bool = True,
         strict: bool = True,
@@ -1186,7 +1182,7 @@ class Scan(Op, ScanMethodsMixin, HasInnerGraph):
         # these are states that do not feed anything back in the recurrent
         # computation, and hence they do not have an initial state. The scan
         # node however receives an input for each such argument, the input
-        # in this case is just a int saying how many steps of this output we
+        # in this case is just an int saying how many steps of this output we
         # need to store. This input does not have the same dtype, nor is it the same
         # type of tensor as the output, it is always a scalar int.
         new_inputs += [as_tensor_variable(ons) for ons in self.outer_nitsot(inputs)]
@@ -1338,7 +1334,6 @@ class Scan(Op, ScanMethodsMixin, HasInnerGraph):
         preallocated_mitmot_outs = []
 
         if config.scan__allow_output_prealloc:
-
             # Go through the mitmots. Whenever a mitmot has a tap both as an
             # input and an output, wrap the input such that the corresponding
             # output variable becomes an update to be performed on it, possibly
@@ -1584,7 +1579,6 @@ class Scan(Op, ScanMethodsMixin, HasInnerGraph):
             #     #     compute_map[o][0] = True
 
             def p(node, inputs, outputs):
-
                 t0_call = time.perf_counter()
 
                 try:
@@ -1889,7 +1883,6 @@ class Scan(Op, ScanMethodsMixin, HasInnerGraph):
             # cases where outputs reused the allocated object but alter the
             # memory region they refer to.
             for idx in range(len(inner_output_storage)):
-
                 var = inner_output_storage[idx].storage[0]
                 old_inner_output_storage[idx] = var
 
@@ -1961,7 +1954,6 @@ class Scan(Op, ScanMethodsMixin, HasInnerGraph):
             for mitmot_grp_idx, taps in enumerate(info.mit_mot_in_slices):
                 for out_slice in info.mit_mot_out_slices[mitmot_grp_idx]:
                     if self.mitmots_preallocated[mitmot_out_idx]:
-
                         mitmot_inp_idx = mitmot_inp_grp_offset + taps.index(out_slice)
                         inner_inp_idx = info.n_seqs + mitmot_inp_idx
 
@@ -2001,7 +1993,6 @@ class Scan(Op, ScanMethodsMixin, HasInnerGraph):
             offset_out -= info.n_mit_mot
 
             for j in range(begin, end):
-
                 # Copy the output value to `outs`, if necessary
                 if store_steps[j] == 1 or self.vector_outs[j]:
                     output_storage[j][0][pos[j]] = inner_output_storage[
@@ -2050,7 +2041,6 @@ class Scan(Op, ScanMethodsMixin, HasInnerGraph):
             begin = end
             end += info.n_nit_sot
             for j in range(begin, end):
-
                 if i == 0:
                     jout = j + offset_out
                     shape = (store_steps[j],) + inner_output_storage[jout].storage[
@@ -2114,7 +2104,6 @@ class Scan(Op, ScanMethodsMixin, HasInnerGraph):
         end = self.n_outs + info.n_nit_sot
         for idx in range(begin, end):
             if store_steps[idx] < i - self.mintaps[idx] and pos[idx] < store_steps[idx]:
-
                 pdx = pos[idx]
                 if pdx >= store_steps[idx] // 2:
                     # It seems inefficient to copy the bigger part of the
@@ -2326,7 +2315,6 @@ class Scan(Op, ScanMethodsMixin, HasInnerGraph):
         return scan_outs
 
     def connection_pattern(self, node):
-
         # We cache the result of this function because, with a previous
         # implementation that repeatedly called grad, there were cases
         # where calls to pytensor.grad() took as much as 4h for functions
@@ -2356,7 +2344,6 @@ class Scan(Op, ScanMethodsMixin, HasInnerGraph):
 
                 for inner_oidx in inner_oidxs:
                     for inner_iidx in inner_iidxs:
-
                         if inner_connect_pattern[inner_iidx][inner_oidx]:
                             connection_pattern[outer_iidx][outer_oidx] = True
                             break
@@ -2373,7 +2360,6 @@ class Scan(Op, ScanMethodsMixin, HasInnerGraph):
         for steps in range(n_outs):
             for iidx in range(n_outs):
                 for jidx in range(n_outs):
-
                     # Get the idx of the outer input corresponding to that
                     # outer output
                     j_inp_idx = var_mappings["outer_inp_from_outer_out"][jidx]
@@ -2525,7 +2511,6 @@ class Scan(Op, ScanMethodsMixin, HasInnerGraph):
         dC_dXts = []
         Xts = []
         for idx, Xt in enumerate(diff_outputs):
-
             # We are looking for x[t-1] for a given x[t]
             if idx >= info.n_mit_mot_outs:
                 Xt_placeholder = safe_new(Xt)
@@ -2605,7 +2590,6 @@ class Scan(Op, ScanMethodsMixin, HasInnerGraph):
         # construct dX_dtm1
         dC_dXtm1s = []
         for pos, x in enumerate(dC_dinps_t[info.n_seqs :]):
-
             # Get the index of the first inner input corresponding to the
             # pos-ieth inner input state
             idxs = var_mappings["inner_out_from_inner_inp"][info.n_seqs + pos]

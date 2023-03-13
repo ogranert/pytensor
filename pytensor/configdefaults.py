@@ -278,7 +278,6 @@ def short_platform(r=None, p=None):
 
 
 def add_basic_configvars():
-
     config.add(
         "floatX",
         "Default floating-point precision for python casts.\n"
@@ -388,7 +387,6 @@ def _is_greater_or_equal_0(x):
 
 
 def add_compile_configvars():
-
     config.add(
         "mode",
         "Default compilation mode",
@@ -631,7 +629,6 @@ def _is_valid_cmp_sloppy(v):
 
 
 def add_tensor_configvars():
-
     # This flag is used when we import PyTensor to initialize global variables.
     # So changing it after import will not modify these global variables.
     # This could be done differently... but for now we simply prevent it from being
@@ -717,7 +714,6 @@ def add_experimental_configvars():
 
 
 def add_error_and_warning_configvars():
-
     ###
     # To disable some warning about old bug that are fixed now.
     ###
@@ -792,7 +788,7 @@ def add_testvalue_and_checking_configvars():
         "print_test_value",
         (
             "If 'True', the __eval__ of an PyTensor variable will return its test_value "
-            "when this is available. This has the practical conseguence that, e.g., "
+            "when this is available. This has the practical consequence that, e.g., "
             "in debugging `my_var` will print the same as `my_var.tag.test_value` "
             "when a test value is defined."
         ),
@@ -1099,7 +1095,7 @@ def add_optimizer_configvars():
 
     config.add(
         "optdb__position_cutoff",
-        "Where to stop eariler during optimization. It represent the"
+        "Where to stop earlier during optimization. It represent the"
         " position of the optimizer where to stop.",
         FloatParam(np.inf),
         in_c_key=False,
@@ -1196,7 +1192,6 @@ def add_vm_configvars():
 
 
 def add_deprecated_configvars():
-
     # TODO: remove this? Agree
     config.add(
         "unittests__rseed",

@@ -85,7 +85,7 @@ invalid_tensor_types = (
 def indices_from_subtensor(
     op_indices: Iterable[ScalarConstant],
     idx_list: Optional[List[Union[Type, slice, Variable]]],
-) -> Union[slice, Variable]:
+) -> Tuple[Union[slice, Variable], ...]:
     """Recreate the index tuple from which a ``*Subtensor**`` ``Op`` was created.
 
     Parameters
@@ -199,7 +199,7 @@ def get_canonical_form_slice(
     if the resulting set of numbers needs to be reversed or not.
 
     """
-    from pytensor.tensor import ge, lt, sgn, switch
+    from pytensor.tensor import ge, lt, sign, switch
 
     if not isinstance(theslice, slice):
         try:
@@ -317,7 +317,7 @@ def get_canonical_form_slice(
             return switch(is_step_neg, a, b)
 
         abs_step = abs(step)
-        sgn_step = sgn(step)
+        sgn_step = sign(step)
 
     defstart = switch_neg_step(length - 1, 0)
     defstop = switch_neg_step(-1, length)
@@ -815,7 +815,6 @@ class Subtensor(COp):
         return [first] + [DisconnectedType()()] * len(rest)
 
     def connection_pattern(self, node):
-
         rval = [[True]]
 
         for ipt in node.inputs[1:]:
@@ -1593,7 +1592,6 @@ class IncSubtensor(COp):
         out[0] = x
 
     def c_code(self, node, name, inputs, outputs, sub):
-
         # This method delegates much of the work to helper
         # methods. This method implements the main logic
         # but subclasses may override the helper methods
@@ -1738,7 +1736,7 @@ class IncSubtensor(COp):
         different types of arrays.
 
         """
-        # Parameters of PyArrary_FromAny are:
+        # Parameters of PyArray_FromAny are:
         # array
         # dtype: we pass NULL to say any dtype is acceptable, so the existing
         #        dtype will be copied
@@ -1838,7 +1836,6 @@ class IncSubtensor(COp):
         return self(eval_points[0], eval_points[1], *inputs[2:], return_list=True)
 
     def connection_pattern(self, node):
-
         rval = [[True], [True]]
 
         for ipt in node.inputs[2:]:
@@ -2200,7 +2197,7 @@ class AdvancedIncSubtensor1(COp):
         different types of arrays.
 
         """
-        # Parameters of PyArrary_FromAny are:
+        # Parameters of PyArray_FromAny are:
         # array
         # dtype: we pass NULL to say any dtype is acceptable, so the existing
         #        dtype will be copied
@@ -2473,7 +2470,6 @@ class AdvancedIncSubtensor1(COp):
         return self.make_node(eval_points[0], eval_points[1], *inputs[2:]).outputs
 
     def connection_pattern(self, node):
-
         rval = [[True], [True], [False]]
         return rval
 
@@ -2692,7 +2688,6 @@ class AdvancedIncSubtensor(Op):
         )
 
     def perform(self, node, inputs, out_):
-
         x, y, *indices = inputs
 
         check_advanced_indexing_dimensions(x, indices)
@@ -2714,7 +2709,6 @@ class AdvancedIncSubtensor(Op):
         return [ishapes[0]]
 
     def connection_pattern(self, node):
-
         rval = [[True], [True]]
 
         for ipt in node.inputs[2:]:

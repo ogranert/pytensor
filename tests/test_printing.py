@@ -273,8 +273,7 @@ def test_debugprint():
     s = s.getvalue()
     exp_res = dedent(
         r"""
-        Elemwise{Composite{(i0 + (i1 - i2))}} 4
-         |A
+        Elemwise{Composite} 4
          |InplaceDimShuffle{x,0} v={0: [0]} 3
          | |CGemv{inplace} d={0: [0]} 2
          |   |AllocEmpty{dtype='float64'} 1
@@ -285,6 +284,16 @@ def test_debugprint():
          |   |<TensorType(float64, (?,))>
          |   |TensorConstant{0.0}
          |D
+         |A
+
+        Inner graphs:
+
+        Elemwise{Composite}
+         >add
+         > |<float64>
+         > |sub
+         >   |<float64>
+         >   |<float64>
         """
     ).lstrip()
 
@@ -386,7 +395,6 @@ MyInnerGraphOp [id C]
 
 
 def test_get_var_by_id():
-
     r1, r2 = MyVariable("v1"), MyVariable("v2")
     o1 = MyOp("op1")(r1, r2)
     o1.name = "o1"

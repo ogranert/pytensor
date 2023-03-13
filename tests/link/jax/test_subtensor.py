@@ -1,8 +1,5 @@
-import jax
 import numpy as np
 import pytest
-from jax._src.errors import NonConcreteBooleanIndexError
-from packaging.version import parse as version_parse
 
 import pytensor.tensor as at
 from pytensor.configdefaults import config
@@ -11,10 +8,20 @@ from pytensor.tensor import subtensor as at_subtensor
 from tests.link.jax.test_basic import compare_jax_and_py
 
 
-def test_jax_Subtensors():
+def test_jax_Subtensor_constant():
     # Basic indices
     x_at = at.as_tensor(np.arange(3 * 4 * 5).reshape((3, 4, 5)))
     out_at = x_at[1, 2, 0]
+    assert isinstance(out_at.owner.op, at_subtensor.Subtensor)
+    out_fg = FunctionGraph([], [out_at])
+    compare_jax_and_py(out_fg, [])
+
+    out_at = x_at[1:, 1, :]
+    assert isinstance(out_at.owner.op, at_subtensor.Subtensor)
+    out_fg = FunctionGraph([], [out_at])
+    compare_jax_and_py(out_fg, [])
+
+    out_at = x_at[:2, 1, :]
     assert isinstance(out_at.owner.op, at_subtensor.Subtensor)
     out_fg = FunctionGraph([], [out_at])
     compare_jax_and_py(out_fg, [])
@@ -46,19 +53,48 @@ def test_jax_Subtensors():
     out_fg = FunctionGraph([], [out_at])
     compare_jax_and_py(out_fg, [])
 
-
-@pytest.mark.xfail(
-    version_parse(jax.__version__) >= version_parse("0.2.12"),
-    reason="Omnistaging cannot be disabled",
-)
-def test_jax_Subtensors_omni():
-    x_at = at.arange(3 * 4 * 5).reshape((3, 4, 5))
-
-    # Boolean indices
-    out_at = x_at[x_at < 0]
-    assert isinstance(out_at.owner.op, at_subtensor.AdvancedSubtensor)
+    # Flipping
+    out_at = x_at[::-1]
     out_fg = FunctionGraph([], [out_at])
     compare_jax_and_py(out_fg, [])
+
+
+@pytest.mark.xfail(reason="`a` should be specified as static when JIT-compiling")
+def test_jax_Subtensor_dynamic():
+    a = at.iscalar("a")
+    x = at.arange(3)
+    out_at = x[:a]
+    assert isinstance(out_at.owner.op, at_subtensor.Subtensor)
+    out_fg = FunctionGraph([a], [out_at])
+    compare_jax_and_py(out_fg, [1])
+
+
+def test_jax_Subtensor_boolean_mask():
+    """JAX does not support resizing arrays with boolean masks."""
+    x_at = at.arange(-5, 5)
+    out_at = x_at[x_at < 0]
+    assert isinstance(out_at.owner.op, at_subtensor.AdvancedSubtensor)
+
+    with pytest.raises(NotImplementedError, match="resizing arrays with boolean"):
+        out_fg = FunctionGraph([], [out_at])
+        compare_jax_and_py(out_fg, [])
+
+
+def test_jax_Subtensor_boolean_mask_reexpressible():
+    """Summing values with boolean indexing.
+
+    This test ensures that the sum of an `AdvancedSubtensor` `Op`s with boolean
+    indexing is replaced with the sum of an equivalent `Switch` `Op`, using the
+    `jax_boolean_indexing_sum` rewrite.
+
+    JAX forces users to re-express this logic manually, so this is an
+    improvement over its user interface.
+
+    """
+    x_at = at.vector("x")
+    out_at = x_at[x_at < 0].sum()
+    out_fg = FunctionGraph([x_at], [out_at])
+    compare_jax_and_py(out_fg, [np.arange(-5, 5).astype(config.floatX)])
 
 
 def test_jax_IncSubtensor():
@@ -147,40 +183,42 @@ def test_jax_IncSubtensor():
     out_fg = FunctionGraph([], [out_at])
     compare_jax_and_py(out_fg, [])
 
-
-def test_jax_IncSubtensors_unsupported():
-    rng = np.random.default_rng(213234)
-    x_np = rng.uniform(-1, 1, size=(3, 4, 5)).astype(config.floatX)
-    x_at = at.constant(np.arange(3 * 4 * 5).reshape((3, 4, 5)).astype(config.floatX))
-
-    mask_at = at.as_tensor(x_np) > 0
-    out_at = at_subtensor.set_subtensor(x_at[mask_at], 0.0)
-    assert isinstance(out_at.owner.op, at_subtensor.AdvancedIncSubtensor)
-    out_fg = FunctionGraph([], [out_at])
-    with pytest.raises(
-        NonConcreteBooleanIndexError, match="Array boolean indices must be concrete"
-    ):
-        compare_jax_and_py(out_fg, [])
-
-    mask_at = at.as_tensor_variable(x_np) > 0
-    out_at = at_subtensor.set_subtensor(x_at[mask_at], 1.0)
-    assert isinstance(out_at.owner.op, at_subtensor.AdvancedIncSubtensor)
-    out_fg = FunctionGraph([], [out_at])
-    with pytest.raises(
-        NonConcreteBooleanIndexError, match="Array boolean indices must be concrete"
-    ):
-        compare_jax_and_py(out_fg, [])
-
     st_at = at.as_tensor_variable(x_np[[0, 2], 0, :3])
     out_at = at_subtensor.set_subtensor(x_at[[0, 2], 0, :3], st_at)
     assert isinstance(out_at.owner.op, at_subtensor.AdvancedIncSubtensor)
     out_fg = FunctionGraph([], [out_at])
-    with pytest.raises(IndexError, match="Array slice indices must have static"):
-        compare_jax_and_py(out_fg, [])
+    compare_jax_and_py(out_fg, [])
 
     st_at = at.as_tensor_variable(x_np[[0, 2], 0, :3])
     out_at = at_subtensor.inc_subtensor(x_at[[0, 2], 0, :3], st_at)
     assert isinstance(out_at.owner.op, at_subtensor.AdvancedIncSubtensor)
     out_fg = FunctionGraph([], [out_at])
-    with pytest.raises(IndexError, match="Array slice indices must have static"):
-        compare_jax_and_py(out_fg, [])
+    compare_jax_and_py(out_fg, [])
+
+
+def test_jax_IncSubtensor_boolean_indexing_reexpressible():
+    """Setting or incrementing values with boolean indexing.
+
+    This test ensures that `AdvancedIncSubtensor` `Op`s with boolean indexing is
+    replaced with an equivalent `Switch` `Op`, using the
+    `jax_boolean_indexing_set_of_inc` rewrite.
+
+    JAX forces users to re-express this logic manually, so this is an
+    improvement over its user interface.
+
+    """
+    rng = np.random.default_rng(213234)
+    x_np = rng.uniform(-1, 1, size=(4, 5)).astype(config.floatX)
+
+    x_at = at.matrix("x")
+    mask_at = at.as_tensor(x_at) > 0
+    out_at = at_subtensor.set_subtensor(x_at[mask_at], 0.0)
+    assert isinstance(out_at.owner.op, at_subtensor.AdvancedIncSubtensor)
+    out_fg = FunctionGraph([x_at], [out_at])
+    compare_jax_and_py(out_fg, [x_np])
+
+    mask_at = at.as_tensor(x_at) > 0
+    out_at = at_subtensor.inc_subtensor(x_at[mask_at], 1.0)
+    assert isinstance(out_at.owner.op, at_subtensor.AdvancedIncSubtensor)
+    out_fg = FunctionGraph([x_at], [out_at])
+    compare_jax_and_py(out_fg, [x_np])

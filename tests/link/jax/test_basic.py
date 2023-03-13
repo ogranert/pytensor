@@ -27,9 +27,12 @@ def set_pytensor_flags():
 jax = pytest.importorskip("jax")
 
 
-opts = RewriteDatabaseQuery(include=["jax"], exclude=["cxx_only", "BlasOpt"])
-jax_mode = Mode(JAXLinker(), opts)
-py_mode = Mode("py", opts)
+jax_mode = Mode(
+    JAXLinker(), RewriteDatabaseQuery(include=["jax"], exclude=["cxx_only", "BlasOpt"])
+)
+py_mode = Mode(
+    "py", RewriteDatabaseQuery(include=[None], exclude=["cxx_only", "BlasOpt"])
+)
 
 
 def compare_jax_and_py(
@@ -180,7 +183,6 @@ def test_shared_updates():
 
 
 def test_jax_ifelse():
-
     true_vals = np.r_[1, 2, 3]
     false_vals = np.r_[-1, -2, -3]
 

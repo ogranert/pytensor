@@ -498,7 +498,6 @@ class ScalarType(CType, HasDataType, HasShape):
         return ""
 
     def c_support_code(self, **kwargs):
-
         if self.dtype.startswith("complex"):
             cplx_types = ["pytensor_complex64", "pytensor_complex128"]
             real_types = [
@@ -1081,7 +1080,6 @@ def real_out(type):
 
 
 class ScalarOp(COp):
-
     nin = -1
     nout = 1
 
@@ -2010,7 +2008,6 @@ class TrueDiv(BinaryScalarOp):
         return f"{z} = {x} / {y};"
 
     def grad(self, inputs, gout):
-
         (x, y) = inputs
         (gz,) = gout
         if x.type in complex_types:
@@ -2393,14 +2390,12 @@ class Second(BinaryScalarOp):
         return f"{z} = {y};"
 
     def connection_pattern(self, node):
-
         # x is never connected because its elements are never used
         # y is connected because its elements are copied over
 
         return [[False], [True]]
 
     def grad(self, inputs, gout):
-
         (x, y) = inputs
         (gz,) = gout
         if y.type in continuous_types:
@@ -2571,7 +2566,7 @@ class Abs(UnaryScalarOp):
                 return [x.zeros_like()]
 
         if x.type in float_types:
-            return (gz * sgn(x),)
+            return (gz * sign(x),)
         return (gz * x / _abs(x),)  # formula works for complex and real
 
     def c_code(self, node, name, inputs, outputs, sub):
@@ -2595,7 +2590,7 @@ class Abs(UnaryScalarOp):
 abs = Abs(same_out)
 
 
-class Sgn(UnaryScalarOp):
+class Sign(UnaryScalarOp):
     nfunc_spec = ("sign", 1, 1)
 
     @staticmethod
@@ -2630,7 +2625,7 @@ class Sgn(UnaryScalarOp):
             )
         if type in int_types:
             return f"{z} = ({x} >= 0) ? ({x} == 0) ? 0 : 1 : -1;"
-        raise ComplexError("complex has no sgn")
+        raise ComplexError("complex has no sign")
 
     def c_code_cache_version(self):
         s = super().c_code_cache_version()
@@ -2640,7 +2635,7 @@ class Sgn(UnaryScalarOp):
             return s
 
 
-sgn = Sgn(name="sgn")
+sign = Sign(name="sign")
 
 
 class Ceil(UnaryScalarOp):
@@ -4000,7 +3995,8 @@ class Composite(ScalarOp, HasInnerGraph):
 
     init_param: Tuple[str, ...] = ("inputs", "outputs")
 
-    def __init__(self, inputs, outputs):
+    def __init__(self, inputs, outputs, name="Composite"):
+        self.name = name
         # We need to clone the graph as sometimes its nodes already
         # contain a reference to an fgraph. As we want the Composite
         # to be pickable, we can't have reference to fgraph.
@@ -4107,30 +4103,6 @@ class Composite(ScalarOp, HasInnerGraph):
         return self._py_perform_fn
 
     @property
-    def name(self):
-        if hasattr(self, "_name"):
-            return self._name
-
-        # TODO FIXME: Just implement pretty printing for the `Op`; don't do
-        # this redundant, outside work in the `Op` itself.
-        for i, r in enumerate(self.fgraph.inputs):
-            r.name = f"i{int(i)}"
-        for i, r in enumerate(self.fgraph.outputs):
-            r.name = f"o{int(i)}"
-        io = set(self.fgraph.inputs + self.fgraph.outputs)
-        for i, r in enumerate(self.fgraph.variables):
-            if r not in io and len(self.fgraph.clients[r]) > 1:
-                r.name = f"t{int(i)}"
-        outputs_str = ", ".join([pprint(output) for output in self.fgraph.outputs])
-        rval = f"Composite{{{outputs_str}}}"
-        self._name = rval
-        return self._name
-
-    @name.setter
-    def name(self, name):
-        self._name = name
-
-    @property
     def fgraph(self):
         if hasattr(self, "_fgraph"):
             return self._fgraph
@@ -4146,6 +4118,21 @@ class Composite(ScalarOp, HasInnerGraph):
                     "The fgraph to Composite must be exclusively"
                     " composed of ScalarOp instances."
                 )
+
+        # Clone identical outputs that have been merged
+        if len(set(fgraph.outputs)) != len(self.outputs):
+            old_outputs = fgraph.outputs
+            new_outputs = []
+            for output in old_outputs:
+                if output not in new_outputs:
+                    new_outputs.append(output)
+                else:
+                    node = output.owner
+                    output_idx = node.outputs.index(output)
+                    new_output = node.clone().outputs[output_idx]
+                    new_outputs.append(new_output)
+            fgraph = FunctionGraph(fgraph.inputs, new_outputs, clone=False)
+
         self._fgraph = fgraph
         return self._fgraph
 
@@ -4312,7 +4299,6 @@ class Composite(ScalarOp, HasInnerGraph):
         return self._c_code
 
     def c_code(self, node, nodename, inames, onames, sub):
-
         d = dict(
             chain(
                 zip((f"i{int(i)}" for i in range(len(inames))), inames),

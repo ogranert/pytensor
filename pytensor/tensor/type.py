@@ -1,9 +1,8 @@
 import logging
 import warnings
-from typing import TYPE_CHECKING, Iterable, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Iterable, Literal, Optional, Tuple, Union
 
 import numpy as np
-from typing_extensions import Literal
 
 import pytensor
 from pytensor import scalar as aes
@@ -786,7 +785,6 @@ def tensor(
     shape: Optional[Tuple[ST, ...]] = None,
     **kwargs,
 ) -> "TensorVariable":
-
     if name is not None:
         # Help catching errors with the new tensor API
         # Many single letter strings are valid sctypes
@@ -860,7 +858,6 @@ lvector = TensorType("int64", shape=(None,))
 
 
 def _validate_static_shape(shape, ndim: int) -> Tuple[ST, ...]:
-
     if not isinstance(shape, tuple):
         raise TypeError(f"Shape must be a tuple, got {type(shape)}")
 

@@ -90,7 +90,6 @@ z = create_pytensor_param(np.random.default_rng().integers(0, 4, size=(2, 2)))
     ],
 )
 def test_local_replace_AdvancedSubtensor(indices, is_none):
-
     X_val = np.random.normal(size=(4, 4, 4))
     X = tensor(dtype=np.float64, shape=(None, None, None), name="X")
     X.tag.test_value = X_val
@@ -424,7 +423,7 @@ def test_local_subtensor_remove_broadcastable_index():
     # testing local_subtensor_remove_broadcastable_index optimization
     #
     # tests removing broadcastable dimensions with index 0 or -1,
-    # otherwise the optimzation should not be applied
+    # otherwise the optimization should not be applied
 
     mode = get_default_mode()
     mode = mode.including("local_subtensor_remove_broadcastable_index")
@@ -433,7 +432,7 @@ def test_local_subtensor_remove_broadcastable_index():
     y2 = x.dimshuffle("x", 1, 0, "x")
     y3 = x.dimshuffle("x", 1, "x", 0, "x")
 
-    # testing for cases that the optimzation should be applied
+    # testing for cases that the optimization should be applied
     z1 = y1[:, 0, :]
     z2 = y1[:, -1, :]
     z3 = y2[0, :, :, -1]
@@ -459,7 +458,7 @@ def test_local_subtensor_remove_broadcastable_index():
     xn = rng.random((5, 5))
     f(xn)
 
-    # testing for cases that the optimzation should not be applied
+    # testing for cases that the optimization should not be applied
     # to verify that other subtensor usage are passed without errors
     w1 = y1[3, 0, :]
     w2 = y1[2:4, -1, :]
@@ -667,7 +666,6 @@ class TestSubtensorIncSubtensor:
 
 
 class TestLocalSubtensorMakeVector:
-
     mode = get_mode("FAST_RUN").including("local_subtensor_make_vector")
 
     def test_scalar_idx(self):
@@ -887,10 +885,9 @@ class TestLocalSubtensorLift:
         prog = f.maker.fgraph.toposort()
         assert isinstance(prog[0].op, DimShuffle)
         assert isinstance(prog[1].op.scalar_op, aes.Composite)  # Composite{add,exp}
-        assert prog[2].op == add or prog[3].op == add
         # first subtensor
-        assert isinstance(prog[2].op, Subtensor) or isinstance(prog[3].op, Subtensor)
-        assert len(prog) == 4
+        assert isinstance(prog[2].op, Subtensor)
+        assert len(prog) == 3
         f([[0, 1], [2, 3]], [4, 5])  # let debugmode test something
 
     def test_basic_7(self):
@@ -1467,7 +1464,6 @@ class TestLocalSubtensorMerge:
 
 class TestLocalAdvSub1AdvIncSub1:
     def setup_method(self):
-
         mode = get_default_mode()
         self.mode = mode.including(
             "local_replace_AdvancedSubtensor",
@@ -1860,7 +1856,6 @@ def test_local_set_to_inc_subtensor():
 
 
 def test_local_subtensor_of_alloc():
-
     # DebugMode should detect if something goes wrong.
     # test shape combination of odd and event shape.
     for s in [(3, 5), (4, 6), (3, 8), (4, 7), (1, 5), (5, 1)]:
@@ -1873,7 +1868,6 @@ def test_local_subtensor_of_alloc():
         yval = np.arange(s[1], dtype=config.floatX)
 
         for y in [shared(yval), at.constant([1.0])]:
-
             # The rows of yx are copies of y
             yx = at.alloc(y, x.shape[0], x.shape[1])
 

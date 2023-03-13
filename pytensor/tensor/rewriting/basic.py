@@ -638,7 +638,6 @@ def local_useless_elemwise(fgraph, node):
             return [node.inputs[0]]
 
         elif isinstance(node.op.scalar_op, aes.AND) and len(node.inputs) == 2:
-
             if isinstance(node.inputs[0], TensorConstant):
                 const_val = extract_constant(
                     node.inputs[0], only_process_constants=True
@@ -664,7 +663,6 @@ def local_useless_elemwise(fgraph, node):
                         return [node.inputs[0].astype(node.outputs[0].dtype)]
 
         elif isinstance(node.op.scalar_op, aes.OR) and len(node.inputs) == 2:
-
             if isinstance(node.inputs[0], TensorConstant):
                 const_val = extract_constant(
                     node.inputs[0], only_process_constants=True
@@ -721,7 +719,7 @@ def local_alloc_unary(fgraph, node):
 def local_cast_cast(fgraph, node):
     """cast(cast(x, dtype1), dtype2)
 
-    when those contrain:
+    when those constrain:
     dtype1 == dtype2
     OR the base dtype is the same (int, uint, float, complex)
           and the first cast cause an upcast.
@@ -1125,7 +1123,6 @@ def local_useless_split(fgraph, node):
 
 @node_rewriter(None)
 def constant_folding(fgraph, node):
-
     if not node.op.do_constant_folding(fgraph, node):
         return False
 

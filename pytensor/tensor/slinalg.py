@@ -1,10 +1,9 @@
 import logging
 import warnings
-from typing import TYPE_CHECKING, Union
+from typing import TYPE_CHECKING, Literal, Union
 
 import numpy as np
 import scipy.linalg
-from typing_extensions import Literal
 
 import pytensor
 import pytensor.tensor as pt
@@ -130,7 +129,6 @@ cholesky = Cholesky()
 
 
 class CholeskySolve(Op):
-
     __props__ = ("lower", "check_finite")
 
     def __init__(

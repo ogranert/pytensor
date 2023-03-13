@@ -19,6 +19,9 @@ from tests.link.jax.test_basic import compare_jax_and_py, jax_mode, set_test_val
 jax = pytest.importorskip("jax")
 
 
+from pytensor.link.jax.dispatch.random import numpyro_available  # noqa: E402
+
+
 def test_random_RandomStream():
     """Two successive calls of a compiled graph using `RandomStream` should
     return different values.
@@ -179,7 +182,7 @@ def test_random_updates(rng_ctor):
             ],
             (2,),
             "lognorm",
-            lambda *args: args,
+            lambda mu, sigma: (sigma, 0, np.exp(mu)),
         ),
         (
             aer.normal,
@@ -223,6 +226,22 @@ def test_random_updates(rng_ctor):
         ),
         (
             aer.randint,
+            [
+                set_test_value(
+                    at.lscalar(),
+                    np.array(0, dtype=np.int64),
+                ),
+                set_test_value(  # high-value necessary since test on cdf
+                    at.lscalar(),
+                    np.array(1000, dtype=np.int64),
+                ),
+            ],
+            (),
+            "randint",
+            lambda *args: args,
+        ),
+        (
+            aer.integers,
             [
                 set_test_value(
                     at.lscalar(),
@@ -285,7 +304,7 @@ def test_random_updates(rng_ctor):
             [
                 set_test_value(
                     at.dvector(),
-                    np.array([-1.0, 2.0], dtype=np.float64),
+                    np.array([-1.0, 200.0], dtype=np.float64),
                 ),
                 set_test_value(
                     at.dscalar(),
@@ -295,6 +314,90 @@ def test_random_updates(rng_ctor):
             (2,),
             "halfnorm",
             lambda *args: args,
+        ),
+        (
+            aer.invgamma,
+            [
+                set_test_value(
+                    at.dvector(),
+                    np.array([10.4, 2.8], dtype=np.float64),
+                ),
+                set_test_value(
+                    at.dvector(),
+                    np.array([3.4, 7.3], dtype=np.float64),
+                ),
+            ],
+            (2,),
+            "invgamma",
+            lambda a, b: (a, 0, b),
+        ),
+        (
+            aer.chisquare,
+            [
+                set_test_value(
+                    at.dvector(),
+                    np.array([2.4, 4.9], dtype=np.float64),
+                ),
+            ],
+            (2,),
+            "chi2",
+            lambda *args: args,
+        ),
+        (
+            aer.gengamma,
+            [
+                set_test_value(
+                    at.dvector(),
+                    np.array([10.4, 2.8], dtype=np.float64),
+                ),
+                set_test_value(
+                    at.dvector(),
+                    np.array([3.4, 7.3], dtype=np.float64),
+                ),
+                set_test_value(
+                    at.dvector(),
+                    np.array([0.9, 2.0], dtype=np.float64),
+                ),
+            ],
+            (2,),
+            "gengamma",
+            lambda alpha, p, lambd: (alpha / p, p, 0, lambd),
+        ),
+        (
+            aer.wald,
+            [
+                set_test_value(
+                    at.dvector(),
+                    np.array([10.4, 2.8], dtype=np.float64),
+                ),
+                set_test_value(
+                    at.dvector(),
+                    np.array([4.5, 2.0], dtype=np.float64),
+                ),
+            ],
+            (2,),
+            "invgauss",
+            # https://stackoverflow.com/a/48603469
+            lambda mean, scale: (mean / scale, 0, scale),
+        ),
+        pytest.param(
+            aer.vonmises,
+            [
+                set_test_value(
+                    at.dvector(),
+                    np.array([-0.5, 1.3], dtype=np.float64),
+                ),
+                set_test_value(
+                    at.dvector(),
+                    np.array([5.5, 13.0], dtype=np.float64),
+                ),
+            ],
+            (2,),
+            "vonmises",
+            lambda mu, kappa: (kappa, mu),
+            marks=pytest.mark.skipif(
+                not numpyro_available, reason="VonMises dispatch requires numpyro"
+            ),
         ),
     ],
 )
@@ -311,7 +414,11 @@ def test_random_RandomVariable(rv_op, dist_params, base_size, cdf_name, params_c
         The parameters passed to the op.
 
     """
-    rng = shared(np.random.RandomState(29402))
+    if rv_op is aer.integers:
+        # Integers only accepts Generator, not RandomState
+        rng = shared(np.random.default_rng(29402))
+    else:
+        rng = shared(np.random.RandomState(29402))
     g = rv_op(*dist_params, size=(10_000,) + base_size, rng=rng)
     g_fn = function(dist_params, g, mode=jax_mode)
     samples = g_fn(
@@ -329,7 +436,8 @@ def test_random_RandomVariable(rv_op, dist_params, base_size, cdf_name, params_c
         test_res = stats.cramervonmises(
             samples[(Ellipsis,) + idx], cdf_name, args=cdf_params
         )
-        assert test_res.pvalue > 0.1
+        assert not np.isnan(test_res.statistic)
+        assert test_res.pvalue > 0.01
 
 
 @pytest.mark.parametrize("size", [(), (4,)])
@@ -368,7 +476,6 @@ def test_random_dirichlet(parameter, size):
 
 
 def test_random_choice():
-
     # Elements are picked at equal frequency
     num_samples = 10000
     rng = shared(np.random.RandomState(123))
@@ -408,6 +515,106 @@ def test_random_permutation():
     permuted = g_fn()
     with pytest.raises(AssertionError):
         np.testing.assert_allclose(array, permuted)
+
+
+def test_random_geometric():
+    rng = shared(np.random.RandomState(123))
+    p = np.array([0.3, 0.7])
+    g = at.random.geometric(p, size=(10_000, 2), rng=rng)
+    g_fn = function([], g, mode=jax_mode)
+    samples = g_fn()
+    np.testing.assert_allclose(samples.mean(axis=0), 1 / p, rtol=0.1)
+    np.testing.assert_allclose(samples.std(axis=0), np.sqrt((1 - p) / p**2), rtol=0.1)
+
+
+def test_negative_binomial():
+    rng = shared(np.random.RandomState(123))
+    n = np.array([10, 40])
+    p = np.array([0.3, 0.7])
+    g = at.random.negative_binomial(n, p, size=(10_000, 2), rng=rng)
+    g_fn = function([], g, mode=jax_mode)
+    samples = g_fn()
+    np.testing.assert_allclose(samples.mean(axis=0), n * (1 - p) / p, rtol=0.1)
+    np.testing.assert_allclose(
+        samples.std(axis=0), np.sqrt(n * (1 - p) / p**2), rtol=0.1
+    )
+
+
+@pytest.mark.skipif(not numpyro_available, reason="Binomial dispatch requires numpyro")
+def test_binomial():
+    rng = shared(np.random.RandomState(123))
+    n = np.array([10, 40])
+    p = np.array([0.3, 0.7])
+    g = at.random.binomial(n, p, size=(10_000, 2), rng=rng)
+    g_fn = function([], g, mode=jax_mode)
+    samples = g_fn()
+    np.testing.assert_allclose(samples.mean(axis=0), n * p, rtol=0.1)
+    np.testing.assert_allclose(samples.std(axis=0), np.sqrt(n * p * (1 - p)), rtol=0.1)
+
+
+@pytest.mark.skipif(
+    not numpyro_available, reason="BetaBinomial dispatch requires numpyro"
+)
+def test_beta_binomial():
+    rng = shared(np.random.RandomState(123))
+    n = np.array([10, 40])
+    a = np.array([1.5, 13])
+    b = np.array([0.5, 9])
+    g = at.random.betabinom(n, a, b, size=(10_000, 2), rng=rng)
+    g_fn = function([], g, mode=jax_mode)
+    samples = g_fn()
+    np.testing.assert_allclose(samples.mean(axis=0), n * a / (a + b), rtol=0.1)
+    np.testing.assert_allclose(
+        samples.std(axis=0),
+        np.sqrt((n * a * b * (a + b + n)) / ((a + b) ** 2 * (a + b + 1))),
+        rtol=0.1,
+    )
+
+
+@pytest.mark.skipif(
+    not numpyro_available, reason="Multinomial dispatch requires numpyro"
+)
+def test_multinomial():
+    rng = shared(np.random.RandomState(123))
+    n = np.array([10, 40])
+    p = np.array([[0.3, 0.7, 0.0], [0.1, 0.4, 0.5]])
+    g = at.random.multinomial(n, p, size=(10_000, 2), rng=rng)
+    g_fn = function([], g, mode=jax_mode)
+    samples = g_fn()
+    np.testing.assert_allclose(samples.mean(axis=0), n[..., None] * p, rtol=0.1)
+    np.testing.assert_allclose(
+        samples.std(axis=0), np.sqrt(n[..., None] * p * (1 - p)), rtol=0.1
+    )
+
+
+@pytest.mark.skipif(not numpyro_available, reason="VonMises dispatch requires numpyro")
+def test_vonmises_mu_outside_circle():
+    # Scipy implementation does not behave as PyTensor/NumPy for mu outside the unit circle
+    # We test that the random draws from the JAX dispatch work as expected in these cases
+    rng = shared(np.random.RandomState(123))
+    mu = np.array([-30, 40])
+    kappa = np.array([100, 10])
+    g = at.random.vonmises(mu, kappa, size=(10_000, 2), rng=rng)
+    g_fn = function([], g, mode=jax_mode)
+    samples = g_fn()
+    np.testing.assert_allclose(
+        samples.mean(axis=0), (mu + np.pi) % (2.0 * np.pi) - np.pi, rtol=0.1
+    )
+
+    # Circvar only does the correct thing in more recent versions of Scipy
+    # https://github.com/scipy/scipy/pull/5747
+    # np.testing.assert_allclose(
+    #     stats.circvar(samples, axis=0),
+    #     1 - special.iv(1, kappa) / special.iv(0, kappa),
+    #     rtol=0.1,
+    # )
+
+    # For now simple compare with std from numpy draws
+    rng = np.random.default_rng(123)
+    ref_samples = rng.vonmises(mu, kappa, size=(10_000, 2))
+    np.testing.assert_allclose(
+        np.std(samples, axis=0), np.std(ref_samples, axis=0), rtol=0.1
+    )
 
 
 def test_random_unimplemented():

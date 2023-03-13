@@ -1,13 +1,11 @@
-import jax
 import numpy as np
 import pytest
-from packaging.version import parse as version_parse
 
 import pytensor.tensor as at
 from pytensor.compile.ops import DeepCopyOp, ViewOp
 from pytensor.configdefaults import config
 from pytensor.graph.fg import FunctionGraph
-from pytensor.tensor.shape import Shape, Shape_i, SpecifyShape, Unbroadcast, reshape
+from pytensor.tensor.shape import Shape, Shape_i, Unbroadcast, reshape
 from pytensor.tensor.type import iscalar, vector
 from tests.link.jax.test_basic import compare_jax_and_py
 
@@ -25,54 +23,54 @@ def test_jax_shape_ops():
     compare_jax_and_py(x_fg, [], must_be_device_array=False)
 
 
-@pytest.mark.xfail(
-    version_parse(jax.__version__) >= version_parse("0.2.12"),
-    reason="Omnistaging cannot be disabled",
-)
 def test_jax_specify_shape():
-    x_np = np.zeros((20, 3))
-    x = SpecifyShape()(at.as_tensor_variable(x_np), (20, 3))
-    x_fg = FunctionGraph([], [x])
+    in_at = at.matrix("in")
+    x = at.specify_shape(in_at, (4, 5))
+    x_fg = FunctionGraph([in_at], [x])
+    compare_jax_and_py(x_fg, [np.ones((4, 5)).astype(config.floatX)])
 
-    compare_jax_and_py(x_fg, [])
+    # When used to assert two arrays have similar shapes
+    in_at = at.matrix("in")
+    shape_at = at.matrix("shape")
+    x = at.specify_shape(in_at, shape_at.shape)
+    x_fg = FunctionGraph([in_at, shape_at], [x])
+    compare_jax_and_py(
+        x_fg,
+        [np.ones((4, 5)).astype(config.floatX), np.ones((4, 5)).astype(config.floatX)],
+    )
 
-    with config.change_flags(compute_test_value="off"):
 
-        x = SpecifyShape()(at.as_tensor_variable(x_np), *(2, 3))
-        x_fg = FunctionGraph([], [x])
-
-        with pytest.raises(AssertionError):
-            compare_jax_and_py(x_fg, [])
-
-
-def test_jax_Reshape():
+def test_jax_Reshape_constant():
     a = vector("a")
     x = reshape(a, (2, 2))
     x_fg = FunctionGraph([a], [x])
     compare_jax_and_py(x_fg, [np.r_[1.0, 2.0, 3.0, 4.0].astype(config.floatX)])
 
-    # Test breaking "omnistaging" changes in JAX.
-    # See https://github.com/tensorflow/probability/commit/782d0c64eb774b9aac54a1c8488e4f1f96fbbc68
+
+def test_jax_Reshape_concrete_shape():
+    """JAX should compile when a concrete value is passed for the `shape` parameter."""
+    a = vector("a")
+    x = reshape(a, a.shape)
+    x_fg = FunctionGraph([a], [x])
+    compare_jax_and_py(x_fg, [np.r_[1.0, 2.0, 3.0, 4.0].astype(config.floatX)])
+
     x = reshape(a, (a.shape[0] // 2, a.shape[0] // 2))
     x_fg = FunctionGraph([a], [x])
-    with pytest.raises(
-        TypeError,
-        match="Shapes must be 1D sequences of concrete values of integer type",
-    ):
-        compare_jax_and_py(x_fg, [np.r_[1.0, 2.0, 3.0, 4.0].astype(config.floatX)])
+    compare_jax_and_py(x_fg, [np.r_[1.0, 2.0, 3.0, 4.0].astype(config.floatX)])
 
-    b = iscalar("b")
-    x = reshape(a, (b, b))
-    x_fg = FunctionGraph([a, b], [x])
-    with pytest.raises(
-        TypeError,
-        match="Shapes must be 1D sequences of concrete values of integer type",
-    ):
-        compare_jax_and_py(x_fg, [np.r_[1.0, 2.0, 3.0, 4.0].astype(config.floatX), 2])
+
+@pytest.mark.xfail(
+    reason="`shape_at` should be specified as a static argument", strict=True
+)
+def test_jax_Reshape_shape_graph_input():
+    a = vector("a")
+    shape_at = iscalar("b")
+    x = reshape(a, (shape_at, shape_at))
+    x_fg = FunctionGraph([a, shape_at], [x])
+    compare_jax_and_py(x_fg, [np.r_[1.0, 2.0, 3.0, 4.0].astype(config.floatX), 2])
 
 
 def test_jax_compile_ops():
-
     x = DeepCopyOp()(at.as_tensor_variable(1.1))
     x_fg = FunctionGraph([], [x])
 

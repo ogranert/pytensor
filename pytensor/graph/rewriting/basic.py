@@ -15,9 +15,7 @@ from functools import _compose_mro, partial, reduce  # type: ignore
 from itertools import chain
 from typing import TYPE_CHECKING, Callable, Dict
 from typing import Iterable as IterableType
-from typing import List, Optional, Sequence, Tuple, Union, cast
-
-from typing_extensions import Literal
+from typing import List, Literal, Optional, Sequence, Tuple, Union, cast
 
 import pytensor
 from pytensor.configdefaults import config
@@ -307,7 +305,6 @@ class SequentialGraphRewriter(GraphRewriter, UserList):
                     else:
                         raise
         finally:
-
             if fgraph.profile:
                 validate_time = fgraph.profile.validate_time - validate_before
                 callbacks_time = {}
@@ -403,7 +400,7 @@ class SequentialGraphRewriter(GraphRewriter, UserList):
                 file=stream,
             )
         ll = []
-        for (rewrite, nb_n) in zip(rewrites, nb_nodes):
+        for rewrite, nb_n in zip(rewrites, nb_nodes):
             if hasattr(rewrite, "__name__"):
                 name = rewrite.__name__
             else:
@@ -412,7 +409,7 @@ class SequentialGraphRewriter(GraphRewriter, UserList):
             ll.append((name, rewrite.__class__.__name__, idx) + nb_n)
         lll = sorted(zip(prof, ll), key=lambda a: a[0])
 
-        for (t, rewrite) in lll[::-1]:
+        for t, rewrite in lll[::-1]:
             i = rewrite[2]
             if sub_validate_time:
                 val_time = sub_validate_time[i + 1] - sub_validate_time[i]
@@ -636,7 +633,6 @@ class MergeFeature(Feature):
 
         replacement_candidates = []
         for candidate in merge_candidates:
-
             if candidate is node:
                 continue
             if len(node.inputs) != len(candidate.inputs):
@@ -812,7 +808,6 @@ class MergeOptimizer(GraphRewriter):
 
     @classmethod
     def print_profile(cls, stream, prof, level=0):
-
         (
             nb_fail,
             replace_time,
@@ -907,7 +902,6 @@ def pre_constant_merge(fgraph, variables):
         variables = [variables]
 
     def recursive_merge(var):
-
         if var in seen_var:
             return var
 
@@ -1185,7 +1179,7 @@ class OpToRewriterTracker:
                 matches.extend(match)
         return matches
 
-    @functools.lru_cache()
+    @functools.lru_cache
     def get_trackers(self, op: Op) -> List[NodeRewriter]:
         """Get all the rewrites applicable to `op`."""
         return (
@@ -1260,7 +1254,6 @@ class SequentialNodeRewriter(NodeRewriter):
         self.tracker = OpToRewriterTracker()
 
         for o in self.rewrites:
-
             self.tracker.add_tracker(o)
 
             if self.profile:
@@ -1361,7 +1354,7 @@ class SequentialNodeRewriter(NodeRewriter):
                 file=stream,
             )
             count_rewrite.sort()
-            for (t, a_t, count, o, n_c) in count_rewrite[::-1]:
+            for t, a_t, count, o, n_c in count_rewrite[::-1]:
                 print(
                     blanc,
                     f"  {t:.3f}s - {int(a_t)} - {int(count)} - {o} - {int(n_c)}",
@@ -1376,7 +1369,7 @@ class SequentialNodeRewriter(NodeRewriter):
                 file=stream,
             )
             not_used.sort(key=lambda nu: (nu[0], str(nu[1])))
-            for (t, o) in not_used[::-1]:
+            for t, o in not_used[::-1]:
                 if t > 0:
                     # Skip rewrites that have 0 times; they probably weren't even tried.
                     print(blanc + "  ", f"  {t:.3f}s - {o}", file=stream)
@@ -2623,7 +2616,7 @@ class EquilibriumGraphRewriter(NodeProcessingGraphRewriter):
                 blanc, "  times - times applied - nb node created - name:", file=stream
             )
             count_rewrite.sort()
-            for (t, count, n_created, o) in count_rewrite[::-1]:
+            for t, count, n_created, o in count_rewrite[::-1]:
                 print(
                     blanc,
                     f"  {t:.3f}s - {int(count)} - {int(n_created)} - {o}",
@@ -2635,7 +2628,7 @@ class EquilibriumGraphRewriter(NodeProcessingGraphRewriter):
                 file=stream,
             )
             not_used.sort(key=lambda nu: (nu[0], str(nu[1])))
-            for (t, o) in not_used[::-1]:
+            for t, o in not_used[::-1]:
                 if t > 0:
                     # Skip rewrites that have no run-times; they probably weren't even tried.
                     print(blanc + "  ", f"  {t:.3f}s - {o}", file=stream)

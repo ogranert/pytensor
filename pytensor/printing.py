@@ -9,10 +9,20 @@ from contextlib import contextmanager
 from copy import copy
 from functools import reduce, singledispatch
 from io import StringIO
-from typing import Any, Callable, Dict, List, Optional, Sequence, TextIO, Tuple, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Sequence,
+    TextIO,
+    Tuple,
+    Union,
+)
 
 import numpy as np
-from typing_extensions import Literal
 
 from pytensor.compile import Function, SharedVariable
 from pytensor.compile.io import In, Out
@@ -300,9 +310,12 @@ N.B.:
     for var, profile, storage_map, topo_order in zip(
         outputs_to_print, profile_list, storage_maps, topo_orders
     ):
-
         if hasattr(var.owner, "op"):
-            if isinstance(var.owner.op, HasInnerGraph) and var not in inner_graph_vars:
+            if (
+                isinstance(var.owner.op, HasInnerGraph)
+                or hasattr(var.owner.op, "scalar_op")
+                and isinstance(var.owner.op.scalar_op, HasInnerGraph)
+            ) and var not in inner_graph_vars:
                 inner_graph_vars.append(var)
             if print_op_info:
                 op_information.update(op_debug_information(var.owner.op, var.owner))
@@ -334,7 +347,6 @@ N.B.:
         print("Inner graphs:", file=_file)
 
         for ig_var in inner_graph_vars:
-
             # This is a work-around to maintain backward compatibility
             # (e.g. to only print inner graphs that have been compiled through
             # a call to `Op.prepare_node`)
@@ -345,8 +357,12 @@ N.B.:
                 inner_inputs = inner_fn.maker.fgraph.inputs
                 inner_outputs = inner_fn.maker.fgraph.outputs
             else:
-                inner_inputs = ig_var.owner.op.inner_inputs
-                inner_outputs = ig_var.owner.op.inner_outputs
+                if hasattr(ig_var.owner.op, "scalar_op"):
+                    inner_inputs = ig_var.owner.op.scalar_op.inner_inputs
+                    inner_outputs = ig_var.owner.op.scalar_op.inner_outputs
+                else:
+                    inner_inputs = ig_var.owner.op.inner_inputs
+                    inner_outputs = ig_var.owner.op.inner_outputs
 
             outer_inputs = ig_var.owner.inputs
 
@@ -409,11 +425,11 @@ N.B.:
                 inner_to_outer_inputs = None
 
             for out in inner_outputs:
-
                 if (
                     isinstance(getattr(out.owner, "op", None), HasInnerGraph)
-                    and out not in inner_graph_vars
-                ):
+                    or hasattr(getattr(out.owner, "op", None), "scalar_op")
+                    and isinstance(out.owner.op.scalar_op, HasInnerGraph)
+                ) and out not in inner_graph_vars:
                     inner_graph_vars.append(out)
 
                 _debugprint(
@@ -654,8 +670,9 @@ def _debugprint(
                 if hasattr(in_var, "owner") and hasattr(in_var.owner, "op"):
                     if (
                         isinstance(in_var.owner.op, HasInnerGraph)
-                        and in_var not in inner_graph_ops
-                    ):
+                        or hasattr(in_var.owner.op, "scalar_op")
+                        and isinstance(in_var.owner.op.scalar_op, HasInnerGraph)
+                    ) and in_var not in inner_graph_ops:
                         inner_graph_ops.append(in_var)
 
                 _debugprint(
@@ -682,7 +699,6 @@ def _debugprint(
                     inner_graph_node=inner_graph_node,
                 )
     else:
-
         id_str = get_id_str(var)
 
         if id_str:
@@ -699,7 +715,6 @@ def _debugprint(
             op_information.update(op_debug_information(var.owner.op, var.owner))
 
         if inner_to_outer_inputs is not None and var in inner_to_outer_inputs:
-
             outer_var = inner_to_outer_inputs[var]
 
             if outer_var.owner:
@@ -1138,7 +1153,6 @@ if use_ascii:
         epsilon="\\epsilon",
     )
 else:
-
     special = dict(middle_dot="\u00B7", big_sigma="\u03A3")
 
     greek = dict(
@@ -1422,7 +1436,6 @@ def pydotprint(
     # it, we must copy it.
     outputs = list(outputs)
     if isinstance(fct, Function):
-
         # TODO: Get rid of all this `expanded_inputs` nonsense and use
         # `fgraph.update_mapping`
         function_inputs = zip(fct.maker.expanded_inputs, fgraph.inputs)

@@ -2,6 +2,7 @@ r"""Rewrites for the `Op`\s in :mod:`pytensor.tensor.math`."""
 
 import itertools
 import operator
+from collections import defaultdict
 from functools import partial, reduce
 
 import numpy as np
@@ -71,8 +72,8 @@ from pytensor.tensor.math import pow as at_pow
 from pytensor.tensor.math import (
     prod,
     reciprocal,
-    sgn,
     sigmoid,
+    sign,
     softplus,
     sqr,
     sqrt,
@@ -91,7 +92,6 @@ from pytensor.tensor.rewriting.basic import (
     register_uncanonicalize,
     register_useless,
 )
-from pytensor.tensor.rewriting.elemwise import FusionOptimizer, fuse_seqopt
 from pytensor.tensor.shape import Shape, Shape_i
 from pytensor.tensor.subtensor import Subtensor
 from pytensor.tensor.type import (
@@ -421,6 +421,100 @@ def local_sumsqr2dot(fgraph, node):
                     if new_out.dtype != out.dtype:
                         new_out = cast(new_out, dtype=out.dtype)
                     return [new_out]
+
+
+@register_specialize
+@node_rewriter([mul, true_div])
+def local_mul_exp_to_exp_add(fgraph, node):
+    """
+    This rewrite detects e^x * e^y and converts it to e^(x+y).
+    Similarly, e^x / e^y becomes e^(x-y).
+    """
+    exps = [
+        n.owner.inputs[0]
+        for n in node.inputs
+        if n.owner
+        and hasattr(n.owner.op, "scalar_op")
+        and isinstance(n.owner.op.scalar_op, aes.Exp)
+    ]
+    # Can only do any rewrite if there are at least two exp-s
+    if len(exps) >= 2:
+        # Mul -> add; TrueDiv -> sub
+        orig_op, new_op = mul, add
+        if isinstance(node.op.scalar_op, aes.TrueDiv):
+            orig_op, new_op = true_div, sub
+        new_out = exp(new_op(*exps))
+        if new_out.dtype != node.outputs[0].dtype:
+            new_out = cast(new_out, dtype=node.outputs[0].dtype)
+        # The original Mul may have more than two factors, some of which may not be exp nodes.
+        # If so, we keep multiplying them with the new exp(sum) node.
+        # E.g.: e^x * y * e^z * w --> e^(x+z) * y * w
+        rest = [
+            n
+            for n in node.inputs
+            if not n.owner
+            or not hasattr(n.owner.op, "scalar_op")
+            or not isinstance(n.owner.op.scalar_op, aes.Exp)
+        ]
+        if len(rest) > 0:
+            new_out = orig_op(new_out, *rest)
+            if new_out.dtype != node.outputs[0].dtype:
+                new_out = cast(new_out, dtype=node.outputs[0].dtype)
+        return [new_out]
+
+
+@register_specialize
+@node_rewriter([mul, true_div])
+def local_mul_pow_to_pow_add(fgraph, node):
+    """
+    This rewrite detects a^x * a^y and converts it to a^(x+y).
+    Similarly, a^x / a^y becomes a^(x-y).
+    """
+    # search for pow-s and group them by their bases
+    pow_nodes = defaultdict(list)
+    rest = []
+    for n in node.inputs:
+        if (
+            n.owner
+            and hasattr(n.owner.op, "scalar_op")
+            and isinstance(n.owner.op.scalar_op, aes.Pow)
+        ):
+            base_node = n.owner.inputs[0]
+            # exponent is at n.owner.inputs[1], but we need to store the full node
+            # in case this particular power node remains alone and can't be rewritten
+            pow_nodes[base_node].append(n)
+        else:
+            rest.append(n)
+
+    # Can only do any rewrite if there are at least two pow-s with the same base
+    can_rewrite = [k for k, v in pow_nodes.items() if len(v) >= 2]
+    if len(can_rewrite) >= 1:
+        # Mul -> add; TrueDiv -> sub
+        orig_op, new_op = mul, add
+        if isinstance(node.op.scalar_op, aes.TrueDiv):
+            orig_op, new_op = true_div, sub
+        pow_factors = []
+        # Rewrite pow-s having the same base for each different base
+        # E.g.: a^x * a^y --> a^(x+y)
+        for base in can_rewrite:
+            exponents = [n.owner.inputs[1] for n in pow_nodes[base]]
+            new_node = base ** new_op(*exponents)
+            if new_node.dtype != node.outputs[0].dtype:
+                new_node = cast(new_node, dtype=node.outputs[0].dtype)
+            pow_factors.append(new_node)
+        # Don't forget about those sole pow-s that couldn't be rewriten
+        sole_pows = [v[0] for k, v in pow_nodes.items() if k not in can_rewrite]
+        # Combine the rewritten pow-s and other, non-pow factors of the original Mul
+        # E.g.: a^x * y * b^z * a^w * v * b^t --> a^(x+z) * b^(z+t) * y * v
+        if len(pow_factors) > 1 or len(sole_pows) > 0 or len(rest) > 0:
+            new_out = orig_op(*pow_factors, *sole_pows, *rest)
+            if new_out.dtype != node.outputs[0].dtype:
+                new_out = cast(new_out, dtype=node.outputs[0].dtype)
+        else:
+            # if all factors of the original mul were pows-s with the same base,
+            # we can get rid of the mul completely.
+            new_out = pow_factors[0]
+        return [new_out]
 
 
 @register_stabilize
@@ -1147,7 +1241,6 @@ def local_sum_prod_mul_by_scalar(fgraph, node):
             # If `node.op` is a `Prod`, then the scalars need to be raised to
             # the power of the number of elements in the input to the `Prod`
             if isinstance(node.op, Prod) and new_op_input_nb_elements != 1:
-
                 scalars = [s**new_op_input_nb_elements for s in scalars]
 
             # Scale the output of the op by the scalars and return as
@@ -1543,7 +1636,6 @@ def local_op_of_op(fgraph, node):
         # computations.
         if len(fgraph.clients[node_inps]) == 1:
             if node_inps.owner and (isinstance(node_inps.owner.op, node.op.__class__)):
-
                 # check to see either the inner or outer prod is doing a
                 # product over all axis, in which case we can remove it
                 if node_inps.owner.op.axis is None or node.op.axis is None:
@@ -1828,7 +1920,6 @@ def local_add_neg_to_sub(fgraph, node):
 
     # Rewrite is only applicable when there are two inputs to add
     if node.op == add and len(node.inputs) == 2:
-
         # Look for pattern with either input order
         for first, second in (node.inputs, reversed(node.inputs)):
             if second.owner:
@@ -2198,7 +2289,7 @@ def check_for_x_over_absX(numerators, denominators):
             else:
                 denominators.remove(den)
                 numerators.remove(den.owner.inputs[0])
-                numerators.append(sgn(den.owner.inputs[0]))
+                numerators.append(sign(den.owner.inputs[0]))
     return numerators, denominators
 
 
@@ -2871,66 +2962,6 @@ def local_grad_log_erfc_neg(fgraph, node):
     return [ret]
 
 
-def local_add_mul_fusion(fgraph, node):
-    """Fuse consecutive add or mul in one such node with more inputs.
-
-    It is better to fuse add/mul that way then in a Composite node as
-    this make the inner graph of the Composite smaller. This allow to
-    put more computation in a Composite before hitting the max
-    recursion limit when pickling Composite.
-
-    """
-    if not isinstance(node.op, Elemwise) or not isinstance(
-        node.op.scalar_op, (aes.Add, aes.Mul)
-    ):
-        return False
-
-    s_op = node.op.scalar_op.__class__
-    new_inp = []
-    fused = False
-    nb_inputs = len(node.inputs)
-    max_inputs = float("inf")
-    if hasattr(node.op, "max_inputs"):
-        max_inputs = node.op.max_inputs(node)
-    for inp in node.inputs:
-        if (
-            inp.owner
-            and isinstance(inp.owner.op, Elemwise)
-            and isinstance(inp.owner.op.scalar_op, s_op)
-            and
-            # Do not duplicate the operation.
-            len(fgraph.clients[inp]) == 1
-            and (nb_inputs + len(inp.owner.inputs) - 1) <= max_inputs
-        ):
-            new_inp.extend(inp.owner.inputs)
-            fused = True
-        else:
-            new_inp.append(inp)
-
-    # We can not compare the number of inputs as Mul and Add could have
-    # 0 or 1 inputs in some corner cases.
-    if fused:
-        output = node.op(*new_inp)
-        copy_stack_trace(node.outputs[0], output)
-
-        # Do the recursion here to help lower the number of
-        # FusionOptimizer iteration.
-        if output.owner:
-            output2 = local_add_mul_fusion(fgraph, output.owner)
-            if output2:
-                return output2
-        return [output]
-
-
-fuse_seqopt.register(
-    "local_add_mul_fusion",
-    FusionOptimizer(local_add_mul_fusion),
-    "fast_run",
-    "fusion",
-    position=0,
-)
-
-
 def _skip_mul_1(r):
     if r.owner and r.owner.op == mul:
         not_is_1 = [i for i in r.owner.inputs if not _is_1(i)]
@@ -3144,7 +3175,6 @@ def local_exp_over_1_plus_exp(fgraph, node):
     # This rewrite should be done for numerical stability
     # so we don't care to check client counts
     if node.op == true_div:
-
         # find all the exp() terms in the numerator
         num, denom = node.inputs
         num_exp_x, num_rest, num_neg = partition_num_or_denom(num, is_exp)

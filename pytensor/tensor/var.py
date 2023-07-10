@@ -12,7 +12,7 @@ from pytensor.configdefaults import config
 from pytensor.graph.basic import Constant, OptionalApplyType, Variable
 from pytensor.graph.utils import MetaType
 from pytensor.scalar import ComplexError, IntegerDivisionError
-from pytensor.tensor import _get_vector_length, as_tensor_variable
+from pytensor.tensor import _get_vector_length
 from pytensor.tensor.exceptions import AdvancedIndexingError
 from pytensor.tensor.type import TensorType
 from pytensor.tensor.type_other import NoneConst
@@ -259,9 +259,6 @@ class _tensor_py_operators:
 
     @property
     def shape(self):
-        if not any(s is None for s in self.type.shape):
-            return as_tensor_variable(self.type.shape, ndim=1, dtype=np.int64)
-
         return at.shape(self)
 
     @property
@@ -286,7 +283,7 @@ class _tensor_py_operators:
     #                     "Variable) due to Python restriction. You can use "
     #                     "PyTensorVariable.shape[0] instead.")
 
-    def reshape(self, shape, ndim=None):
+    def reshape(self, shape, *, ndim=None):
         """Return a reshaped view/copy of this variable.
 
         Parameters
@@ -616,9 +613,9 @@ class _tensor_py_operators:
         except TypeError:
             # This prevents accidental iteration via sum(self)
             raise TypeError(
-                "TensorType does not support iteration. "
-                "Maybe you are using builtins.sum instead of "
-                "pytensor.tensor.math.sum? (Maybe .max?)"
+                "TensorType does not support iteration.\n"
+                "\tDid you pass a PyTensor variable to a function that expects a list?\n"
+                "\tMaybe you are using builtins.sum instead of pytensor.tensor.sum?"
             )
 
     @property
@@ -756,8 +753,8 @@ class _tensor_py_operators:
     # This value is set so that PyTensor arrays will trump NumPy operators.
     __array_priority__ = 1000
 
-    def get_scalar_constant_value(self):
-        return at.basic.get_scalar_constant_value(self)
+    def get_underlying_scalar_constant(self):
+        return at.basic.get_underlying_scalar_constant_value(self)
 
     def zeros_like(model, dtype=None):
         return at.basic.zeros_like(model, dtype=dtype)
@@ -1022,21 +1019,6 @@ class TensorConstant(TensorVariable, Constant[_TensorTypeType]):
         assert not any(s is None for s in new_type.shape)
 
         Constant.__init__(self, new_type, data, name)
-
-    def __str__(self):
-        unique_val = get_unique_value(self)
-        if unique_val is not None:
-            val = f"{self.data.shape} of {unique_val}"
-        else:
-            val = f"{self.data}"
-        if len(val) > 20:
-            val = val[:10] + ".." + val[-10:]
-
-        if self.name is not None:
-            name = self.name
-        else:
-            name = "TensorConstant"
-        return f"{name}{{{val}}}"
 
     def signature(self):
         return TensorConstantSignature((self.type, self.data))

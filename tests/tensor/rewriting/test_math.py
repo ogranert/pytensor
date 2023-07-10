@@ -96,7 +96,7 @@ from pytensor.tensor.rewriting.math import (
     perform_sigm_times_exp,
     simplify_mul,
 )
-from pytensor.tensor.shape import Reshape, Shape_i
+from pytensor.tensor.shape import Reshape, Shape_i, SpecifyShape
 from pytensor.tensor.type import (
     TensorType,
     cmatrix,
@@ -608,9 +608,10 @@ class TestAlgebraicCanonizer:
                 ((dv / dy) / dv, [dv, dy], [dvv, dyv], 1, "float64"),
                 ((fv / fy) / fv, [fv, fy], [fvv, fyv], 1, "float32"),
                 # must broadcast as their is a dimshuffle in the computation
-                ((dx / dv) / dx, [dx, dv], [dxv, dvv], 1, "float64"),
+                # The broadcast leads to an extra elemwise to check compatibility
+                ((dx / dv) / dx, [dx, dv], [dxv, dvv], 2, "float64"),
                 # topo: [Shape_i, Shape_i, Elemwise{reciprocal,no_inplace}(<TensorType(float64, row)>), Alloc]
-                ((fx / fv) / fx, [fx, fv], [fxv, fvv], 1, "float32"),
+                ((fx / fv) / fx, [fx, fv], [fxv, fvv], 2, "float32"),
                 # topo: [Shape_i, Shape_i, Elemwise{reciprocal,no_inplace}(<TensorType(float32, row)>), Alloc]
             ]
         ):
@@ -621,9 +622,12 @@ class TestAlgebraicCanonizer:
             elem = [t for t in topo if isinstance(t.op, Elemwise)]
             assert len(elem) == nb_elemwise
             assert isinstance(elem[0].op, (Elemwise,))
-            assert isinstance(
-                elem[0].op.scalar_op,
-                (aes.basic.Reciprocal, aes.basic.TrueDiv),
+            assert any(
+                isinstance(
+                    el.op.scalar_op,
+                    (aes.basic.Reciprocal, aes.basic.TrueDiv),
+                )
+                for el in elem
             )
             assert out_dtype == out.dtype
 
@@ -1667,13 +1671,25 @@ def test_local_pow_specialize():
     assert isinstance(nodes[1].scalar_op, aes.basic.Reciprocal)
     utt.assert_allclose(f(val_no0), val_no0 ** (-0.5))
 
+    twos = np.full(shape=(10,), fill_value=2.0).astype(config.floatX)
+    f = function([v], v**twos, mode=mode)
+    topo = f.maker.fgraph.toposort()
+    assert len(topo) == 2
+    # Depending on the mode the SpecifyShape is lifted or not
+    if topo[0].op == sqr:
+        assert isinstance(topo[1].op, SpecifyShape)
+    else:
+        assert isinstance(topo[0].op, SpecifyShape)
+        assert topo[1].op == sqr
+    utt.assert_allclose(f(val), val**twos)
 
-def test_local_pow_specialize_device_more_aggressive_on_cpu():
+
+def test_local_pow_to_nested_squaring():
     mode = config.mode
     if mode == "FAST_COMPILE":
         mode = "FAST_RUN"
     mode = get_mode(mode)
-    mode = mode.excluding("fusion").excluding("gpu")
+    mode = mode.excluding("fusion")
 
     v = vector()
     val = np.arange(10, dtype=config.floatX)
@@ -3994,9 +4010,9 @@ class TestSigmoidUtils:
         exp_op = exp
         assert is_1pexp(1 + exp_op(x), False) == (False, x)
         assert is_1pexp(exp_op(x) + 1, False) == (False, x)
-        for neg_, exp_arg in map(
-            lambda x: is_1pexp(x, only_process_constants=False),
-            [(1 + exp_op(-x)), (exp_op(-x) + 1)],
+        for neg_, exp_arg in (
+            is_1pexp(x, only_process_constants=False)
+            for x in [(1 + exp_op(-x)), (exp_op(-x) + 1)]
         ):
             assert not neg_ and is_same_graph(exp_arg, -x)
         assert is_1pexp(1 - exp_op(x), False) is None
@@ -4115,3 +4131,63 @@ def test_local_add_neg_to_sub_const():
 
     x_test = np.array([3, 4], dtype=config.floatX)
     assert np.allclose(f(x_test), x_test + (-const))
+
+
+def test_log1mexp_stabilization():
+    mode = Mode("py").including("stabilize")
+
+    x = vector()
+    f = function([x], log(1 - exp(x)), mode=mode)
+
+    nodes = [node.op for node in f.maker.fgraph.toposort()]
+    assert nodes == [at.log1mexp]
+
+    # Check values that would under or overflow without rewriting
+    assert f([-(2.0**-55)]) != -np.inf
+    overflow_value = -500.0 if config.floatX == "float64" else -100.0
+    assert f([overflow_value]) < 0
+
+    # Check values around the switch point np.log(0.5)
+    assert np.allclose(
+        f(np.array([-0.8, -0.6], dtype=config.floatX)),
+        np.log(1 - np.exp([-0.8, -0.6])),
+    )
+
+
+def test_logdiffexp():
+    rng = np.random.default_rng(3559)
+    mode = Mode("py").including("stabilize").excluding("fusion")
+
+    x = fmatrix("x")
+    y = fmatrix("y")
+    f = function([x, y], log(exp(x) - exp(y)), mode=mode)
+
+    graph = f.maker.fgraph.toposort()
+    assert (
+        len(
+            [
+                node
+                for node in graph
+                if isinstance(node.op, Elemwise)
+                and isinstance(node.op.scalar_op, (aes.Exp, aes.Log))
+            ]
+        )
+        == 0
+    )
+    assert (
+        len(
+            [
+                node
+                for node in graph
+                if isinstance(node.op, Elemwise)
+                and isinstance(node.op.scalar_op, aes.Log1mexp)
+            ]
+        )
+        == 1
+    )
+
+    y_test = rng.normal(size=(3, 2)).astype("float32")
+    x_test = rng.normal(size=(3, 2)).astype("float32") + y_test.max()
+    np.testing.assert_almost_equal(
+        f(x_test, y_test), np.log(np.exp(x_test) - np.exp(y_test))
+    )

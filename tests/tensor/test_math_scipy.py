@@ -1,7 +1,11 @@
-from contextlib import ExitStack as does_not_warn
+import warnings
 
 import numpy as np
 import pytest
+
+from pytensor.gradient import verify_grad
+from pytensor.scalar import ScalarLoop
+from pytensor.tensor.elemwise import Elemwise
 
 
 scipy = pytest.importorskip("scipy")
@@ -11,11 +15,11 @@ from functools import partial
 import scipy.special
 import scipy.stats
 
-from pytensor import function
+from pytensor import function, grad
 from pytensor import tensor as at
 from pytensor.compile.mode import get_default_mode
 from pytensor.configdefaults import config
-from pytensor.tensor import inplace
+from pytensor.tensor import gammaincc, inplace, vector
 from tests import unittest_tools as utt
 from tests.tensor.utils import (
     _good_broadcast_unary_chi2sf,
@@ -387,6 +391,9 @@ def test_gammainc_ddk_tabulated_values():
     gammaincc_ddk = at.grad(gammainc_out, k)
     f_grad = function([k, x], gammaincc_ddk)
 
+    rtol = 1e-5 if config.floatX == "float64" else 1e-2
+    atol = 1e-10 if config.floatX == "float64" else 1e-6
+
     for test_k, test_x, expected_ddk in (
         (0.0001, 0, 0),  # Limit condition
         (0.0001, 0.0001, -8.62594024578651),
@@ -421,8 +428,25 @@ def test_gammainc_ddk_tabulated_values():
         (19.0001, 29.7501, -0.007828749832965796),
     ):
         np.testing.assert_allclose(
-            f_grad(test_k, test_x), expected_ddk, rtol=1e-5, atol=1e-14
+            f_grad(test_k, test_x), expected_ddk, rtol=rtol, atol=atol
         )
+
+
+def test_gammaincc_ddk_performance(benchmark):
+    rng = np.random.default_rng(1)
+    k = vector("k")
+    x = vector("x")
+
+    out = gammaincc(k, x)
+    grad_fn = function([k, x], grad(out.sum(), wrt=[k]), mode="FAST_RUN")
+    vals = [
+        # Values that hit the second branch of the gradient
+        np.full((1000,), 3.2),
+        np.full((1000,), 0.01),
+    ]
+
+    verify_grad(gammaincc, vals, rng=rng)
+    benchmark(grad_fn, *vals)
 
 
 TestGammaUBroadcast = makeBroadcastTester(
@@ -796,7 +820,7 @@ class TestBetaIncGrad:
         betainc_out = at.betainc(a, b, z)
         betainc_grad = at.grad(betainc_out, [a, b])
         f_grad = function([a, b, z], betainc_grad)
-
+        decimal = 7 if config.floatX == "float64" else 5
         for test_a, test_b, test_z, expected_dda, expected_ddb in (
             (1.5, 11.0, 0.001, -4.5720356e-03, 1.1845673e-04),
             (1.5, 11.0, 0.5, -2.5501997e-03, 9.0824388e-04),
@@ -806,6 +830,7 @@ class TestBetaIncGrad:
             np.testing.assert_almost_equal(
                 f_grad(test_a, test_b, test_z),
                 [expected_dda, expected_ddb],
+                decimal=decimal,
             )
 
     def test_beta_inc_stan_grad_combined(self):
@@ -849,162 +874,229 @@ TestHyp2F1InplaceBroadcast = makeBroadcastTester(
 )
 
 
-def test_hyp2f1_grad_stan_cases():
-    """This test reuses the same test cases as in:
-    https://github.com/stan-dev/math/blob/master/test/unit/math/prim/fun/grad_2F1_test.cpp
-    https://github.com/andrjohns/math/blob/develop/test/unit/math/prim/fun/hypergeometric_2F1_test.cpp
+class TestHyp2F1Grad:
+    few_iters_case = (
+        2.0,
+        1.0,
+        2.0,
+        0.4,
+        0.4617734323582945,
+        0.851376039609984,
+        -0.4617734323582945,
+        2.777777777777778,
+    )
 
-    Note: The expected_ddz was computed from the perform method, as it is not part of all Stan tests
-    """
-    a1, a2, b1, z = at.scalars("a1", "a2", "b1", "z")
-    betainc_out = at.hyp2f1(a1, a2, b1, z)
-    betainc_grad = at.grad(betainc_out, [a1, a2, b1, z])
-    f_grad = function([a1, a2, b1, z], betainc_grad)
+    many_iters_case = (
+        3.70975,
+        1.0,
+        2.70975,
+        0.999696,
+        29369830.002773938200417693317785,
+        36347869.41885337,
+        -30843032.10697079073015067426929807,
+        26278034019.28811,
+    )
 
-    rtol = 1e-9 if config.floatX == "float64" else 1e-3
+    def test_hyp2f1_grad_stan_cases(self):
+        """This test reuses the same test cases as in:
+        https://github.com/stan-dev/math/blob/master/test/unit/math/prim/fun/grad_2F1_test.cpp
+        https://github.com/andrjohns/math/blob/develop/test/unit/math/prim/fun/hypergeometric_2F1_test.cpp
 
-    for (
-        test_a1,
-        test_a2,
-        test_b1,
-        test_z,
-        expected_dda1,
-        expected_dda2,
-        expected_ddb1,
-        expected_ddz,
-    ) in (
-        (
-            3.70975,
-            1.0,
-            2.70975,
-            -0.2,
-            -0.0488658806159776,
-            -0.193844936204681,
-            0.0677809985598383,
-            0.8652952472723672,
-        ),
-        (3.70975, 1.0, 2.70975, 0, 0, 0, 0, 1.369037734108313),
-        (
-            1.0,
-            1.0,
-            1.0,
-            0.6,
-            2.290726829685388,
-            2.290726829685388,
-            -2.290726829685388,
-            6.25,
-        ),
-        (
-            1.0,
-            31.0,
-            41.0,
-            1.0,
-            6.825270649241036,
-            0.4938271604938271,
-            -0.382716049382716,
-            17.22222222222223,
-        ),
-        (
-            1.0,
-            -2.1,
-            41.0,
-            1.0,
-            -0.04921317604093563,
-            0.02256814168279349,
-            0.00118482743834665,
-            -0.04854621426218426,
-        ),
-        (
-            1.0,
-            -0.5,
-            10.6,
-            0.3,
-            -0.01443822031245647,
-            0.02829710651967078,
-            0.00136986255602642,
-            -0.04846036062115473,
-        ),
-        (
-            1.0,
-            -0.5,
-            10.0,
-            0.3,
-            -0.0153218866216130,
-            0.02999436412836072,
-            0.0015413242328729,
-            -0.05144686244336445,
-        ),
-        (
-            -0.5,
-            -4.5,
-            11.0,
-            0.3,
-            -0.1227022810085707,
-            -0.01298849638043795,
-            -0.0053540982315572,
-            0.1959735211840362,
-        ),
-        (
-            -0.5,
-            -4.5,
-            -3.2,
-            0.9,
-            0.85880025358111,
-            0.4677704416159314,
-            -4.19010422485256,
-            -2.959196647856408,
-        ),
-        (
-            3.70975,
-            1.0,
-            2.70975,
-            -0.2,
-            -0.0488658806159776,
-            -0.193844936204681,
-            0.0677809985598383,
-            0.865295247272367,
-        ),
-        (
-            2.0,
-            1.0,
-            2.0,
-            0.4,
-            0.4617734323582945,
-            0.851376039609984,
-            -0.4617734323582945,
-            2.777777777777778,
-        ),
-        (
-            3.70975,
-            1.0,
-            2.70975,
-            0.999696,
-            29369830.002773938200417693317785,
-            36347869.41885337,
-            -30843032.10697079073015067426929807,
-            26278034019.28811,
-        ),
-        # Cases where series does not converge
-        (1.0, 12.0, 10.0, 1.0, np.nan, np.nan, np.nan, np.inf),
-        (1.0, 12.0, 20.0, 1.2, np.nan, np.nan, np.nan, np.inf),
-        # Case where series converges under Euler transform (not implemented!)
-        # (1.0, 1.0, 2.0, -5.0, -0.321040199556840, -0.321040199556840, 0.129536268190289, 0.0383370454357889),
-        (1.0, 1.0, 2.0, -5.0, np.nan, np.nan, np.nan, 0.0383370454357889),
-    ):
-        expectation = (
-            pytest.warns(
-                RuntimeWarning, match="Hyp2F1 does not meet convergence conditions"
+        Note: The expected_ddz was computed from the perform method, as it is not part of all Stan tests
+        """
+        a1, a2, b1, z = at.scalars("a1", "a2", "b1", "z")
+        hyp2f1_out = at.hyp2f1(a1, a2, b1, z)
+        hyp2f1_grad = at.grad(hyp2f1_out, [a1, a2, b1, z])
+        f_grad = function([a1, a2, b1, z], hyp2f1_grad)
+
+        rtol = 1e-9 if config.floatX == "float64" else 2e-3
+        for (
+            test_a1,
+            test_a2,
+            test_b1,
+            test_z,
+            expected_dda1,
+            expected_dda2,
+            expected_ddb1,
+            expected_ddz,
+        ) in (
+            (
+                3.70975,
+                1.0,
+                2.70975,
+                -0.2,
+                -0.0488658806159776,
+                -0.193844936204681,
+                0.0677809985598383,
+                0.8652952472723672,
+            ),
+            (3.70975, 1.0, 2.70975, 0, 0, 0, 0, 1.369037734108313),
+            (
+                1.0,
+                1.0,
+                1.0,
+                0.6,
+                2.290726829685388,
+                2.290726829685388,
+                -2.290726829685388,
+                6.25,
+            ),
+            (
+                1.0,
+                31.0,
+                41.0,
+                1.0,
+                6.825270649241036,
+                0.4938271604938271,
+                -0.382716049382716,
+                17.22222222222223,
+            ),
+            (
+                1.0,
+                -2.1,
+                41.0,
+                1.0,
+                -0.04921317604093563,
+                0.02256814168279349,
+                0.00118482743834665,
+                -0.04854621426218426,
+            ),
+            (
+                1.0,
+                -0.5,
+                10.6,
+                0.3,
+                -0.01443822031245647,
+                0.02829710651967078,
+                0.00136986255602642,
+                -0.04846036062115473,
+            ),
+            (
+                1.0,
+                -0.5,
+                10.0,
+                0.3,
+                -0.0153218866216130,
+                0.02999436412836072,
+                0.0015413242328729,
+                -0.05144686244336445,
+            ),
+            (
+                -0.5,
+                -4.5,
+                11.0,
+                0.3,
+                -0.1227022810085707,
+                -0.01298849638043795,
+                -0.0053540982315572,
+                0.1959735211840362,
+            ),
+            (
+                -0.5,
+                -4.5,
+                -3.2,
+                0.9,
+                0.85880025358111,
+                0.4677704416159314,
+                -4.19010422485256,
+                -2.959196647856408,
+            ),
+            (
+                3.70975,
+                1.0,
+                2.70975,
+                -0.2,
+                -0.0488658806159776,
+                -0.193844936204681,
+                0.0677809985598383,
+                0.865295247272367,
+            ),
+            self.few_iters_case,
+            self.many_iters_case,
+            # Cases where series does not converge
+            (1.0, 12.0, 10.0, 1.0, np.nan, np.nan, np.nan, np.inf),
+            (1.0, 12.0, 20.0, 1.2, np.nan, np.nan, np.nan, np.inf),
+            # Case where series converges under Euler transform (not implemented!)
+            # (1.0, 1.0, 2.0, -5.0, -0.321040199556840, -0.321040199556840, 0.129536268190289, 0.0383370454357889),
+            (1.0, 1.0, 2.0, -5.0, np.nan, np.nan, np.nan, 0.0383370454357889),
+        ):
+            with warnings.catch_warnings():
+                warnings.simplefilter("error")
+                warnings.filterwarnings(
+                    "ignore",
+                    category=RuntimeWarning,
+                    message="divide by zero encountered in log",
+                )
+                result = np.array(f_grad(test_a1, test_a2, test_b1, test_z))
+
+            np.testing.assert_allclose(
+                result,
+                np.array([expected_dda1, expected_dda2, expected_ddb1, expected_ddz]),
+                rtol=rtol,
             )
-            if np.any(
-                np.isnan([expected_dda1, expected_dda2, expected_ddb1, expected_ddz])
-            )
-            else does_not_warn()
-        )
-        with expectation:
-            result = np.array(f_grad(test_a1, test_a2, test_b1, test_z))
 
+    @pytest.mark.parametrize("case", (few_iters_case, many_iters_case))
+    @pytest.mark.parametrize("wrt", ("a", "all"))
+    def test_benchmark(self, case, wrt, benchmark):
+        a1, a2, b1, z = at.scalars("a1", "a2", "b1", "z")
+        hyp2f1_out = at.hyp2f1(a1, a2, b1, z)
+        hyp2f1_grad = at.grad(hyp2f1_out, wrt=a1 if wrt == "a" else [a1, a2, b1, z])
+        f_grad = function([a1, a2, b1, z], hyp2f1_grad)
+
+        (test_a1, test_a2, test_b1, test_z, *expected_dds) = case
+
+        result = benchmark(f_grad, test_a1, test_a2, test_b1, test_z)
+
+        rtol = 1e-9 if config.floatX == "float64" else 2e-3
+        expected_result = expected_dds[0] if wrt == "a" else np.array(expected_dds)
         np.testing.assert_allclose(
             result,
-            np.array([expected_dda1, expected_dda2, expected_ddb1, expected_ddz]),
+            expected_result,
+            rtol=rtol,
+        )
+
+    @pytest.mark.parametrize("wrt", ([0], [1], [2], [0, 1], [1, 2], [0, 2], [0, 1, 2]))
+    def test_unused_grad_loop_opt(self, wrt):
+        """Test that we don't compute unnecessary outputs in the grad scalar loop"""
+        (
+            test_a1,
+            test_a2,
+            test_b1,
+            test_z,
+            *expected_dds,
+            expected_ddz,
+        ) = self.few_iters_case
+
+        a1, a2, b1, z = at.scalars("a1", "a2", "b1", "z")
+        hyp2f1_out = at.hyp2f1(a1, a2, b1, z)
+        wrt_vars = [v for i, v in enumerate((a1, a2, b1, z)) if i in wrt]
+        hyp2f1_grad = at.grad(hyp2f1_out, wrt=wrt_vars)
+
+        mode = get_default_mode().including("local_useless_2f1grad_loop")
+        f_grad = function([a1, a2, b1, z], hyp2f1_grad, mode=mode)
+
+        if len(wrt) == 3 and (config.mode == "FAST_COMPILE" or not config.cxx):
+            # In this case we actually get two scalar_loops, because the merged one can't be executed in Python
+            [scalar_loop_op1, scalar_loop_op2] = [
+                node.op.scalar_op
+                for node in f_grad.maker.fgraph.toposort()
+                if isinstance(node.op, Elemwise)
+                and isinstance(node.op.scalar_op, ScalarLoop)
+            ]
+            assert scalar_loop_op1.nin == 10 + 3 * 2  # wrt=[0, 1]
+            assert scalar_loop_op2.nin == 10 + 3 * 1  # wrt=[2]
+        else:
+            [scalar_loop_op] = [
+                node.op.scalar_op
+                for node in f_grad.maker.fgraph.apply_nodes
+                if isinstance(node.op, Elemwise)
+                and isinstance(node.op.scalar_op, ScalarLoop)
+            ]
+            assert scalar_loop_op.nin == 10 + 3 * len(wrt)
+
+        rtol = 1e-9 if config.floatX == "float64" else 2e-3
+        np.testing.assert_allclose(
+            f_grad(test_a1, test_a2, test_b1, test_z),
+            [dd for i, dd in enumerate(expected_dds) if i in wrt],
             rtol=rtol,
         )

@@ -32,7 +32,7 @@ from pytensor.tensor.basic import (
     cast,
     extract_constant,
     fill,
-    get_scalar_constant_value,
+    get_underlying_scalar_constant_value,
     join,
     ones_like,
     switch,
@@ -200,25 +200,6 @@ def register_uncanonicalize(
     else:
         name = (kwargs and kwargs.pop("name", None)) or node_rewriter.__name__
         compile.optdb["uncanonicalize"].register(
-            name, node_rewriter, "fast_run", *tags, **kwargs
-        )
-        return node_rewriter
-
-
-def register_specialize_device(
-    node_rewriter: Union[RewriteDatabase, Rewriter, str], *tags: str, **kwargs
-):
-    if isinstance(node_rewriter, str):
-
-        def register(inner_rewriter: Union[RewriteDatabase, Rewriter]):
-            return register_specialize_device(
-                inner_rewriter, node_rewriter, *tags, **kwargs
-            )
-
-        return register
-    else:
-        name = (kwargs and kwargs.pop("name", None)) or node_rewriter.__name__
-        compile.optdb["specialize_device"].register(
             name, node_rewriter, "fast_run", *tags, **kwargs
         )
         return node_rewriter
@@ -802,7 +783,7 @@ def local_remove_useless_assert(fgraph, node):
     n_conds = len(node.inputs[1:])
     for c in node.inputs[1:]:
         try:
-            const = get_scalar_constant_value(c)
+            const = get_underlying_scalar_constant_value(c)
 
             if 0 != const.ndim or const == 0:
                 # Should we raise an error here? How to be sure it
@@ -895,7 +876,7 @@ def local_join_empty(fgraph, node):
         return
     new_inputs = []
     try:
-        join_idx = get_scalar_constant_value(
+        join_idx = get_underlying_scalar_constant_value(
             node.inputs[0], only_process_constants=True
         )
     except NotScalarConstantError:

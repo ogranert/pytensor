@@ -80,7 +80,7 @@ def _as_tensor_Apply(x, name, ndim, **kwargs):
     # use Apply's default output mechanism
     if (x.op.default_output is None) and (len(x.outputs) != 1):
         raise TypeError(
-            "Multi-output Op encountered. "
+            "Multi-output Op without default_output encountered. "
             "Retry using only one of the outputs directly."
         )
 
@@ -256,6 +256,26 @@ _scalar_constant_value_elemwise_ops = (
 
 
 def get_scalar_constant_value(
+    v, elemwise=True, only_process_constants=False, max_recur=10
+):
+    """
+    Checks whether 'v' is a scalar (ndim = 0).
+
+    If 'v' is a scalar then this function fetches the underlying constant by calling
+    'get_underlying_scalar_constant_value()'.
+
+    If 'v' is not a scalar, it raises a NotScalarConstantError.
+
+    """
+    if isinstance(v, (Variable, np.ndarray)):
+        if v.ndim != 0:
+            raise NotScalarConstantError()
+    return get_underlying_scalar_constant_value(
+        v, elemwise, only_process_constants, max_recur
+    )
+
+
+def get_underlying_scalar_constant_value(
     orig_v, elemwise=True, only_process_constants=False, max_recur=10
 ):
     """Return the constant scalar(0-D) value underlying variable `v`.
@@ -358,7 +378,7 @@ def get_scalar_constant_value(
             elif isinstance(v.owner.op, CheckAndRaise):
                 # check if all conditions are constant and true
                 conds = [
-                    get_scalar_constant_value(c, max_recur=max_recur)
+                    get_underlying_scalar_constant_value(c, max_recur=max_recur)
                     for c in v.owner.inputs[1:]
                 ]
                 if builtins.all(0 == c.ndim and c != 0 for c in conds):
@@ -372,7 +392,7 @@ def get_scalar_constant_value(
                     continue
                 if isinstance(v.owner.op, _scalar_constant_value_elemwise_ops):
                     const = [
-                        get_scalar_constant_value(i, max_recur=max_recur)
+                        get_underlying_scalar_constant_value(i, max_recur=max_recur)
                         for i in v.owner.inputs
                     ]
                     ret = [[None]]
@@ -391,7 +411,7 @@ def get_scalar_constant_value(
                     v.owner.op.scalar_op, _scalar_constant_value_elemwise_ops
                 ):
                     const = [
-                        get_scalar_constant_value(i, max_recur=max_recur)
+                        get_underlying_scalar_constant_value(i, max_recur=max_recur)
                         for i in v.owner.inputs
                     ]
                     ret = [[None]]
@@ -437,7 +457,7 @@ def get_scalar_constant_value(
                     ):
                         idx = v.owner.op.idx_list[0]
                         if isinstance(idx, Type):
-                            idx = get_scalar_constant_value(
+                            idx = get_underlying_scalar_constant_value(
                                 v.owner.inputs[1], max_recur=max_recur
                             )
                         try:
@@ -471,14 +491,14 @@ def get_scalar_constant_value(
                 ):
                     idx = v.owner.op.idx_list[0]
                     if isinstance(idx, Type):
-                        idx = get_scalar_constant_value(
+                        idx = get_underlying_scalar_constant_value(
                             v.owner.inputs[1], max_recur=max_recur
                         )
                     # Python 2.4 does not support indexing with numpy.integer
                     # So we cast it.
                     idx = int(idx)
                     ret = v.owner.inputs[0].owner.inputs[idx]
-                    ret = get_scalar_constant_value(ret, max_recur=max_recur)
+                    ret = get_underlying_scalar_constant_value(ret, max_recur=max_recur)
                     # MakeVector can cast implicitly its input in some case.
                     return _asarray(ret, dtype=v.type.dtype)
 
@@ -493,7 +513,7 @@ def get_scalar_constant_value(
                     idx_list = op.idx_list
                     idx = idx_list[0]
                     if isinstance(idx, Type):
-                        idx = get_scalar_constant_value(
+                        idx = get_underlying_scalar_constant_value(
                             owner.inputs[1], max_recur=max_recur
                         )
                     grandparent = leftmost_parent.owner.inputs[0]
@@ -508,7 +528,7 @@ def get_scalar_constant_value(
 
                     if not (idx < ndim):
                         msg = (
-                            "get_scalar_constant_value detected "
+                            "get_underlying_scalar_constant_value detected "
                             f"deterministic IndexError: x.shape[{int(idx)}] "
                             f"when x.ndim={int(ndim)}."
                         )
@@ -1398,6 +1418,8 @@ class Alloc(COp):
     """
 
     _f16_ok = True
+    _output_type_depends_on_input_value = True
+
     __props__ = ()
 
     def make_node(self, value, *shape):
@@ -1570,7 +1592,7 @@ pprint.assign(alloc, printing.FunctionPrinter(["alloc"]))
 @_get_vector_length.register(Alloc)
 def _get_vector_length_Alloc(var_inst, var):
     try:
-        return get_scalar_constant_value(var.owner.inputs[1])
+        return get_underlying_scalar_constant_value(var.owner.inputs[1])
     except NotScalarConstantError:
         raise ValueError(f"Length of {var} cannot be determined")
 
@@ -1821,17 +1843,17 @@ default = Default()
 
 def extract_constant(x, elemwise=True, only_process_constants=False):
     """
-    This function is basically a call to tensor.get_scalar_constant_value.
+    This function is basically a call to tensor.get_underlying_scalar_constant_value.
 
     The main difference is the behaviour in case of failure. While
-    get_scalar_constant_value raises an TypeError, this function returns x,
+    get_underlying_scalar_constant_value raises an TypeError, this function returns x,
     as a tensor if possible. If x is a ScalarVariable from a
     scalar_from_tensor, we remove the conversion. If x is just a
     ScalarVariable, we convert it to a tensor with tensor_from_scalar.
 
     """
     try:
-        x = get_scalar_constant_value(x, elemwise, only_process_constants)
+        x = get_underlying_scalar_constant_value(x, elemwise, only_process_constants)
     except NotScalarConstantError:
         pass
     if isinstance(x, aes.ScalarVariable) or isinstance(
@@ -1883,6 +1905,7 @@ class Split(COp):
     b == [3, 4]
     c == [5]
 
+    TODO: Don't make a copy in C impl
     """
 
     len_splits = None
@@ -1893,6 +1916,7 @@ class Split(COp):
 
     def __init__(self, len_splits):
         self.len_splits = int(len_splits)
+        self.view_map = {i: [0] for i in range(self.len_splits)}
 
     def __str__(self):
         return f"{self.__class__.__name__ }{{{self.len_splits}}}"
@@ -1929,7 +1953,7 @@ class Split(COp):
 
         split_outs = np.split(x, np.cumsum(splits[:-1]), axis=axis)
         for i, out in enumerate(split_outs):
-            outputs[i][0] = out.copy()
+            outputs[i][0] = out
 
     def infer_shape(self, fgraph, node, in_shapes):
         axis = node.inputs[1]
@@ -2201,7 +2225,7 @@ class Join(COp):
 
             if not isinstance(axis, int):
                 try:
-                    axis = int(get_scalar_constant_value(axis))
+                    axis = int(get_underlying_scalar_constant_value(axis))
                 except NotScalarConstantError:
                     pass
 
@@ -2450,7 +2474,7 @@ pprint.assign(Join, printing.FunctionPrinter(["join"]))
 def _get_vector_length_Join(op, var):
     axis, *arrays = var.owner.inputs
     try:
-        axis = get_scalar_constant_value(axis)
+        axis = get_underlying_scalar_constant_value(axis)
         assert axis == 0 and builtins.all(a.ndim == 1 for a in arrays)
         return builtins.sum(get_vector_length(a) for a in arrays)
     except NotScalarConstantError:
@@ -2862,7 +2886,7 @@ class ARange(Op):
 
         def is_constant_value(var, value):
             try:
-                v = get_scalar_constant_value(var)
+                v = get_underlying_scalar_constant_value(var)
                 return np.all(v == value)
             except NotScalarConstantError:
                 pass
@@ -3774,7 +3798,7 @@ class Choose(Op):
         static_out_shape = ()
         for s in out_shape:
             try:
-                s_val = pytensor.get_scalar_constant_value(s)
+                s_val = pytensor.get_underlying_scalar_constant(s)
             except (NotScalarConstantError, AttributeError):
                 s_val = None
 
@@ -3796,6 +3820,8 @@ class Choose(Op):
 
 class AllocEmpty(COp):
     """Implement Alloc on the cpu, but without initializing memory."""
+
+    _output_type_depends_on_input_value = True
 
     __props__ = ("dtype",)
     params_type = ParamsType(typecode=int32)
@@ -3987,10 +4013,10 @@ def expand_dims(
     out_ndim = len(axis) + a.ndim
     axis = np.core.numeric.normalize_axis_tuple(axis, out_ndim)
 
-    shape_it = iter(a.shape)
-    shape = [1 if ax in axis else next(shape_it) for ax in range(out_ndim)]
+    dim_it = iter(range(a.ndim))
+    pattern = ["x" if ax in axis else next(dim_it) for ax in range(out_ndim)]
 
-    return a.reshape(shape)
+    return a.dimshuffle(pattern)
 
 
 def _make_along_axis_idx(arr_shape, indices, axis):
@@ -4095,6 +4121,7 @@ __all__ = [
     "scalar_from_tensor",
     "tensor_from_scalar",
     "get_scalar_constant_value",
+    "get_underlying_scalar_constant_value",
     "constant",
     "as_tensor_variable",
     "as_tensor",

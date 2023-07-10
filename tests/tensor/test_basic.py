@@ -11,11 +11,12 @@ import pytensor.tensor.basic as at
 import pytensor.tensor.math as tm
 from pytensor import compile, config, function, shared
 from pytensor.compile.io import In, Out
-from pytensor.compile.mode import get_default_mode
+from pytensor.compile.mode import Mode, get_default_mode
 from pytensor.compile.ops import DeepCopyOp
 from pytensor.gradient import grad, hessian
 from pytensor.graph.basic import Apply
 from pytensor.graph.op import Op
+from pytensor.graph.replace import clone_replace
 from pytensor.misc.safe_asarray import _asarray
 from pytensor.raise_op import Assert
 from pytensor.scalar import autocast_float, autocast_float_as
@@ -52,6 +53,7 @@ from pytensor.tensor.basic import (
     flatten,
     full_like,
     get_scalar_constant_value,
+    get_underlying_scalar_constant_value,
     get_vector_length,
     horizontal_stack,
     identity_like,
@@ -499,12 +501,13 @@ class TestMakeVector(utt.InferShapeTester):
 
 
 class ApplyDefaultTestOp(Op):
-    def __init__(self, id):
+    def __init__(self, id, n_outs=1):
         self.default_output = id
+        self.n_outs = n_outs
 
     def make_node(self, x):
         x = at.as_tensor_variable(x)
-        return Apply(self, [x], [x.type()])
+        return Apply(self, [x], [x.type() for _ in range(self.n_outs)])
 
     def perform(self, *args, **kwargs):
         raise NotImplementedError()
@@ -536,6 +539,12 @@ def test_constant():
     assert np.array_equal(z.data, x_data)
 
 
+def test_constant_masked_array_not_implemented():
+    x = np.ma.masked_greater(np.array([1, 2, 3, 4]), 3)
+    with pytest.raises(NotImplementedError, match="MaskedArrays are not supported"):
+        constant(x)
+
+
 class TestAsTensorVariable:
     """
     Unit test for ensuring that as_tensor_variable handles Apply objects
@@ -549,16 +558,26 @@ class TestAsTensorVariable:
         y = as_tensor_variable(aes.int8())
         assert isinstance(y.owner.op, TensorFromScalar)
 
-    def test_multi_outputs(self):
-        good_apply_var = ApplyDefaultTestOp(0).make_node(self.x)
-        as_tensor_variable(good_apply_var)
+    def test_default_output(self):
+        good_apply_var = ApplyDefaultTestOp(0, n_outs=1).make_node(self.x)
+        as_tensor_variable(good_apply_var) is good_apply_var
 
-        bad_apply_var = ApplyDefaultTestOp(-1).make_node(self.x)
-        with pytest.raises(ValueError):
+        good_apply_var = ApplyDefaultTestOp(-1, n_outs=1).make_node(self.x)
+        as_tensor_variable(good_apply_var) is good_apply_var
+
+        bad_apply_var = ApplyDefaultTestOp(1, n_outs=1).make_node(self.x)
+        with pytest.raises(IndexError):
             _ = as_tensor_variable(bad_apply_var)
 
-        bad_apply_var = ApplyDefaultTestOp(2).make_node(self.x)
-        with pytest.raises(ValueError):
+        bad_apply_var = ApplyDefaultTestOp(2.0, n_outs=1).make_node(self.x)
+        with pytest.raises(TypeError):
+            _ = as_tensor_variable(bad_apply_var)
+
+        good_apply_var = ApplyDefaultTestOp(1, n_outs=2).make_node(self.x)
+        as_tensor_variable(good_apply_var) is good_apply_var.outputs[1]
+
+        bad_apply_var = ApplyDefaultTestOp(None, n_outs=2).make_node(self.x)
+        with pytest.raises(TypeError, match="Multi-output Op without default_output"):
             _ = as_tensor_variable(bad_apply_var)
 
     def test_list(self):
@@ -571,7 +590,7 @@ class TestAsTensorVariable:
             _ = as_tensor_variable(y)
 
         bad_apply_var = ApplyDefaultTestOp([0, 1]).make_node(self.x)
-        with pytest.raises(ValueError):
+        with pytest.raises(TypeError):
             as_tensor_variable(bad_apply_var)
 
     def test_ndim_strip_leading_broadcastable(self):
@@ -687,6 +706,13 @@ class TestAsTensorVariable:
         with pytest.raises(TypeError):
             at.as_tensor(TestOp(matrix(), matrix()))
 
+    def test_masked_array_not_implemented(
+        self,
+    ):
+        x = np.ma.masked_greater(np.array([1, 2, 3, 4]), 3)
+        with pytest.raises(NotImplementedError, match="MaskedArrays are not supported"):
+            at.as_tensor(x)
+
 
 class TestAlloc:
     dtype = config.floatX
@@ -792,6 +818,22 @@ class TestAlloc:
         full_at = at.full((2, 3), 3, dtype="int64")
         res = pytensor.function([], full_at, mode=self.mode)()
         assert np.array_equal(res, np.full((2, 3), 3, dtype="int64"))
+
+    @pytest.mark.parametrize("func", (at.zeros, at.empty))
+    def test_rebuild(self, func):
+        x = vector(shape=(50,))
+        x_test = np.zeros((50,), dtype=config.floatX)
+        y = func(x.shape)
+        assert y.type.shape == (50,)
+        assert y.shape.eval({x: x_test}) == (50,)
+        assert y.eval({x: x_test}).shape == (50,)
+
+        x_new = vector(shape=(100,))
+        x_new_test = np.zeros((100,), dtype=config.floatX)
+        y_new = clone_replace(y, {x: x_new}, rebuild_strict=False)
+        assert y_new.type.shape == (100,)
+        assert y_new.shape.eval({x_new: x_new_test}) == (100,)
+        assert y_new.eval({x_new: x_new_test}).shape == (100,)
 
 
 def test_infer_shape():
@@ -1977,45 +2019,65 @@ class TestJoinAndSplit:
         y = Split(2)(x, 0, [s, 5 - s])[0]
         assert y.type.shape == (None,)
 
+    def test_join_inplace(self):
+        # Test join to work inplace.
+        #
+        # This function tests the case when several elements are passed to the
+        # join function but all except one of them are empty. In this case join
+        # should work inplace and the output should be the view of the non-empty
+        # element.
+        s = lscalar()
+        x = vector("x")
+        z = at.zeros((s,))
 
-def test_join_inplace():
-    # Test join to work inplace.
-    #
-    # This function tests the case when several elements are passed to the
-    # join function but all except one of them are empty. In this case join
-    # should work inplace and the output should be the view of the non-empty
-    # element.
-    s = lscalar()
-    x = vector("x")
-    z = at.zeros((s,))
+        join = Join(view=0)
+        c = join(0, x, z, z)
 
-    join = Join(view=0)
-    c = join(0, x, z, z)
+        f = pytensor.function([In(x, borrow=True), s], Out(c, borrow=True))
 
-    f = pytensor.function([In(x, borrow=True), s], Out(c, borrow=True))
+        data = np.array([3, 4, 5], dtype=config.floatX)
 
-    data = np.array([3, 4, 5], dtype=config.floatX)
+        if config.mode not in ["DebugMode", "DEBUG_MODE"]:
+            assert f(data, 0) is data
+        assert np.allclose(f(data, 0), [3, 4, 5])
 
-    if config.mode not in ["DebugMode", "DEBUG_MODE"]:
-        assert f(data, 0) is data
-    assert np.allclose(f(data, 0), [3, 4, 5])
+    def test_join_oneInput(self):
+        # Test join when only 1 input is given.
+        #
+        # This functions tests the case when concatenate is called
+        # on an array of tensors but the array has only one element.
+        # In this case, we would like to avoid the computational
+        # overhead of concatenation of one element.
+        x_0 = fmatrix()
+        x_1 = fmatrix()
+        x_2 = fvector()
+        join_0 = at.concatenate([x_0], axis=1)
+        join_1 = at.concatenate([x_0, x_1, shape_padright(x_2)], axis=1)
 
+        assert join_0 is x_0
+        assert join_1 is not x_0
 
-def test_join_oneInput():
-    # Test join when only 1 input is given.
-    #
-    # This functions tests the case when concatenate is called
-    # on an array of tensors but the array has only one element.
-    # In this case, we would like to avoid the computational
-    # overhead of concatenation of one element.
-    x_0 = fmatrix()
-    x_1 = fmatrix()
-    x_2 = fvector()
-    join_0 = at.concatenate([x_0], axis=1)
-    join_1 = at.concatenate([x_0, x_1, shape_padright(x_2)], axis=1)
+    @pytest.mark.parametrize("linker", ("py", "c"))
+    def test_split_view(self, linker):
+        x = vector("x")
+        axis = 0
+        op = Split(len_splits=3)
+        assert op.view_map == {0: [0], 1: [0], 2: [0]}
+        splits = op(x, axis, [0, 3, 2])
 
-    assert join_0 is x_0
-    assert join_1 is not x_0
+        mode = Mode(linker)
+        f = pytensor.function(
+            [In(x, borrow=True)], [Out(s, borrow=True) for s in splits], mode=mode
+        )
+        x_test = np.arange(5, dtype=config.floatX)
+        res = f(x_test)
+        for r, expected in zip(res, ([], [0, 1, 2], [3, 4])):
+            assert np.allclose(r, expected)
+            if linker == "py":
+                assert r.base is x_test
+            else:
+                # C impl always makes a copy
+                assert r.base is not x_test
 
 
 def test_TensorFromScalar():
@@ -3263,52 +3325,52 @@ def test_dimshuffle_duplicate():
         DimShuffle((False,), (0, 0))(x)
 
 
-class TestGetScalarConstantValue:
+class TestGetUnderlyingScalarConstantValue:
     def test_basic(self):
         with pytest.raises(NotScalarConstantError):
-            get_scalar_constant_value(aes.int64())
+            get_underlying_scalar_constant_value(aes.int64())
 
-        res = get_scalar_constant_value(at.as_tensor(10))
+        res = get_underlying_scalar_constant_value(at.as_tensor(10))
         assert res == 10
         assert isinstance(res, np.ndarray)
 
-        res = get_scalar_constant_value(np.array(10))
+        res = get_underlying_scalar_constant_value(np.array(10))
         assert res == 10
         assert isinstance(res, np.ndarray)
 
         a = at.stack([1, 2, 3])
-        assert get_scalar_constant_value(a[0]) == 1
-        assert get_scalar_constant_value(a[1]) == 2
-        assert get_scalar_constant_value(a[2]) == 3
+        assert get_underlying_scalar_constant_value(a[0]) == 1
+        assert get_underlying_scalar_constant_value(a[1]) == 2
+        assert get_underlying_scalar_constant_value(a[2]) == 3
 
         b = iscalar()
         a = at.stack([b, 2, 3])
         with pytest.raises(NotScalarConstantError):
-            get_scalar_constant_value(a[0])
-        assert get_scalar_constant_value(a[1]) == 2
-        assert get_scalar_constant_value(a[2]) == 3
+            get_underlying_scalar_constant_value(a[0])
+        assert get_underlying_scalar_constant_value(a[1]) == 2
+        assert get_underlying_scalar_constant_value(a[2]) == 3
 
-        # For now get_scalar_constant_value goes through only MakeVector and Join of
+        # For now get_underlying_scalar_constant_value goes through only MakeVector and Join of
         # scalars.
         v = ivector()
         a = at.stack([v, [2], [3]])
         with pytest.raises(NotScalarConstantError):
-            get_scalar_constant_value(a[0])
+            get_underlying_scalar_constant_value(a[0])
         with pytest.raises(NotScalarConstantError):
-            get_scalar_constant_value(a[1])
+            get_underlying_scalar_constant_value(a[1])
         with pytest.raises(NotScalarConstantError):
-            get_scalar_constant_value(a[2])
+            get_underlying_scalar_constant_value(a[2])
 
         # Test the case SubTensor(Shape(v)) when the dimensions
         # is broadcastable.
         v = row()
-        assert get_scalar_constant_value(v.shape[0]) == 1
+        assert get_underlying_scalar_constant_value(v.shape[0]) == 1
 
-        res = at.get_scalar_constant_value(at.as_tensor([10, 20]).shape[0])
+        res = at.get_underlying_scalar_constant_value(at.as_tensor([10, 20]).shape[0])
         assert isinstance(res, np.ndarray)
         assert 2 == res
 
-        res = at.get_scalar_constant_value(
+        res = at.get_underlying_scalar_constant_value(
             9 + at.as_tensor([1.0]).shape[0],
             elemwise=True,
             only_process_constants=False,
@@ -3320,63 +3382,63 @@ class TestGetScalarConstantValue:
     @pytest.mark.xfail(reason="Incomplete implementation")
     def test_DimShufle(self):
         a = as_tensor_variable(1.0)[None][0]
-        assert get_scalar_constant_value(a) == 1
+        assert get_underlying_scalar_constant_value(a) == 1
 
     def test_subtensor_of_constant(self):
         c = constant(random(5))
         for i in range(c.value.shape[0]):
-            assert get_scalar_constant_value(c[i]) == c.value[i]
+            assert get_underlying_scalar_constant_value(c[i]) == c.value[i]
         c = constant(random(5, 5))
         for i in range(c.value.shape[0]):
             for j in range(c.value.shape[1]):
-                assert get_scalar_constant_value(c[i, j]) == c.value[i, j]
+                assert get_underlying_scalar_constant_value(c[i, j]) == c.value[i, j]
 
     def test_numpy_array(self):
         # Regression test for crash when called on a numpy array.
-        assert get_scalar_constant_value(np.array(3)) == 3
+        assert get_underlying_scalar_constant_value(np.array(3)) == 3
         with pytest.raises(NotScalarConstantError):
-            get_scalar_constant_value(np.array([0, 1]))
+            get_underlying_scalar_constant_value(np.array([0, 1]))
         with pytest.raises(NotScalarConstantError):
-            get_scalar_constant_value(np.array([]))
+            get_underlying_scalar_constant_value(np.array([]))
 
     def test_make_vector(self):
         mv = make_vector(1, 2, 3)
         with pytest.raises(NotScalarConstantError):
-            get_scalar_constant_value(mv)
-        assert get_scalar_constant_value(mv[0]) == 1
-        assert get_scalar_constant_value(mv[1]) == 2
-        assert get_scalar_constant_value(mv[2]) == 3
-        assert get_scalar_constant_value(mv[np.int32(0)]) == 1
-        assert get_scalar_constant_value(mv[np.int64(1)]) == 2
-        assert get_scalar_constant_value(mv[np.uint(2)]) == 3
+            get_underlying_scalar_constant_value(mv)
+        assert get_underlying_scalar_constant_value(mv[0]) == 1
+        assert get_underlying_scalar_constant_value(mv[1]) == 2
+        assert get_underlying_scalar_constant_value(mv[2]) == 3
+        assert get_underlying_scalar_constant_value(mv[np.int32(0)]) == 1
+        assert get_underlying_scalar_constant_value(mv[np.int64(1)]) == 2
+        assert get_underlying_scalar_constant_value(mv[np.uint(2)]) == 3
         t = aes.ScalarType("int64")
         with pytest.raises(NotScalarConstantError):
-            get_scalar_constant_value(mv[t()])
+            get_underlying_scalar_constant_value(mv[t()])
 
     def test_shape_i(self):
         c = constant(np.random.random((3, 4)))
         s = Shape_i(0)(c)
-        assert get_scalar_constant_value(s) == 3
+        assert get_underlying_scalar_constant_value(s) == 3
         s = Shape_i(1)(c)
-        assert get_scalar_constant_value(s) == 4
+        assert get_underlying_scalar_constant_value(s) == 4
         d = pytensor.shared(np.random.standard_normal((1, 1)), shape=(1, 1))
         f = ScalarFromTensor()(Shape_i(0)(d))
-        assert get_scalar_constant_value(f) == 1
+        assert get_underlying_scalar_constant_value(f) == 1
 
     def test_elemwise(self):
         # We test only for a few elemwise, the list of all supported
         # elemwise are in the fct.
         c = constant(np.random.random())
         s = c + 1
-        assert np.allclose(get_scalar_constant_value(s), c.data + 1)
+        assert np.allclose(get_underlying_scalar_constant_value(s), c.data + 1)
         s = c - 1
-        assert np.allclose(get_scalar_constant_value(s), c.data - 1)
+        assert np.allclose(get_underlying_scalar_constant_value(s), c.data - 1)
         s = c * 1.2
-        assert np.allclose(get_scalar_constant_value(s), c.data * 1.2)
+        assert np.allclose(get_underlying_scalar_constant_value(s), c.data * 1.2)
         s = c < 0.5
-        assert np.allclose(get_scalar_constant_value(s), int(c.data < 0.5))
+        assert np.allclose(get_underlying_scalar_constant_value(s), int(c.data < 0.5))
         s = at.second(c, 0.4)
-        assert np.allclose(get_scalar_constant_value(s), 0.4)
+        assert np.allclose(get_underlying_scalar_constant_value(s), 0.4)
 
     def test_assert(self):
         # Make sure we still get the constant value if it is wrapped in
@@ -3386,25 +3448,25 @@ class TestGetScalarConstantValue:
 
         # condition is always True
         a = Assert()(c, c > 1)
-        assert get_scalar_constant_value(a) == 2
+        assert get_underlying_scalar_constant_value(a) == 2
 
         with config.change_flags(compute_test_value="off"):
             # condition is always False
             a = Assert()(c, c > 2)
             with pytest.raises(NotScalarConstantError):
-                get_scalar_constant_value(a)
+                get_underlying_scalar_constant_value(a)
 
         # condition is not constant
         a = Assert()(c, c > x)
         with pytest.raises(NotScalarConstantError):
-            get_scalar_constant_value(a)
+            get_underlying_scalar_constant_value(a)
 
     def test_second(self):
         # Second should apply when the value is constant but not the shape
         c = constant(np.random.random())
         shp = vector()
         s = at.second(shp, c)
-        assert get_scalar_constant_value(s) == c.data
+        assert get_underlying_scalar_constant_value(s) == c.data
 
     def test_copy(self):
         # Make sure we do not return the internal storage of a constant,
@@ -3418,15 +3480,25 @@ class TestGetScalarConstantValue:
     @pytest.mark.parametrize("only_process_constants", (True, False))
     def test_None_and_NoneConst(self, only_process_constants):
         with pytest.raises(NotScalarConstantError):
-            get_scalar_constant_value(
+            get_underlying_scalar_constant_value(
                 None, only_process_constants=only_process_constants
             )
         assert (
-            get_scalar_constant_value(
+            get_underlying_scalar_constant_value(
                 NoneConst, only_process_constants=only_process_constants
             )
             is None
         )
+
+
+@pytest.mark.parametrize(
+    ["valid_inp", "invalid_inp"],
+    ((np.array(4), np.zeros(5)), (at.constant(4), at.constant(3, ndim=1))),
+)
+def test_get_scalar_constant_value(valid_inp, invalid_inp):
+    with pytest.raises(NotScalarConstantError):
+        get_scalar_constant_value(invalid_inp)
+    assert get_scalar_constant_value(valid_inp) == 4
 
 
 def test_complex_mod_failure():
@@ -3451,7 +3523,7 @@ class TestSize:
     def test_scalar(self):
         x = scalar()
         y = np.array(7, dtype=config.floatX)
-        assert y.size == function([], x.size)()
+        assert y.size == function([x], x.size)(y)
 
     def test_shared(self):
         # NB: we also test higher order tensors at the same time.

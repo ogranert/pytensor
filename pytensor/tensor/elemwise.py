@@ -14,7 +14,7 @@ from pytensor.link.c.op import COp, ExternalCOp, OpenMPOp
 from pytensor.link.c.params_type import ParamsType
 from pytensor.misc.frozendict import frozendict
 from pytensor.misc.safe_asarray import _asarray
-from pytensor.printing import FunctionPrinter, Printer, pprint
+from pytensor.printing import Printer, pprint
 from pytensor.scalar import get_scalar_type
 from pytensor.scalar.basic import bool as scalar_bool
 from pytensor.scalar.basic import identity as scalar_identity
@@ -130,6 +130,10 @@ class DimShuffle(ExternalCOp):
         super().__init__([self.c_func_file], self.c_func_name)
 
         self.input_broadcastable = tuple(input_broadcastable)
+        if not all(isinstance(bs, (bool, np.bool_)) for bs in self.input_broadcastable):
+            raise ValueError(
+                f"input_broadcastable must be boolean, {self.input_broadcastable}"
+            )
         self.new_order = tuple(new_order)
 
         self.inplace = True
@@ -215,10 +219,18 @@ class DimShuffle(ExternalCOp):
         return Apply(self, [input], [output])
 
     def __str__(self):
-        if self.inplace:
-            return "InplaceDimShuffle{%s}" % ",".join(str(x) for x in self.new_order)
-        else:
-            return "DimShuffle{%s}" % ",".join(str(x) for x in self.new_order)
+        shuffle = sorted(self.shuffle) != self.shuffle
+        if self.augment and not (shuffle or self.drop):
+            if len(self.augment) == 1:
+                return f"ExpandDims{{axis={self.augment[0]}}}"
+            return f"ExpandDims{{axes={self.augment}}}"
+        if self.drop and not (self.augment or shuffle):
+            if len(self.drop) == 1:
+                return f"DropDims{{axis={self.drop[0]}}}"
+            return f"DropDims{{axes={self.drop}}}"
+        if shuffle and not (self.augment or self.drop):
+            return f"Transpose{{axes={self.shuffle}}}"
+        return f"DimShuffle{{order=[{','.join(map(str, self.new_order))}]}}"
 
     def perform(self, node, inp, out, params):
         (res,) = inp
@@ -403,10 +415,9 @@ class Elemwise(OpenMPOp):
             if not difference:
                 args.append(input)
             else:
-                # TODO: use LComplete instead
                 args.append(
                     dim_shuffle(
-                        tuple(1 if s == 1 else None for s in input.type.shape),
+                        input.type.broadcastable,
                         ["x"] * difference + list(range(length)),
                     )(input)
                 )
@@ -490,15 +501,9 @@ class Elemwise(OpenMPOp):
         return Apply(self, inputs, outputs)
 
     def __str__(self):
-        if self.name is None:
-            if self.inplace_pattern:
-                items = list(self.inplace_pattern.items())
-                items.sort()
-                return f"{type(self).__name__}{{{self.scalar_op}}}{items}"
-            else:
-                return f"{type(self).__name__}{{{self.scalar_op}}}"
-        else:
+        if self.name:
             return self.name
+        return str(self.scalar_op).capitalize()
 
     def R_op(self, inputs, eval_points):
         outs = self(*inputs, return_list=True)
@@ -636,6 +641,9 @@ class Elemwise(OpenMPOp):
                 return DimShuffle((), ["x"] * nd)(res)
 
             new_r = Elemwise(node.op, {})(*[transform(ipt) for ipt in node.inputs])
+            if isinstance(new_r, (list, tuple)):
+                # Scalar Op with multiple outputs
+                new_r = new_r[r.owner.outputs.index(r)]
             return new_r
 
         ret = []
@@ -759,7 +767,7 @@ class Elemwise(OpenMPOp):
                 ufunc = self.ufunc
             elif not hasattr(node.tag, "ufunc"):
                 # It happen that make_thunk isn't called, like in
-                # get_scalar_constant_value
+                # get_underlying_scalar_constant_value
                 self.prepare_node(node, None, None, "py")
                 # prepare_node will add ufunc to self or the tag
                 # depending if we can reuse it or not. So we need to
@@ -1203,6 +1211,7 @@ class Elemwise(OpenMPOp):
         for i in node.inputs + node.outputs:
             version.append(get_scalar_type(dtype=i.type.dtype).c_code_cache_version())
         version.append(("openmp", self.openmp))
+        version.append(("openmp_elemwise_minsize", config.openmp_elemwise_minsize))
         if all(version):
             return tuple(version)
         else:
@@ -1465,23 +1474,17 @@ class CAReduce(COp):
 
         return res
 
-    def __str__(self):
-        prefix = f"{type(self).__name__}{{{self.scalar_op}}}"
-        extra_params = []
-
-        if self.axis is not None:
-            axis = ", ".join(str(x) for x in self.axis)
-            extra_params.append(f"axis=[{axis}]")
-
-        if self.acc_dtype:
-            extra_params.append(f"acc_dtype={self.acc_dtype}")
-
-        extra_params_str = ", ".join(extra_params)
-
-        if extra_params_str:
-            return f"{prefix}{{{extra_params_str}}}"
+    def _axis_str(self):
+        axis = self.axis
+        if axis is None:
+            return "axes=None"
+        elif len(axis) == 1:
+            return f"axis={axis[0]}"
         else:
-            return f"{prefix}"
+            return f"axes={list(axis)}"
+
+    def __str__(self):
+        return f"{type(self).__name__}{{{self.scalar_op}, {self._axis_str()}}}"
 
     def perform(self, node, inp, out):
         (input,) = inp
@@ -1725,21 +1728,17 @@ def scalar_elemwise(*symbol, nfunc=None, nin=None, nout=None, symbolname=None):
         symbolname = symbolname or symbol.__name__
 
         if symbolname.endswith("_inplace"):
-            elemwise_name = f"Elemwise{{{symbolname},inplace}}"
-            scalar_op = getattr(scalar, symbolname[: -len("_inplace")])
+            base_symbol_name = symbolname[: -len("_inplace")]
+            scalar_op = getattr(scalar, base_symbol_name)
             inplace_scalar_op = scalar_op.__class__(transfer_type(0))
             rval = Elemwise(
                 inplace_scalar_op,
                 {0: 0},
-                name=elemwise_name,
                 nfunc_spec=(nfunc and (nfunc, nin, nout)),
             )
         else:
-            elemwise_name = f"Elemwise{{{symbolname},no_inplace}}"
             scalar_op = getattr(scalar, symbolname)
-            rval = Elemwise(
-                scalar_op, name=elemwise_name, nfunc_spec=(nfunc and (nfunc, nin, nout))
-            )
+            rval = Elemwise(scalar_op, nfunc_spec=(nfunc and (nfunc, nin, nout)))
 
         if getattr(symbol, "__doc__"):
             rval.__doc__ = symbol.__doc__ + "\n\n    " + rval.__doc__
@@ -1748,8 +1747,6 @@ def scalar_elemwise(*symbol, nfunc=None, nin=None, nout=None, symbolname=None):
         # it makes epydoc display rval as if it were a function, not an object
         rval.__epydoc_asRoutine = symbol
         rval.__module__ = symbol.__module__
-
-        pprint.assign(rval, FunctionPrinter([symbolname.replace("_inplace", "=")]))
 
         return rval
 

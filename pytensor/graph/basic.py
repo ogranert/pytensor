@@ -193,11 +193,9 @@ class Apply(Node, Generic[OpType]):
             if len(self.outputs) == 1:
                 return self.outputs[0]
             else:
-                raise ValueError(f"{self.op}.default_output should be an output index.")
-        elif not isinstance(do, int):
-            raise ValueError(f"{self.op}.default_output should be an int or long")
-        elif do < 0 or do >= len(self.outputs):
-            raise ValueError(f"{self.op}.default_output is out of range.")
+                raise ValueError(
+                    f"Multi-output Op {self.op} default_output not specified"
+                )
         return self.outputs[do]
 
     def __str__(self):
@@ -268,14 +266,24 @@ class Apply(Node, Generic[OpType]):
         assert isinstance(inputs, (list, tuple))
         remake_node = False
         new_inputs: List["Variable"] = list(inputs)
+
+        # Some Ops like Alloc require the node to always be rebuilt in non-strict mode
+        # as the output type depends on the input values and not just their types
+        output_type_depends_on_input_value = self.op._output_type_depends_on_input_value
+
         for i, (curr, new) in enumerate(zip(self.inputs, new_inputs)):
-            if curr.type != new.type:
+            # Check if the input type changed or if the Op has output types that depend on input values
+            if (curr.type != new.type) or output_type_depends_on_input_value:
+                # In strict mode, the cloned graph is assumed to be mathematically equivalent to the original one.
+                # We only need to rebuild a node when the new input has a different, but compatible, type.
+                # This can happen e.g., when we provide a new input with a more specialized static shape.
                 if strict:
                     new_i = curr.type.filter_variable(new)
                     new_inputs[i] = new_i
 
                     if curr.type != new_i.type:
                         remake_node = True
+                # Otherwise, we always rebuild the node
                 else:
                     remake_node = True
 
@@ -597,6 +605,22 @@ class Variable(Node, Generic[_TypeType, OptionalApplyType]):
         if inputs_to_values is None:
             inputs_to_values = {}
 
+        def convert_string_keys_to_variables(input_to_values):
+            new_input_to_values = {}
+            for key, value in inputs_to_values.items():
+                if isinstance(key, str):
+                    matching_vars = get_var_by_name([self], key)
+                    if not matching_vars:
+                        raise Exception(f"{key} not found in graph")
+                    elif len(matching_vars) > 1:
+                        raise Exception(f"Found multiple variables with name {key}")
+                    new_input_to_values[matching_vars[0]] = value
+                else:
+                    new_input_to_values[key] = value
+            return new_input_to_values
+
+        inputs_to_values = convert_string_keys_to_variables(inputs_to_values)
+
         if not hasattr(self, "_fn_cache"):
             self._fn_cache = dict()
 
@@ -749,13 +773,20 @@ class Constant(AtomicVariable[_TypeType]):
         return (self.type, self.data)
 
     def __str__(self):
-        if self.name is not None:
-            return self.name
-        else:
-            name = str(self.data)
-            if len(name) > 20:
-                name = name[:10] + "..." + name[-10:]
-            return f"{type(self).__name__}{{{name}}}"
+        data_str = str(self.data).replace("\n", "")
+        if len(data_str) > 20:
+            data_str = data_str[:10].strip() + " ... " + data_str[-10:].strip()
+
+        if self.name is None:
+            return data_str
+
+        return f"{self.name}{{{data_str}}}"
+
+    def __repr__(self):
+        data_str = repr(self.data)
+        if len(data_str) > 20:
+            data_str = data_str[:10].strip() + " ... " + data_str[-10:].strip()
+        return f"{type(self).__name__}({repr(self.type)}, data={data_str})"
 
     def clone(self, **kwargs):
         return self
@@ -1101,12 +1132,12 @@ def truncated_graph_inputs(
 
 
 def clone(
-    inputs: List[Variable],
-    outputs: List[Variable],
+    inputs: Sequence[Variable],
+    outputs: Sequence[Variable],
     copy_inputs: bool = True,
     copy_orphans: Optional[bool] = None,
     clone_inner_graphs: bool = False,
-) -> Tuple[Collection[Variable], Collection[Variable]]:
+) -> Tuple[List[Variable], List[Variable]]:
     r"""Copies the sub-graph contained between inputs and outputs.
 
     Parameters
@@ -1615,7 +1646,7 @@ def as_string(
                 multi.add(op2)
             else:
                 seen.add(input.owner)
-    multi_list = [x for x in multi]
+    multi_list = list(multi)
     done: Set = set()
 
     def multi_index(x):

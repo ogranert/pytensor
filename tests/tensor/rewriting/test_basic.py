@@ -12,6 +12,7 @@ from pytensor.compile.function import function
 from pytensor.compile.mode import get_default_mode, get_mode
 from pytensor.compile.ops import DeepCopyOp, deep_copy_op
 from pytensor.configdefaults import config
+from pytensor.graph.basic import equal_computations
 from pytensor.graph.fg import FunctionGraph
 from pytensor.graph.rewriting.basic import check_stack_trace, out2in
 from pytensor.graph.rewriting.db import RewriteDatabaseQuery
@@ -1371,15 +1372,28 @@ def test_local_useless_split():
 
     f_rewritten(np.random.random((4, 4)).astype(config.floatX), [4])
     f_not_rewritten(np.random.random((4, 4)).astype(config.floatX), [1, 2, 1])
-    graph_rewritten = f_rewritten.maker.fgraph.toposort()
-    graph_not_rewritten = f_not_rewritten.maker.fgraph.toposort()
+    graph_rewritten = f_rewritten.maker.fgraph
+    graph_not_rewritten = f_not_rewritten.maker.fgraph
 
-    assert isinstance(graph_rewritten[-1].op, DeepCopyOp)
-    assert len(graph_not_rewritten) == 1
-    assert isinstance(graph_not_rewritten[0].op, Split)
+    assert all(
+        isinstance(out.owner.op, DeepCopyOp) for out in graph_not_rewritten.outputs
+    )
+    assert all(isinstance(out.owner.op, DeepCopyOp) for out in graph_rewritten.outputs)
 
+    assert sum(isinstance(node.op, Split) for node in graph_rewritten.apply_nodes) == 0
+    assert (
+        sum(isinstance(node.op, Split) for node in graph_not_rewritten.apply_nodes) == 1
+    )
+
+    assert sum(isinstance(node.op, Assert) for node in graph_rewritten.apply_nodes) == 2
+    assert (
+        sum(isinstance(node.op, Assert) for node in graph_not_rewritten.apply_nodes)
+        == 0
+    )
+
+    # The DeepCopy Ops don't have traces, so we can't check "all"
     assert check_stack_trace(f_rewritten, ops_to_check=[Assert])
-    assert check_stack_trace(f_not_rewritten, ops_to_check="all")
+    assert check_stack_trace(f_not_rewritten, ops_to_check=[Split])
 
 
 @pytest.mark.parametrize("i", list(range(1, 4)))
@@ -1410,31 +1424,28 @@ class TestLiftTransposeThroughDot:
 
     def test_matrix_matrix(self):
         a, b = matrices("ab")
-        g = self.simple_rewrite(FunctionGraph([a, b], [dot(a, b).T]))
-        sg = "FunctionGraph(dot(InplaceDimShuffle{1,0}(b), InplaceDimShuffle{1,0}(a)))"
-        assert str(g) == sg, (str(g), sg)
+        g = self.simple_rewrite(FunctionGraph([a, b], [dot(a, b).T], clone=False))
+        assert equal_computations(g.outputs, [dot(b.T, a.T)])
         assert check_stack_trace(g, ops_to_check="all")
 
     def test_row_matrix(self):
         a = vector("a")
         b = matrix("b")
         g = rewrite(
-            FunctionGraph([a, b], [dot(a.dimshuffle("x", 0), b).T]),
+            FunctionGraph([a, b], [dot(a.dimshuffle("x", 0), b).T], clone=False),
             level="stabilize",
         )
-        sg = "FunctionGraph(dot(InplaceDimShuffle{1,0}(b), InplaceDimShuffle{0,x}(a)))"
-        assert str(g) == sg, (str(g), sg)
+        assert equal_computations(g.outputs, [dot(b.T, a.dimshuffle(0, "x"))])
         assert check_stack_trace(g, ops_to_check="all")
 
     def test_matrix_col(self):
         a = vector("a")
         b = matrix("b")
         g = rewrite(
-            FunctionGraph([a, b], [dot(b, a.dimshuffle(0, "x")).T]),
+            FunctionGraph([a, b], [dot(b, a.dimshuffle(0, "x")).T], clone=False),
             level="stabilize",
         )
-        sg = "FunctionGraph(dot(InplaceDimShuffle{x,0}(a), InplaceDimShuffle{1,0}(b)))"
-        assert str(g) == sg, (str(g), sg)
+        assert equal_computations(g.outputs, [dot(a.dimshuffle("x", 0), b.T)])
         assert check_stack_trace(g, ops_to_check="all")
 
 
@@ -1692,8 +1703,12 @@ class TestLocalElemwiseAlloc:
         ],
     )
     def test_basic(self, expr, x_shape, y_shape):
-        x = at.tensor(dtype="int64", shape=(None,) * len(x_shape), name="x")
-        y = at.tensor(dtype="int64", shape=(None,) * len(y_shape), name="y")
+        x = at.tensor(
+            dtype="int64", shape=(1 if val == 1 else None for val in x_shape), name="x"
+        )
+        y = at.tensor(
+            dtype="int64", shape=(1 if val == 1 else None for val in y_shape), name="y"
+        )
         z = expr(x, y)
 
         z_opt = pytensor.function(
@@ -1867,7 +1882,8 @@ class TestLocalElemwiseAlloc:
             mode=self.fast_run_mode,
         )
         self.verify_op_count(func, 0, Alloc)
-        self.verify_op_count(func, 1, Assert)
+        # The second assert is from the shape check...
+        self.verify_op_count(func, 2, Assert)
 
     def test_misc(self):
         x = row(dtype=self.dtype)

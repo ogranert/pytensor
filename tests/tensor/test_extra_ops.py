@@ -9,6 +9,7 @@ from pytensor import tensor as at
 from pytensor.compile.mode import Mode
 from pytensor.configdefaults import config
 from pytensor.graph.basic import Constant, applys_between
+from pytensor.graph.replace import clone_replace
 from pytensor.graph.rewriting.db import RewriteDatabaseQuery
 from pytensor.raise_op import Assert
 from pytensor.tensor.elemwise import DimShuffle
@@ -925,7 +926,7 @@ class TestUnique(utt.InferShapeTester):
 class TestUnravelIndex(utt.InferShapeTester):
     def test_unravel_index(self):
         def check(shape, index_ndim, order):
-            indices = np.arange(np.product(shape))
+            indices = np.arange(np.prod(shape))
             # test with scalars and higher-dimensional indices
             if index_ndim == 0:
                 indices = indices[-1]
@@ -996,7 +997,7 @@ class TestRavelMultiIndex(utt.InferShapeTester):
     def test_ravel_multi_index(self):
         def check(shape, index_ndim, mode, order):
             multi_index = np.unravel_index(
-                np.arange(np.product(shape)), shape, order=order
+                np.arange(np.prod(shape)), shape, order=order
             )
             # create some invalid indices to test the mode
             if mode in ("wrap", "clip"):
@@ -1086,7 +1087,9 @@ def test_broadcast_shape_basic():
     assert any(
         isinstance(node.op, Assert) for node in applys_between([x_at, y_at], b_at)
     )
-    assert np.array_equal([z.eval() for z in b_at], b.shape)
+    # This should fail because it would need dynamic broadcasting
+    with pytest.raises(AssertionError):
+        assert np.array_equal([z.eval() for z in b_at], b.shape)
     b_at = broadcast_shape(shape_tuple(x_at), shape_tuple(y_at), arrays_are_shapes=True)
     assert np.array_equal([z.eval() for z in b_at], b.shape)
 
@@ -1183,8 +1186,8 @@ def test_broadcast_shape_constants():
 @pytest.mark.parametrize(
     ("s1_vals", "s2_vals", "exp_res"),
     [
-        ((2, 2), (1, 2), (2, 2)),
-        ((0, 2), (1, 2), (0, 2)),
+        ((2, 2), (1, 2), AssertionError),
+        ((0, 2), (1, 2), AssertionError),
         ((1, 2, 1), (2, 1, 2, 1), (2, 1, 2, 1)),
     ],
 )
@@ -1203,7 +1206,11 @@ def test_broadcast_shape_symbolic(s1_vals, s2_vals, exp_res):
     res = broadcast_shape(s1s, s2s, arrays_are_shapes=True)
     res = at.as_tensor(res)
 
-    assert tuple(res.eval(eval_point)) == exp_res
+    if exp_res is AssertionError:
+        with pytest.raises(AssertionError):
+            res.eval(eval_point)
+    else:
+        assert tuple(res.eval(eval_point)) == exp_res
 
 
 def test_broadcast_shape_symbolic_one_symbolic():
@@ -1393,9 +1400,25 @@ class TestBroadcastTo(utt.InferShapeTester):
 
         assert advincsub_node.op.inplace is False
 
+    def test_rebuild(self):
+        x = vector(shape=(50,))
+        x_test = np.zeros((50,), dtype=config.floatX)
+        i = 0
+        y = broadcast_to(i, x.shape)
+        assert y.type.shape == (50,)
+        assert y.shape.eval({x: x_test}) == (50,)
+        assert y.eval({x: x_test}).shape == (50,)
+
+        x_new = vector(shape=(100,))
+        x_new_test = np.zeros((100,), dtype=config.floatX)
+        y_new = clone_replace(y, {x: x_new}, rebuild_strict=False)
+        assert y_new.type.shape == (100,)
+        assert y_new.shape.eval({x_new: x_new_test}) == (100,)
+        assert y_new.eval({x_new: x_new_test}).shape == (100,)
+
 
 def test_broadcast_arrays():
-    x, y = at.dvector(), at.dmatrix()
+    x, y = at.tensor(shape=(1,), dtype="float64"), at.dmatrix()
     x_bcast, y_bcast = broadcast_arrays(x, y)
 
     py_mode = Mode("py", None)

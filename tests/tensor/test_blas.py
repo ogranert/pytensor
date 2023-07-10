@@ -44,12 +44,11 @@ from pytensor.tensor.blas import (
     gemv_no_inplace,
     ger,
     ger_destructive,
-    local_dot22_to_dot22scalar,
-    local_gemm_to_ger,
     res_is_a,
 )
 from pytensor.tensor.elemwise import DimShuffle
 from pytensor.tensor.math import Dot, dot, mean, mul, neg, outer, sigmoid, sqrt
+from pytensor.tensor.rewriting.blas import local_dot22_to_dot22scalar, local_gemm_to_ger
 from pytensor.tensor.type import (
     cmatrix,
     col,
@@ -2589,10 +2588,10 @@ TestBatchedDot = makeTester(
     op=batched_dot,
     expected=(
         lambda xs, ys: np.asarray(
-            list(
+            [
                 x * y if x.ndim == 0 or y.ndim == 0 else np.dot(x, y)
                 for x, y in zip(xs, ys)
-            ),
+            ],
             dtype=aes.upcast(xs.dtype, ys.dtype),
         )
     ),
@@ -2694,7 +2693,7 @@ def test_batched_dot_not_contiguous():
         assert x.strides[0] == direction * np.dtype(config.floatX).itemsize
         assert not (x.flags["C_CONTIGUOUS"] or x.flags["F_CONTIGUOUS"])
         result = f(x, w)
-        ref_result = np.asarray(list(np.dot(u, v) for u, v in zip(x, w)))
+        ref_result = np.asarray([np.dot(u, v) for u, v in zip(x, w)])
         utt.assert_allclose(ref_result, result)
 
     for inverted in (0, 1):

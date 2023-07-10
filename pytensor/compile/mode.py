@@ -248,11 +248,6 @@ optdb.register("specialize", EquilibriumDB(), "fast_run", "fast_compile", positi
 # misc special cases for speed that break canonicalization
 optdb.register("uncanonicalize", EquilibriumDB(), "fast_run", position=3)
 
-# misc special cases for speed that are dependent on the device.
-optdb.register(
-    "specialize_device", EquilibriumDB(), "fast_compile", "fast_run", position=48.6
-)  # must be after gpu stuff at 48.5
-
 # especially constant merge
 optdb.register("merge2", MergeOptimizer(), "fast_run", "merge", position=49)
 
@@ -262,6 +257,7 @@ optdb.register(
 
 # final pass just to make sure
 optdb.register("merge3", MergeOptimizer(), "fast_run", "merge", position=100)
+optdb.register("py_only", EquilibriumDB(), "fast_compile", position=100)
 
 _tags: Union[Tuple[str, str], Tuple]
 
@@ -439,15 +435,24 @@ class Mode:
 # FunctionMaker, the Mode will be taken from this dictionary using the
 # string as the key
 # Use VM_linker to allow lazy evaluation by default.
-FAST_COMPILE = Mode(VMLinker(use_cloop=False, c_thunks=False), "fast_compile")
+FAST_COMPILE = Mode(
+    VMLinker(use_cloop=False, c_thunks=False),
+    RewriteDatabaseQuery(include=["fast_compile", "py_only"]),
+)
 if config.cxx:
     FAST_RUN = Mode("cvm", "fast_run")
 else:
-    FAST_RUN = Mode("vm", "fast_run")
+    FAST_RUN = Mode(
+        "vm",
+        RewriteDatabaseQuery(include=["fast_run", "py_only"]),
+    )
 
 JAX = Mode(
     JAXLinker(),
-    RewriteDatabaseQuery(include=["fast_run", "jax"], exclude=["cxx_only", "BlasOpt"]),
+    RewriteDatabaseQuery(
+        include=["fast_run", "jax"],
+        exclude=["cxx_only", "BlasOpt", "fusion", "inplace"],
+    ),
 )
 NUMBA = Mode(
     NumbaLinker(),

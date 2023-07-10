@@ -361,7 +361,7 @@ def create_multiaxis_reducer(
 
     careduce_fn_name = f"careduce_{scalar_op}"
     global_env = {}
-    to_reduce = reversed(sorted(axes))
+    to_reduce = sorted(axes, reverse=True)
     careduce_lines_src = []
     var_name = input_name
 
@@ -841,7 +841,7 @@ def numba_funcify_DimShuffle(op, node, **kwargs):
 
         @numba_basic.numba_njit
         def dimshuffle_inner(x, shuffle):
-            return np.reshape(x, ())
+            return np.reshape(np.ascontiguousarray(x), ())
 
     # Without the following wrapper function we would see this error:
     # E   No implementation of function Function(<built-in function getitem>) found for signature:

@@ -12,14 +12,14 @@ from pytensor.compile.function import function
 from pytensor.compile.mode import Mode, get_default_mode
 from pytensor.configdefaults import config
 from pytensor.gradient import grad
-from pytensor.graph.basic import Constant
+from pytensor.graph.basic import Constant, equal_computations
 from pytensor.graph.fg import FunctionGraph
 from pytensor.graph.rewriting.basic import check_stack_trace, out2in
 from pytensor.graph.rewriting.db import RewriteDatabaseQuery
 from pytensor.graph.rewriting.utils import rewrite_graph
 from pytensor.misc.safe_asarray import _asarray
 from pytensor.raise_op import assert_op
-from pytensor.scalar.basic import Composite
+from pytensor.scalar.basic import Composite, float64
 from pytensor.tensor.basic import MakeVector
 from pytensor.tensor.elemwise import DimShuffle, Elemwise
 from pytensor.tensor.math import abs as at_abs
@@ -86,113 +86,66 @@ def inputs(xbc=(0, 0), ybc=(0, 0), zbc=(0, 0)):
 
 class TestDimshuffleLift:
     def test_double_transpose(self):
-        x, y, z = inputs()
+        x, *_ = inputs()
         e = ds(ds(x, (1, 0)), (1, 0))
-        g = FunctionGraph([x], [e])
-        # TODO FIXME: Construct these graphs and compare them.
-        assert (
-            str(g) == "FunctionGraph(InplaceDimShuffle{1,0}(InplaceDimShuffle{1,0}(x)))"
-        )
+        g = FunctionGraph([x], [e], clone=False)
+        assert isinstance(g.outputs[0].owner.op, DimShuffle)
         dimshuffle_lift.rewrite(g)
-        assert str(g) == "FunctionGraph(x)"
+        assert g.outputs[0] is x
         # no need to check_stack_trace as graph is supposed to be empty
 
     def test_merge2(self):
-        x, y, z = inputs()
+        x, *_ = inputs()
         e = ds(ds(x, (1, "x", 0)), (2, 0, "x", 1))
-        g = FunctionGraph([x], [e])
-        # TODO FIXME: Construct these graphs and compare them.
-        assert (
-            str(g)
-            == "FunctionGraph(InplaceDimShuffle{2,0,x,1}(InplaceDimShuffle{1,x,0}(x)))"
-        ), str(g)
+        g = FunctionGraph([x], [e], clone=False)
+        assert len(g.apply_nodes) == 2
         dimshuffle_lift.rewrite(g)
-        assert str(g) == "FunctionGraph(InplaceDimShuffle{0,1,x,x}(x))", str(g)
+        assert equal_computations(g.outputs, [x.dimshuffle(0, 1, "x", "x")])
         # Check stacktrace was copied over correctly after rewrite was applied
         assert check_stack_trace(g, ops_to_check="all")
 
     def test_elim3(self):
         x, y, z = inputs()
         e = ds(ds(ds(x, (0, "x", 1)), (2, 0, "x", 1)), (1, 0))
-        g = FunctionGraph([x], [e])
-        # TODO FIXME: Construct these graphs and compare them.
-        assert str(g) == (
-            "FunctionGraph(InplaceDimShuffle{1,0}(InplaceDimShuffle{2,0,x,1}"
-            "(InplaceDimShuffle{0,x,1}(x))))"
-        ), str(g)
+        g = FunctionGraph([x], [e], clone=False)
+        assert isinstance(g.outputs[0].owner.op, DimShuffle)
         dimshuffle_lift.rewrite(g)
-        assert str(g) == "FunctionGraph(x)", str(g)
+        assert g.outputs[0] is x
         # no need to check_stack_trace as graph is supposed to be empty
 
     def test_lift(self):
         x, y, z = inputs([False] * 1, [False] * 2, [False] * 3)
         e = x + y + z
-        g = FunctionGraph([x, y, z], [e])
-
-        # TODO FIXME: Construct these graphs and compare them.
-        # It does not really matter if the DimShuffles are inplace
-        # or not.
-        init_str_g_inplace = (
-            "FunctionGraph(Elemwise{add,no_inplace}(InplaceDimShuffle{x,0,1}"
-            "(Elemwise{add,no_inplace}(InplaceDimShuffle{x,0}(x), y)), z))"
-        )
-        init_str_g_noinplace = (
-            "FunctionGraph(Elemwise{add,no_inplace}(DimShuffle{x,0,1}"
-            "(Elemwise{add,no_inplace}(DimShuffle{x,0}(x), y)), z))"
-        )
-        assert str(g) in (init_str_g_inplace, init_str_g_noinplace), str(g)
-
-        rewrite_str_g_inplace = (
-            "FunctionGraph(Elemwise{add,no_inplace}(Elemwise{add,no_inplace}"
-            "(InplaceDimShuffle{x,x,0}(x), InplaceDimShuffle{x,0,1}(y)), z))"
-        )
-        rewrite_str_g_noinplace = (
-            "FunctionGraph(Elemwise{add,no_inplace}(Elemwise{add,no_inplace}"
-            "(DimShuffle{x,x,0}(x), DimShuffle{x,0,1}(y)), z))"
-        )
+        g = FunctionGraph([x, y, z], [e], clone=False)
         dimshuffle_lift.rewrite(g)
-        assert str(g) in (rewrite_str_g_inplace, rewrite_str_g_noinplace), str(g)
+        assert equal_computations(
+            g.outputs,
+            [(x.dimshuffle("x", "x", 0) + y.dimshuffle("x", 0, 1)) + z],
+        )
         # Check stacktrace was copied over correctly after rewrite was applied
         assert check_stack_trace(g, ops_to_check="all")
 
     def test_recursive_lift(self):
-        v = vector(dtype="float64")
-        m = matrix(dtype="float64")
+        v = vector("v", dtype="float64")
+        m = matrix("m", dtype="float64")
         out = ((v + 42) * (m + 84)).T
-        g = FunctionGraph([v, m], [out])
-        # TODO FIXME: Construct these graphs and compare them.
-        init_str_g = (
-            "FunctionGraph(InplaceDimShuffle{1,0}(Elemwise{mul,no_inplace}"
-            "(InplaceDimShuffle{x,0}(Elemwise{add,no_inplace}"
-            "(<TensorType(float64, (?,))>, "
-            "InplaceDimShuffle{x}(TensorConstant{42}))), "
-            "Elemwise{add,no_inplace}"
-            "(<TensorType(float64, (?, ?))>, "
-            "InplaceDimShuffle{x,x}(TensorConstant{84})))))"
+        g = FunctionGraph([v, m], [out], clone=False)
+        new_out = local_dimshuffle_lift.transform(g, g.outputs[0].owner)
+        assert equal_computations(
+            new_out,
+            [(v.dimshuffle(0, "x") + 42) * (m.T + 84)],
         )
-        assert str(g) == init_str_g
-        new_out = local_dimshuffle_lift.transform(g, g.outputs[0].owner)[0]
-        new_g = FunctionGraph(g.inputs, [new_out])
-        rewrite_str_g = (
-            "FunctionGraph(Elemwise{mul,no_inplace}(Elemwise{add,no_inplace}"
-            "(InplaceDimShuffle{0,x}(<TensorType(float64, (?,))>), "
-            "InplaceDimShuffle{x,x}(TensorConstant{42})), "
-            "Elemwise{add,no_inplace}(InplaceDimShuffle{1,0}"
-            "(<TensorType(float64, (?, ?))>), "
-            "InplaceDimShuffle{x,x}(TensorConstant{84}))))"
-        )
-        assert str(new_g) == rewrite_str_g
         # Check stacktrace was copied over correctly after rewrite was applied
+        new_g = FunctionGraph(g.inputs, new_out, clone=False)
         assert check_stack_trace(new_g, ops_to_check="all")
 
     def test_useless_dimshuffle(self):
-        x, _, _ = inputs()
+        x, *_ = inputs()
         e = ds(x, (0, 1))
-        g = FunctionGraph([x], [e])
-        # TODO FIXME: Construct these graphs and compare them.
-        assert str(g) == "FunctionGraph(InplaceDimShuffle{0,1}(x))"
+        g = FunctionGraph([x], [e], clone=False)
+        assert isinstance(g.outputs[0].owner.op, DimShuffle)
         dimshuffle_lift.rewrite(g)
-        assert str(g) == "FunctionGraph(x)"
+        assert g.outputs[0] is x
         # Check stacktrace was copied over correctly after rewrite was applied
         assert hasattr(g.outputs[0].tag, "trace")
 
@@ -203,19 +156,26 @@ class TestDimshuffleLift:
         ds_y = ds(y, (2, 1, 0))  # useless
         ds_z = ds(z, (2, 1, 0))  # useful
         ds_u = ds(u, ("x"))  # useful
-        g = FunctionGraph([x, y, z, u], [ds_x, ds_y, ds_z, ds_u])
-        # TODO FIXME: Construct these graphs and compare them.
-        assert (
-            str(g)
-            == "FunctionGraph(InplaceDimShuffle{0,x}(x), InplaceDimShuffle{2,1,0}(y), InplaceDimShuffle{2,1,0}(z), InplaceDimShuffle{x}(TensorConstant{1}))"
-        )
+        g = FunctionGraph([x, y, z, u], [ds_x, ds_y, ds_z, ds_u], clone=False)
+        assert len(g.apply_nodes) == 4
         dimshuffle_lift.rewrite(g)
-        assert (
-            str(g)
-            == "FunctionGraph(x, y, InplaceDimShuffle{2,1,0}(z), InplaceDimShuffle{x}(TensorConstant{1}))"
-        )
+        assert equal_computations(g.outputs, [x, y, z.T, u.dimshuffle("x")])
         # Check stacktrace was copied over correctly after rewrite was applied
         assert hasattr(g.outputs[0].tag, "trace")
+
+    def test_dimshuffle_lift_multi_out_elemwise(self):
+        # Create a multi-output Elemwise Op with Composite
+        x = float64("x")
+        outs = [x + 1, x + 2]
+        op = Elemwise(Composite([x], outs))
+
+        # Transpose both outputs
+        x = matrix("x")
+        outs = [out.T for out in op(x)]
+
+        # Make sure rewrite doesn't apply in this case
+        g = FunctionGraph([x], outs)
+        assert not local_dimshuffle_lift.transform(g, g.outputs[0].owner)
 
 
 def test_local_useless_dimshuffle_in_reshape():
@@ -237,34 +197,32 @@ def test_local_useless_dimshuffle_in_reshape():
             reshape_dimshuffle_row,
             reshape_dimshuffle_col,
         ],
+        clone=False,
     )
-
-    # TODO FIXME: Construct these graphs and compare them.
-    assert str(g) == (
-        "FunctionGraph(Reshape{1}(InplaceDimShuffle{x,0}(vector), Shape(vector)), "
-        "Reshape{2}(InplaceDimShuffle{x,0,x,1}(mat), Shape(mat)), "
-        "Reshape{2}(InplaceDimShuffle{1,x}(row), Shape(row)), "
-        "Reshape{2}(InplaceDimShuffle{0}(col), Shape(col)))"
-    )
+    assert len(g.apply_nodes) == 4 * 3
     useless_dimshuffle_in_reshape = out2in(local_useless_dimshuffle_in_reshape)
     useless_dimshuffle_in_reshape.rewrite(g)
-    assert str(g) == (
-        "FunctionGraph(Reshape{1}(vector, Shape(vector)), "
-        "Reshape{2}(mat, Shape(mat)), "
-        "Reshape{2}(row, Shape(row)), "
-        "Reshape{2}(col, Shape(col)))"
+    assert equal_computations(
+        g.outputs,
+        [
+            reshape(vec, vec.shape),
+            reshape(mat, mat.shape),
+            reshape(row, row.shape),
+            reshape(col, col.shape),
+        ],
     )
-
     # Check stacktrace was copied over correctly after rewrite was applied
     assert check_stack_trace(g, ops_to_check="all")
 
     # Check that the rewrite does not get applied when the order
     # of dimensions has changed.
     reshape_dimshuffle_mat2 = reshape(mat.dimshuffle("x", 1, "x", 0), mat.shape)
-    h = FunctionGraph([mat], [reshape_dimshuffle_mat2])
-    str_h = str(h)
+    h = FunctionGraph([mat], [reshape_dimshuffle_mat2], clone=False)
+    assert len(h.apply_nodes) == 3
     useless_dimshuffle_in_reshape.rewrite(h)
-    assert str(h) == str_h
+    assert equal_computations(
+        h.outputs, [reshape(mat.dimshuffle("x", 1, "x", 0), mat.shape)]
+    )
 
 
 class TestFusion:
@@ -1123,7 +1081,7 @@ class TestFusion:
         out = dot(x, y) + x + y + z
 
         f = function([x, y, z], out, mode=self.mode)
-        topo = [n for n in f.maker.fgraph.toposort()]
+        topo = list(f.maker.fgraph.toposort())
         assert len(topo) == 2
         assert topo[-1].op.inplace_pattern
 
@@ -1219,8 +1177,24 @@ class TestFusion:
         )
 
     @pytest.mark.parametrize("linker", ["cvm", "py"])
+    @pytest.mark.parametrize("inp_dtype", ("floatX", "int32"))
     @pytest.mark.parametrize("axis", [None, 0, 1, (0, 1), (0, 1, 2)])
-    def test_CAReduce_single_input(self, linker, axis):
+    @pytest.mark.parametrize(
+        "careduce_op, numpy_op",
+        [
+            (at_sum, np.sum),
+            pytest.param(
+                at_all,
+                np.all,
+                marks=pytest.mark.xfail(
+                    reason="Rewrite logic does not support all CAReduce"
+                ),
+            ),
+        ],
+    )
+    def test_CAReduce_single_input(
+        self, linker, inp_dtype, axis, careduce_op, numpy_op
+    ):
         """Make sure that `CAReduce` and `Elemwise` fusions work with a single input."""
 
         mode = Mode(linker=linker)
@@ -1230,8 +1204,8 @@ class TestFusion:
             "inplace",
         )
 
-        x = tensor(dtype="floatX", shape=(None, None, None), name="x")
-        out = exp(x).sum(axis=axis)
+        x = tensor(dtype=inp_dtype, shape=(None, None, None), name="x")
+        out = careduce_op(exp(x), axis=axis)
 
         out_fn = function([x], out, mode=mode)
 
@@ -1240,9 +1214,9 @@ class TestFusion:
             assert isinstance(getattr(out_node.op, "scalar_op"), aes.basic.Composite)
 
             rng = np.random.default_rng(2320)
-            x_val = rng.random((4, 3, 2), dtype=config.floatX)
+            x_val = rng.random((4, 3, 2)).astype(x.type.dtype)
 
-            exp_res = np.exp(x_val).sum(axis=axis)
+            exp_res = numpy_op(np.exp(x_val), axis=axis)
 
             out_val = out_fn(x_val)
             assert out_val.shape == exp_res.shape
@@ -1258,7 +1232,7 @@ class TestFusion:
         # `Elemwise`s with more than one client shouldn't be rewritten
         x = tensor(dtype="floatX", shape=(None, None, None), name="x")
         exp_x = exp(x)
-        out = exp_x.sum(axis=axis) + exp(x)
+        out = careduce_op(exp_x, axis=axis) + exp(x)
 
         out_fn = function([x], out, mode=mode)
         out_nodes = out_fn.maker.fgraph.toposort()
@@ -1451,39 +1425,40 @@ class TestCompositeCodegen:
         fval = f([1, 2, 3])
         assert np.all(fval == [6, 12, 18])
 
-    def test_local_useless_composite(self):
-        x = aes.float32()
-        y = aes.float32()
-        z = aes.float32()
-        c = aes.Composite([x, y, z], [x + 1, y - 1])
-        X = matrix("X")
-        Y = matrix("Y")
-        Z = matrix("Z")
-        o1, o2 = Elemwise(scalar_op=c)(X, Y, Z)
-        mode = get_default_mode().including("local_useless_composite")
 
-        f = function([X, Y, Z], [o1, o2], mode=mode)
-        topo = f.maker.fgraph.toposort()
-        assert len(topo) == 1
-        assert len(topo[0].inputs) == 2
-        assert len(topo[0].outputs) == 2
-        res1, res2 = f([[1.0]], [[1.0]], [[np.nan]])
-        utt.assert_allclose(res1, [[2.0]])
-        utt.assert_allclose(res2, [[0.0]])
+def test_local_useless_composite_outputs():
+    x = aes.float32()
+    y = aes.float32()
+    z = aes.float32()
+    c = aes.Composite([x, y, z], [x + 1, y - 1])
+    X = matrix("X")
+    Y = matrix("Y")
+    Z = matrix("Z")
+    o1, o2 = Elemwise(scalar_op=c)(X, Y, Z)
+    mode = get_default_mode().including("local_useless_composite")
 
-        f = function([X, Y, Z], o1, mode=mode)
-        topo = f.maker.fgraph.toposort()
-        assert len(topo) == 1
-        assert len(topo[0].inputs) == 1
-        assert len(topo[0].outputs) == 1
-        utt.assert_allclose(f([[1.0]], [[np.nan]], [[np.nan]]), [[2.0]])
+    f = function([X, Y, Z], [o1, o2], mode=mode)
+    topo = f.maker.fgraph.toposort()
+    assert len(topo) == 1
+    assert len(topo[0].inputs) == 2
+    assert len(topo[0].outputs) == 2
+    res1, res2 = f([[1.0]], [[1.0]], [[np.nan]])
+    utt.assert_allclose(res1, [[2.0]])
+    utt.assert_allclose(res2, [[0.0]])
 
-        f = function([X, Y, Z], o2, mode=mode)
-        topo = f.maker.fgraph.toposort()
-        assert len(topo) == 1
-        assert len(topo[0].inputs) == 1
-        assert len(topo[0].outputs) == 1
-        utt.assert_allclose(f([[np.nan]], [[1.0]], [[np.nan]]), [[0.0]])
+    f = function([X, Y, Z], o1, mode=mode)
+    topo = f.maker.fgraph.toposort()
+    assert len(topo) == 1
+    assert len(topo[0].inputs) == 1
+    assert len(topo[0].outputs) == 1
+    utt.assert_allclose(f([[1.0]], [[np.nan]], [[np.nan]]), [[2.0]])
+
+    f = function([X, Y, Z], o2, mode=mode)
+    topo = f.maker.fgraph.toposort()
+    assert len(topo) == 1
+    assert len(topo[0].inputs) == 1
+    assert len(topo[0].outputs) == 1
+    utt.assert_allclose(f([[np.nan]], [[1.0]], [[np.nan]]), [[0.0]])
 
 
 def test_local_useless_dimshuffle_makevector():

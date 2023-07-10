@@ -18,7 +18,8 @@ from pytensor.tensor.basic import (
     ScalarFromTensor,
     Split,
     TensorFromScalar,
-    get_scalar_constant_value,
+    Tri,
+    get_underlying_scalar_constant_value,
 )
 from pytensor.tensor.exceptions import NotScalarConstantError
 
@@ -26,7 +27,6 @@ from pytensor.tensor.exceptions import NotScalarConstantError
 ARANGE_CONCRETE_VALUE_ERROR = """JAX requires the arguments of `jax.numpy.arange`
 to be constants. The graph that you defined thus cannot be JIT-compiled
 by JAX. An example of a graph that can be compiled to JAX:
-
 >>> import pytensor.tensor basic
 >>> at.arange(1, 10, 2)
 """
@@ -106,7 +106,7 @@ def jax_funcify_Join(op, **kwargs):
 def jax_funcify_Split(op: Split, node, **kwargs):
     _, axis, splits = node.inputs
     try:
-        constant_axis = get_scalar_constant_value(axis)
+        constant_axis = get_underlying_scalar_constant_value(axis)
     except NotScalarConstantError:
         constant_axis = None
         warnings.warn(
@@ -116,7 +116,7 @@ def jax_funcify_Split(op: Split, node, **kwargs):
     try:
         constant_splits = np.array(
             [
-                get_scalar_constant_value(splits[i])
+                get_underlying_scalar_constant_value(splits[i])
                 for i in range(get_vector_length(splits))
             ]
         )
@@ -193,3 +193,18 @@ def jax_funcify_ScalarFromTensor(op, **kwargs):
         return jnp.array(x).flatten()[0]
 
     return scalar_from_tensor
+
+
+@jax_funcify.register(Tri)
+def jax_funcify_Tri(op, node, **kwargs):
+    # node.inputs is N, M, k
+    const_args = [getattr(x, "data", None) for x in node.inputs]
+
+    def tri(*args):
+        # args is N, M, k
+        args = [
+            x if const_x is None else const_x for x, const_x in zip(args, const_args)
+        ]
+        return jnp.tri(*args, dtype=op.dtype)
+
+    return tri

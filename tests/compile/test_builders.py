@@ -572,18 +572,18 @@ def test_debugprint():
     lines = output_str.split("\n")
 
     exp_res = """OpFromGraph{inline=False} [id A]
- |x [id B]
- |y [id C]
- |z [id D]
+ ├─ x [id B]
+ ├─ y [id C]
+ └─ z [id D]
 
 Inner graphs:
 
 OpFromGraph{inline=False} [id A]
- >Elemwise{add,no_inplace} [id E]
- > |*0-<TensorType(float64, (?, ?))> [id F]
- > |Elemwise{mul,no_inplace} [id G]
- >   |*1-<TensorType(float64, (?, ?))> [id H]
- >   |*2-<TensorType(float64, (?, ?))> [id I]
+ ← Add [id E]
+    ├─ *0-<Matrix(float64, shape=(?, ?))> [id F]
+    └─ Mul [id G]
+       ├─ *1-<Matrix(float64, shape=(?, ?))> [id H]
+       └─ *2-<Matrix(float64, shape=(?, ?))> [id I]
 """
 
     for truth, out in zip(exp_res.split("\n"), lines):

@@ -4,10 +4,8 @@ from pytensor.graph.rewriting.basic import node_rewriter
 from pytensor.tensor import basic as at
 from pytensor.tensor.blas import Dot22
 from pytensor.tensor.elemwise import DimShuffle
-from pytensor.tensor.math import Dot, Prod, dot, log
-from pytensor.tensor.math import pow as at_pow
-from pytensor.tensor.math import prod
-from pytensor.tensor.nlinalg import Det, MatrixInverse, trace
+from pytensor.tensor.math import Dot, Prod, log, prod
+from pytensor.tensor.nlinalg import Det, MatrixInverse
 from pytensor.tensor.rewriting.basic import (
     register_canonicalize,
     register_specialize,
@@ -109,6 +107,50 @@ def psd_solve_with_chol(fgraph, node):
             return [x]
 
 
+@register_canonicalize
+@register_stabilize
+@node_rewriter([Cholesky])
+def cholesky_ldotlt(fgraph, node):
+    """
+    rewrite cholesky(dot(L, L.T), lower=True) = L, where L is lower triangular,
+    or cholesky(dot(U.T, U), upper=True) = U where U is upper triangular.
+
+    This utilizes a boolean `lower_triangular` or `upper_triangular` tag on matrices.
+    """
+    if not isinstance(node.op, Cholesky):
+        return
+
+    A = node.inputs[0]
+    if not (A.owner and isinstance(A.owner.op, (Dot, Dot22))):
+        return
+
+    l, r = A.owner.inputs
+
+    # cholesky(dot(L,L.T)) case
+    if (
+        getattr(l.tag, "lower_triangular", False)
+        and r.owner
+        and isinstance(r.owner.op, DimShuffle)
+        and r.owner.op.new_order == (1, 0)
+        and r.owner.inputs[0] == l
+    ):
+        if node.op.lower:
+            return [l]
+        return [r]
+
+    # cholesky(dot(U.T,U)) case
+    if (
+        getattr(r.tag, "upper_triangular", False)
+        and l.owner
+        and isinstance(l.owner.op, DimShuffle)
+        and l.owner.op.new_order == (1, 0)
+        and l.owner.inputs[0] == r
+    ):
+        if node.op.lower:
+            return [l]
+        return [r]
+
+
 @register_stabilize
 @register_specialize
 @node_rewriter([Det])
@@ -147,34 +189,3 @@ def local_log_prod_sqr(fgraph, node):
 
             # TODO: have a reduction like prod and sum that simply
             # returns the sign of the prod multiplication.
-
-
-def spectral_radius_bound(X, log2_exponent):
-    """
-    Returns upper bound on the largest eigenvalue of square symmetric matrix X.
-
-    log2_exponent must be a positive-valued integer. The larger it is, the
-    slower and tighter the bound. Values up to 5 should usually suffice. The
-    algorithm works by multiplying X by itself this many times.
-
-    From V.Pan, 1990. "Estimating the Extremal Eigenvalues of a Symmetric
-    Matrix", Computers Math Applic. Vol 20 n. 2 pp 17-22.
-    Rq: an efficient algorithm, not used here, is defined in this paper.
-
-    """
-    if X.type.ndim != 2:
-        raise TypeError("spectral_radius_bound requires a matrix argument", X)
-    if not isinstance(log2_exponent, int):
-        raise TypeError(
-            "spectral_radius_bound requires an integer exponent", log2_exponent
-        )
-    if log2_exponent <= 0:
-        raise ValueError(
-            "spectral_radius_bound requires a strictly positive exponent",
-            log2_exponent,
-        )
-
-    XX = X
-    for i in range(log2_exponent):
-        XX = dot(XX, XX)
-    return at_pow(trace(XX), 2 ** (-log2_exponent))

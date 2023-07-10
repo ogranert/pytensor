@@ -1,14 +1,17 @@
 import numpy as np
 import numpy.linalg
+import pytest
+import scipy.linalg
 
 import pytensor
 from pytensor import function
 from pytensor import tensor as at
+from pytensor.compile import get_default_mode
 from pytensor.configdefaults import config
-from pytensor.sandbox.linalg.ops import inv_as_solve, spectral_radius_bound
 from pytensor.tensor.elemwise import DimShuffle
 from pytensor.tensor.math import _allclose
 from pytensor.tensor.nlinalg import MatrixInverse, matrix_inverse
+from pytensor.tensor.rewriting.linalg import inv_as_solve
 from pytensor.tensor.slinalg import Cholesky, Solve, solve
 from pytensor.tensor.type import dmatrix, matrix, vector
 from tests import unittest_tools as utt
@@ -65,53 +68,6 @@ def test_rop_lop():
     assert _allclose(v1, v2), f"LOP mismatch: {v1} {v2}"
 
 
-def test_spectral_radius_bound():
-    tol = 10 ** (-6)
-    rng = np.random.default_rng(utt.fetch_seed())
-    x = matrix()
-    radius_bound = spectral_radius_bound(x, 5)
-    f = pytensor.function([x], radius_bound)
-
-    shp = (3, 4)
-    m = rng.random(shp)
-    m = np.cov(m).astype(config.floatX)
-    radius_bound_pytensor = f(m)
-
-    # test the approximation
-    mm = m
-    for i in range(5):
-        mm = np.dot(mm, mm)
-    radius_bound_numpy = np.trace(mm) ** (2 ** (-5))
-    assert abs(radius_bound_numpy - radius_bound_pytensor) < tol
-
-    # test the bound
-    eigen_val = numpy.linalg.eig(m)
-    assert (eigen_val[0].max() - radius_bound_pytensor) < tol
-
-    # test type errors
-    xx = vector()
-    ok = False
-    try:
-        spectral_radius_bound(xx, 5)
-    except TypeError:
-        ok = True
-    assert ok
-    ok = False
-    try:
-        spectral_radius_bound(x, 5.0)
-    except TypeError:
-        ok = True
-    assert ok
-
-    # test value error
-    ok = False
-    try:
-        spectral_radius_bound(x, -5)
-    except ValueError:
-        ok = True
-    assert ok
-
-
 def test_transinv_to_invtrans():
     X = matrix("X")
     Y = matrix_inverse(X)
@@ -152,3 +108,75 @@ def test_matrix_inverse_solve():
     node = matrix_inverse(A).dot(b).owner
     [out] = inv_as_solve.transform(None, node)
     assert isinstance(out.owner.op, Solve)
+
+
+@pytest.mark.parametrize("tag", ("lower", "upper", None))
+@pytest.mark.parametrize("cholesky_form", ("lower", "upper"))
+@pytest.mark.parametrize("product", ("lower", "upper", None))
+def test_cholesky_ldotlt(tag, cholesky_form, product):
+    cholesky = Cholesky(lower=(cholesky_form == "lower"))
+
+    transform_removes_chol = tag is not None and product == tag
+    transform_transposes = transform_removes_chol and cholesky_form != tag
+
+    A = matrix("L")
+    if tag:
+        setattr(A.tag, tag + "_triangular", True)
+
+    if product == "lower":
+        M = A.dot(A.T)
+    elif product == "upper":
+        M = A.T.dot(A)
+    else:
+        M = A
+
+    C = cholesky(M)
+    f = pytensor.function([A], C, mode=get_default_mode().including("cholesky_ldotlt"))
+
+    print(f.maker.fgraph.apply_nodes)
+
+    no_cholesky_in_graph = not any(
+        isinstance(node.op, Cholesky) for node in f.maker.fgraph.apply_nodes
+    )
+
+    assert no_cholesky_in_graph == transform_removes_chol
+
+    if transform_transposes:
+        assert any(
+            isinstance(node.op, DimShuffle) and node.op.new_order == (1, 0)
+            for node in f.maker.fgraph.apply_nodes
+        )
+
+    # Test some concrete value through f
+    # there must be lower triangular (f assumes they are)
+    Avs = [
+        np.eye(1, dtype=pytensor.config.floatX),
+        np.eye(10, dtype=pytensor.config.floatX),
+        np.array([[2, 0], [1, 4]], dtype=pytensor.config.floatX),
+    ]
+    if not tag:
+        # these must be positive def
+        Avs.extend(
+            [
+                np.ones((4, 4), dtype=pytensor.config.floatX)
+                + np.eye(4, dtype=pytensor.config.floatX),
+            ]
+        )
+
+    for Av in Avs:
+        if tag == "upper":
+            Av = Av.T
+
+        if product == "lower":
+            Mv = Av.dot(Av.T)
+        elif product == "upper":
+            Mv = Av.T.dot(Av)
+        else:
+            Mv = Av
+
+        assert np.all(
+            np.isclose(
+                scipy.linalg.cholesky(Mv, lower=(cholesky_form == "lower")),
+                f(Av),
+            )
+        )

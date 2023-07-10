@@ -188,6 +188,12 @@ class TestDimShuffle(unittest_tools.InferShapeTester):
         y = x.dimshuffle([0, 1, "x"])
         assert y.type.shape == (1, 2, 1)
 
+    def test_valid_input_broadcastable(self):
+        assert DimShuffle([True, False], (1, 0)).input_broadcastable == (True, False)
+
+        with pytest.raises(ValueError, match="input_broadcastable must be boolean"):
+            DimShuffle([None, None], (1, 0))
+
 
 class TestBroadcast:
     # this is to allow other types to reuse this class to test their ops
@@ -490,50 +496,50 @@ class TestCAReduce(unittest_tools.InferShapeTester):
                 assert len(axis2) == len(tosum)
                 tosum = tuple(axis2)
             if tensor_op == at_all:
-                for axis in reversed(sorted(tosum)):
+                for axis in sorted(tosum, reverse=True):
                     zv = np.all(zv, axis)
                 if len(tosum) == 0:
                     zv = zv != 0
             elif tensor_op == at_any:
-                for axis in reversed(sorted(tosum)):
+                for axis in sorted(tosum, reverse=True):
                     zv = np.any(zv, axis)
                 if len(tosum) == 0:
                     zv = zv != 0
             elif scalar_op == aes.add:
-                for axis in reversed(sorted(tosum)):
+                for axis in sorted(tosum, reverse=True):
                     zv = np.add.reduce(zv, axis)
                 if dtype == "bool":
                     # np.add of a bool upcast, while CAReduce don't
                     zv = zv.astype(dtype)
             elif scalar_op == aes.mul:
-                for axis in reversed(sorted(tosum)):
+                for axis in sorted(tosum, reverse=True):
                     zv = np.multiply.reduce(zv, axis)
             elif scalar_op == aes.scalar_maximum:
                 # There is no identity value for the maximum function
                 # So we can't support shape of dimensions 0.
                 if np.prod(zv.shape) == 0:
                     continue
-                for axis in reversed(sorted(tosum)):
+                for axis in sorted(tosum, reverse=True):
                     zv = np.maximum.reduce(zv, axis)
             elif scalar_op == aes.scalar_minimum:
                 # There is no identity value for the minimum function
                 # So we can't support shape of dimensions 0.
                 if np.prod(zv.shape) == 0:
                     continue
-                for axis in reversed(sorted(tosum)):
+                for axis in sorted(tosum, reverse=True):
                     zv = np.minimum.reduce(zv, axis)
             elif scalar_op == aes.or_:
-                for axis in reversed(sorted(tosum)):
+                for axis in sorted(tosum, reverse=True):
                     zv = np.bitwise_or.reduce(zv, axis)
             elif scalar_op == aes.and_:
-                for axis in reversed(sorted(tosum)):
+                for axis in sorted(tosum, reverse=True):
                     zv = reduce_bitwise_and(zv, axis, dtype=dtype)
             elif scalar_op == aes.xor:
                 # There is no identity value for the xor function
                 # So we can't support shape of dimensions 0.
                 if np.prod(zv.shape) == 0:
                     continue
-                for axis in reversed(sorted(tosum)):
+                for axis in sorted(tosum, reverse=True):
                     zv = np.bitwise_xor.reduce(zv, axis)
             else:
                 raise NotImplementedError(
@@ -676,14 +682,9 @@ class TestCAReduce(unittest_tools.InferShapeTester):
 
     def test_str(self):
         op = CAReduce(aes.add, axis=None)
-        assert str(op) == "CAReduce{add}"
+        assert str(op) == "CAReduce{add, axes=None}"
         op = CAReduce(aes.add, axis=(1,))
-        assert str(op) == "CAReduce{add}{axis=[1]}"
-
-        op = CAReduce(aes.add, axis=None, acc_dtype="float64")
-        assert str(op) == "CAReduce{add}{acc_dtype=float64}"
-        op = CAReduce(aes.add, axis=(1,), acc_dtype="float64")
-        assert str(op) == "CAReduce{add}{axis=[1], acc_dtype=float64}"
+        assert str(op) == "CAReduce{add, axis=1}"
 
     def test_repeated_axis(self):
         x = vector("x")
@@ -802,10 +803,8 @@ class TestElemwise(unittest_tools.InferShapeTester):
         self.check_input_dimensions_match(Mode(linker="c"))
 
     def test_str(self):
-        op = Elemwise(aes.add, inplace_pattern=None, name=None)
-        assert str(op) == "Elemwise{add}"
         op = Elemwise(aes.add, inplace_pattern={0: 0}, name=None)
-        assert str(op) == "Elemwise{add}[(0, 0)]"
+        assert str(op) == "Add"
         op = Elemwise(aes.add, inplace_pattern=None, name="my_op")
         assert str(op) == "my_op"
 
@@ -823,8 +822,8 @@ class TestElemwise(unittest_tools.InferShapeTester):
 
         assert len(res_shape) == 1
         assert len(res_shape[0]) == 2
-        assert pytensor.get_scalar_constant_value(res_shape[0][0]) == 1
-        assert pytensor.get_scalar_constant_value(res_shape[0][1]) == 1
+        assert pytensor.get_underlying_scalar_constant(res_shape[0][0]) == 1
+        assert pytensor.get_underlying_scalar_constant(res_shape[0][1]) == 1
 
     def test_multi_output(self):
         class CustomElemwise(Elemwise):

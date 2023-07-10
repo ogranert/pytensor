@@ -20,7 +20,7 @@ from pytensor.misc.safe_asarray import _asarray
 from pytensor.printing import Printer, pprint, set_precedence
 from pytensor.scalar.basic import ScalarConstant
 from pytensor.tensor import _get_vector_length, as_tensor_variable, get_vector_length
-from pytensor.tensor.basic import alloc, get_scalar_constant_value
+from pytensor.tensor.basic import alloc, get_underlying_scalar_constant_value
 from pytensor.tensor.elemwise import DimShuffle
 from pytensor.tensor.exceptions import (
     AdvancedIndexingError,
@@ -656,7 +656,7 @@ def get_constant_idx(
             return slice(conv(val.start), conv(val.stop), conv(val.step))
         else:
             try:
-                return get_scalar_constant_value(
+                return get_underlying_scalar_constant_value(
                     val,
                     only_process_constants=only_process_constants,
                     elemwise=elemwise,
@@ -733,7 +733,7 @@ class Subtensor(COp):
                 if s == 1:
                     start = p.start
                     try:
-                        start = get_scalar_constant_value(start)
+                        start = get_underlying_scalar_constant_value(start)
                     except NotScalarConstantError:
                         pass
                     if start is None or start == 0:
@@ -840,22 +840,34 @@ class Subtensor(COp):
 
     @staticmethod
     def str_from_slice(entry):
-        msg = []
-        for x in [entry.start, entry.stop, entry.step]:
-            if x is None:
-                msg.append("")
+        if entry.step:
+            return ":".join(
+                (
+                    "start" if entry.start else "",
+                    "stop" if entry.stop else "",
+                    "step",
+                )
+            )
+        if entry.stop:
+            return f"{'start' if entry.start else ''}:stop"
+        if entry.start:
+            return "start:"
+        return ":"
+
+    @staticmethod
+    def str_from_indices(idx_list):
+        indices = []
+        letter_indexes = 0
+        for entry in idx_list:
+            if isinstance(entry, slice):
+                indices.append(Subtensor.str_from_slice(entry))
             else:
-                msg.append(str(x))
-        return ":".join(msg)
+                indices.append("ijk"[letter_indexes % 3] * (letter_indexes // 3 + 1))
+                letter_indexes += 1
+        return ", ".join(indices)
 
     def __str__(self):
-        indices = []
-        for entry in self.idx_list:
-            if isinstance(entry, slice):
-                indices.append(self.str_from_slice(entry))
-            else:
-                indices.append(str(entry))
-        return f"{self.__class__.__name__}{{{', '.join(indices)}}}"
+        return f"{self.__class__.__name__}{{{self.str_from_indices(self.idx_list)}}}"
 
     @staticmethod
     def default_helper_c_code_args():
@@ -1498,21 +1510,8 @@ class IncSubtensor(COp):
         return hash((type(self), idx_list, self.inplace, self.set_instead_of_inc))
 
     def __str__(self):
-        indices = []
-        for entry in self.idx_list:
-            if isinstance(entry, slice):
-                indices.append(Subtensor.str_from_slice(entry))
-            else:
-                indices.append(str(entry))
-        if self.inplace:
-            msg = "Inplace"
-        else:
-            msg = ""
-        if not self.set_instead_of_inc:
-            msg += "Inc"
-        else:
-            msg += "Set"
-        return f"{self.__class__.__name__}{{{msg};{', '.join(indices)}}}"
+        name = "SetSubtensor" if self.set_instead_of_inc else "IncSubtensor"
+        return f"{name}{{{Subtensor.str_from_indices(self.idx_list)}}}"
 
     def make_node(self, x, y, *inputs):
         """
@@ -1902,7 +1901,7 @@ def _sum_grad_over_bcasted_dims(x, gx):
     if gx.broadcastable != x.broadcastable:
         x_dim_added = gx.ndim - x.ndim
         x_broad = (True,) * x_dim_added + x.broadcastable
-        assert sum(gx.broadcastable) < sum(x_broad)
+        assert sum(gx.broadcastable) <= sum(x_broad)
         axis_to_sum = []
         for i in range(gx.ndim):
             if gx.broadcastable[i] is False and x_broad[i] is True:
@@ -2604,7 +2603,7 @@ class AdvancedSubtensor(Op):
             ishapes[0], index_shapes, indices_are_shapes=True
         )
         assert node.outputs[0].ndim == len(res_shape)
-        return [[s for s in res_shape]]
+        return [list(res_shape)]
 
     def perform(self, node, inputs, out_):
         (out,) = out_
@@ -2661,10 +2660,10 @@ class AdvancedIncSubtensor(Op):
         self.ignore_duplicates = ignore_duplicates
 
     def __str__(self):
-        return "{}{{{}, {}}}".format(
-            self.__class__.__name__,
-            "inplace=" + str(self.inplace),
-            " set_instead_of_inc=" + str(self.set_instead_of_inc),
+        return (
+            "AdvancedSetSubtensor"
+            if self.set_instead_of_inc
+            else "AdvancedIncSubtensor"
         )
 
     def make_node(self, x, y, *inputs):
@@ -2808,17 +2807,17 @@ def _get_vector_length_Subtensor(op, var):
         start = (
             None
             if indices[0].start is None
-            else get_scalar_constant_value(indices[0].start)
+            else get_underlying_scalar_constant_value(indices[0].start)
         )
         stop = (
             None
             if indices[0].stop is None
-            else get_scalar_constant_value(indices[0].stop)
+            else get_underlying_scalar_constant_value(indices[0].stop)
         )
         step = (
             None
             if indices[0].step is None
-            else get_scalar_constant_value(indices[0].step)
+            else get_underlying_scalar_constant_value(indices[0].step)
         )
 
         if start == stop:

@@ -22,9 +22,17 @@ from pytensor.graph.rewriting.basic import (
 )
 from pytensor.graph.rewriting.db import SequenceDB
 from pytensor.graph.utils import InconsistencyError, MethodNotDefined
-from pytensor.tensor.basic import MakeVector, alloc, cast, get_scalar_constant_value
+from pytensor.scalar.loop import ScalarLoop
+from pytensor.scalar.math import Grad2F1Loop, _grad_2f1_loop
+from pytensor.tensor.basic import (
+    MakeVector,
+    alloc,
+    cast,
+    get_underlying_scalar_constant_value,
+)
 from pytensor.tensor.elemwise import CAReduce, DimShuffle, Elemwise
 from pytensor.tensor.exceptions import NotScalarConstantError
+from pytensor.tensor.math import exp
 from pytensor.tensor.rewriting.basic import register_canonicalize, register_specialize
 from pytensor.tensor.shape import shape_padleft
 from pytensor.tensor.var import TensorConstant
@@ -61,9 +69,12 @@ class InplaceElemwiseOptimizer(GraphRewriter):
                 print(blanc, n, ndim[n], file=stream)
 
     def candidate_input_idxs(self, node):
-        if isinstance(node.op.scalar_op, aes.Composite) and len(node.outputs) > 1:
-            # TODO: Implement specialized InplaceCompositeOptimizer with logic
-            #  needed to correctly assign inplace for multi-output Composites
+        # TODO: Implement specialized InplaceCompositeOptimizer with logic
+        #  needed to correctly assign inplace for multi-output Composites
+        #  and ScalarLoops
+        if isinstance(node.op.scalar_op, ScalarLoop):
+            return []
+        if isinstance(node.op.scalar_op, aes.Composite) and (len(node.outputs) > 1):
             return []
         else:
             return range(len(node.outputs))
@@ -338,7 +349,7 @@ class InplaceElemwiseOptimizer(GraphRewriter):
 
 
 inplace_elemwise_optimizer = InplaceElemwiseOptimizer(Elemwise)
-compile.optdb.register(  # type: ignore
+compile.optdb.register(
     "inplace_elemwise_opt",
     inplace_elemwise_optimizer,
     "inplace_opt",  # for historic reason
@@ -411,7 +422,12 @@ def local_dimshuffle_lift(fgraph, node):
     inp = node.inputs[0]
     inode = inp.owner
     new_order = op.new_order
-    if inode and isinstance(inode.op, Elemwise) and (len(fgraph.clients[inp]) == 1):
+    if (
+        inode
+        and isinstance(inode.op, Elemwise)
+        and len(inode.outputs) == 1
+        and (len(fgraph.clients[inp]) == 1)
+    ):
         # Don't use make_node to have tag.test_value set.
         new_inputs = []
         for inp in inode.inputs:
@@ -495,7 +511,7 @@ def local_upcast_elemwise_constant_inputs(fgraph, node):
                 else:
                     try:
                         # works only for scalars
-                        cval_i = get_scalar_constant_value(
+                        cval_i = get_underlying_scalar_constant_value(
                             i, only_process_constants=True
                         )
                         if all(i.broadcastable):
@@ -1069,38 +1085,10 @@ class FusionOptimizer(GraphRewriter):
         print(blanc, " time_toposort", prof[7], file=stream)
 
 
-if config.tensor__local_elemwise_fusion:
-    # Must be after gpu(48.5) and before AddDestroyHandler(49.5)
-    fuse_seqopt = SequenceDB()
-    fuse_seqopt.register(
-        "local_add_mul_fusion",
-        EquilibriumGraphRewriter(rewriters=[local_add_mul_fusion], max_use_ratio=1000),
-        "fast_run",
-        "fusion",
-        position=0,
-    )
-    fuse_seqopt.register(
-        "composite_elemwise_fusion",
-        FusionOptimizer(),
-        "fast_run",
-        "fusion",
-        position=1,
-    )
-    compile.optdb.register(  # type: ignore
-        "elemwise_fusion",
-        fuse_seqopt,
-        "fast_run",
-        "fusion",
-        "local_elemwise_fusion",
-        "FusionOptimizer",
-        position=49,
-    )
-
-
 @register_canonicalize
 @register_specialize
 @node_rewriter([Elemwise])
-def local_useless_composite(fgraph, node):
+def local_useless_composite_outputs(fgraph, node):
     """Remove inputs and outputs of Composite Ops that are not used anywhere."""
     if not isinstance(node.op, Elemwise) or not isinstance(
         node.op.scalar_op, aes.Composite
@@ -1134,10 +1122,19 @@ def local_careduce_fusion(fgraph, node):
     """Fuse a `CAReduce` applied to an `Elemwise`."""
 
     (car_input,) = node.inputs
+    car_scalar_op = node.op.scalar_op
+
+    # FIXME: This check is needed because of the faulty logic in the FIXME below!
+    # Right now, rewrite only works for `Sum`/`Prod`
+    if not isinstance(car_scalar_op, (aes.Add, aes.Mul)):
+        return None
+
     elm_node = car_input.owner
 
     if elm_node is None or not isinstance(elm_node.op, Elemwise):
         return False
+
+    elm_scalar_op = elm_node.op.scalar_op
 
     elm_inputs = elm_node.inputs
     elm_outputs = elm_node.outputs
@@ -1150,21 +1147,15 @@ def local_careduce_fusion(fgraph, node):
         return False
 
     # Don't form the fusion when the target language is Python
-    elm_scalar_op = elm_node.op.scalar_op
-    car_scalar_op = node.op.scalar_op
-
     if get_target_language() == ("py",):
         return False
 
-    try:
-        elm_scalar_op.c_code(
-            elm_node,
-            "test_presence_of_c_code",
-            ["x" for x in elm_inputs],
-            ["z" for z in elm_outputs],
-            {"fail": "%(fail)s"},
-        )
+    if not elm_scalar_op.supports_c_code(elm_inputs, elm_outputs):
+        return None
 
+    # FIXME: This fails with Ops like `Max` whose `c_code` always expects two inputs!
+    #  Should implement a `CAReduce.supports_c_code`?
+    try:
         car_scalar_op.c_code(
             node,
             "test_presence_of_c_code",
@@ -1175,18 +1166,24 @@ def local_careduce_fusion(fgraph, node):
     except (NotImplementedError, MethodNotDefined):
         return False
 
-    car_axis = node.op.axis
+    car_op = node.op
+    car_acc_dtype = node.op.acc_dtype
 
     scalar_elm_inputs = [
         aes.get_scalar_type(inp.type.dtype).make_variable() for inp in elm_inputs
     ]
+
     elm_output = elm_scalar_op(*scalar_elm_inputs)
+
     # This input represents the previous value in the `CAReduce` binary reduction
-    carried_car_input = elm_output.type()
-    scalar_fused_outputs = [car_scalar_op(carried_car_input, elm_output)]
+    carried_car_input = aes.get_scalar_type(car_acc_dtype).make_variable()
+
+    scalar_fused_output = car_scalar_op(carried_car_input, elm_output)
+    if scalar_fused_output.type.dtype != car_acc_dtype:
+        scalar_fused_output = aes.cast(scalar_fused_output, car_acc_dtype)
 
     fused_scalar_op = aes.Composite(
-        inputs=[carried_car_input] + scalar_elm_inputs, outputs=scalar_fused_outputs
+        inputs=[carried_car_input] + scalar_elm_inputs, outputs=[scalar_fused_output]
     )
 
     # The fused `Op` needs to look and behave like a `BinaryScalarOp`
@@ -1195,14 +1192,163 @@ def local_careduce_fusion(fgraph, node):
     fused_scalar_op.nin = 2
     fused_scalar_op.nout = 1
 
-    new_car_op = CAReduce(fused_scalar_op, car_axis)
+    new_car_op = CAReduce(
+        scalar_op=fused_scalar_op,
+        axis=car_op.axis,
+        acc_dtype=car_acc_dtype,
+        dtype=car_op.dtype,
+        upcast_discrete_output=car_op.upcast_discrete_output,
+    )
 
     return [new_car_op(*elm_inputs)]
 
 
-compile.optdb.register(  # type: ignore
+# Register fusion database just before AddDestroyHandler(49.5) (inplace rewrites)
+fuse_seqopt = SequenceDB()
+compile.optdb.register(
+    "elemwise_fusion",
+    fuse_seqopt,
+    "fast_run",
+    "fusion",
+    "local_elemwise_fusion",
+    "FusionOptimizer",
+    position=49,
+)
+
+fuse_seqopt.register(
+    "local_add_mul_fusion",
+    EquilibriumGraphRewriter(rewriters=[local_add_mul_fusion], max_use_ratio=1000),
+    "fast_run",
+    "fusion",
+    position=0,
+)
+fuse_seqopt.register(
+    "composite_elemwise_fusion",
+    FusionOptimizer(),
+    "fast_run",
+    "fusion",
+    position=1,
+)
+fuse_seqopt.register(
+    "local_useless_composite_outputs",
+    in2out(local_useless_composite_outputs),
+    "fast_run",
+    "fusion",
+    position=2,
+)
+fuse_seqopt.register(
     "local_careduce_fusion",
     in2out(local_careduce_fusion),
+    "fast_run",
     "fusion",
-    position=49,
+    position=10,
+)
+
+
+def _rebuild_partial_2f1grad_loop(node, wrt):
+    a, b, c, log_z, sign_z = node.inputs[-5:]
+    z = exp(log_z) * sign_z
+
+    # Reconstruct scalar loop with relevant outputs
+    a_, b_, c_, z_ = (x.type.to_scalar_type()() for x in (a, b, c, z))
+    new_loop_op = _grad_2f1_loop(
+        a_, b_, c_, z_, skip_loop=False, wrt=wrt, dtype=a_.type.dtype
+    )[0].owner.op
+
+    # Reconstruct elemwise loop
+    new_elemwise_op = Elemwise(scalar_op=new_loop_op)
+    n_steps = node.inputs[0]
+    init_grad_vars = node.inputs[1:10]
+    other_inputs = node.inputs[10:]
+
+    init_grads = init_grad_vars[: len(wrt)]
+    init_gs = init_grad_vars[3 : 3 + len(wrt)]
+    init_gs_signs = init_grad_vars[6 : 6 + len(wrt)]
+    subset_init_grad_vars = init_grads + init_gs + init_gs_signs
+
+    return new_elemwise_op(n_steps, *subset_init_grad_vars, *other_inputs)
+
+
+@register_specialize
+@node_rewriter([Elemwise])
+def local_useless_2f1grad_loop(fgraph, node):
+    # Remove unused terms from the hyp2f1 grad loop
+
+    loop_op = node.op.scalar_op
+    if not isinstance(loop_op, Grad2F1Loop):
+        return
+
+    grad_related_vars = node.outputs[:-4]
+    # Rewrite was already applied
+    if len(grad_related_vars) // 3 != 3:
+        return None
+
+    grad_vars = grad_related_vars[:3]
+    grad_var_is_used = [bool(fgraph.clients.get(v)) for v in grad_vars]
+
+    # Nothing to do here
+    if sum(grad_var_is_used) == 3:
+        return None
+
+    *other_vars, converges = node.outputs[3:]
+
+    # Check that None of the remaining vars (except the converge flag) is used anywhere
+    if any(bool(fgraph.clients.get(v)) for v in other_vars):
+        return None
+
+    wrt = [i for i, used in enumerate(grad_var_is_used) if used]
+    *new_outs, new_converges = _rebuild_partial_2f1grad_loop(node, wrt=wrt)
+
+    replacements = {converges: new_converges}
+    i = 0
+    for grad_var, is_used in zip(grad_vars, grad_var_is_used):
+        if not is_used:
+            continue
+        replacements[grad_var] = new_outs[i]
+        i += 1
+    return replacements
+
+
+@node_rewriter([Elemwise])
+def split_2f1grad_loop(fgraph, node):
+    """
+    2f1grad loop has too many operands for Numpy frompyfunc code used by Elemwise nodes on python mode.
+
+    This rewrite splits it across 3 different operations. It is not needed if `local_useless_2f1grad_loop` was applied
+    """
+    loop_op = node.op.scalar_op
+
+    if not isinstance(loop_op, Grad2F1Loop):
+        return None
+
+    grad_related_vars = node.outputs[:-4]
+    # local_useless_2f1grad_loop was used, we should be safe
+    if len(grad_related_vars) // 3 != 3:
+        return None
+
+    grad_vars = grad_related_vars[:3]
+    *other_vars, converges = node.outputs[3:]
+
+    # Check that None of the remaining vars is used anywhere
+    if any(bool(fgraph.clients.get(v)) for v in other_vars):
+        return None
+
+    new_grad0, new_grad1, *_, new_converges01 = _rebuild_partial_2f1grad_loop(
+        node, wrt=[0, 1]
+    )
+    new_grad2, *_, new_converges2 = _rebuild_partial_2f1grad_loop(node, wrt=[2])
+
+    replacements = {
+        converges: new_converges01 & new_converges2,
+        grad_vars[0]: new_grad0,
+        grad_vars[1]: new_grad1,
+        grad_vars[2]: new_grad2,
+    }
+    return replacements
+
+
+compile.optdb["py_only"].register(
+    "split_2f1grad_loop",
+    split_2f1grad_loop,
+    "fast_compile",
 )

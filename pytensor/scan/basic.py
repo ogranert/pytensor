@@ -12,7 +12,7 @@ from pytensor.graph.replace import clone_replace
 from pytensor.graph.utils import MissingInputError, TestValueError
 from pytensor.scan.op import Scan, ScanInfo
 from pytensor.scan.utils import expand_empty, safe_new, until
-from pytensor.tensor.basic import get_scalar_constant_value
+from pytensor.tensor.basic import get_underlying_scalar_constant_value
 from pytensor.tensor.exceptions import NotScalarConstantError
 from pytensor.tensor.math import minimum
 from pytensor.tensor.shape import shape_padleft, unbroadcast
@@ -147,7 +147,7 @@ def isNaN_or_Inf_or_None(x):
         isStr = False
     if not isNaN and not isInf:
         try:
-            val = get_scalar_constant_value(x)
+            val = get_underlying_scalar_constant_value(x)
             isInf = np.isinf(val)
             isNaN = np.isnan(val)
         except Exception:
@@ -476,7 +476,7 @@ def scan(
         n_fixed_steps = int(n_steps)
     else:
         try:
-            n_fixed_steps = at.get_scalar_constant_value(n_steps)
+            n_fixed_steps = at.get_underlying_scalar_constant_value(n_steps)
         except NotScalarConstantError:
             n_fixed_steps = None
 
@@ -492,7 +492,7 @@ def scan(
     # wrap sequences in a dictionary if they are not already dictionaries
     for i in range(n_seqs):
         if not isinstance(seqs[i], dict):
-            seqs[i] = dict([("input", seqs[i]), ("taps", [0])])
+            seqs[i] = {"input": seqs[i], "taps": [0]}
         elif seqs[i].get("taps", None) is not None:
             seqs[i]["taps"] = wrap_into_list(seqs[i]["taps"])
         elif seqs[i].get("taps", None) is None:
@@ -504,7 +504,7 @@ def scan(
         if outs_info[i] is not None:
             if not isinstance(outs_info[i], dict):
                 # by default any output has a tap value of -1
-                outs_info[i] = dict([("initial", outs_info[i]), ("taps", [-1])])
+                outs_info[i] = {"initial": outs_info[i], "taps": [-1]}
             elif (
                 outs_info[i].get("initial", None) is None
                 and outs_info[i].get("taps", None) is not None

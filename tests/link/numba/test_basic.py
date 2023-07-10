@@ -3,9 +3,11 @@ import inspect
 from typing import TYPE_CHECKING, Any, Callable, Optional, Sequence, Tuple, Union
 from unittest import mock
 
-import numba
 import numpy as np
 import pytest
+
+
+numba = pytest.importorskip("numba")
 
 import pytensor.scalar as aes
 import pytensor.scalar.math as aesm
@@ -127,8 +129,6 @@ def set_test_value(x, v):
 
 
 def compare_shape_dtype(x, y):
-    (x,) = x
-    (y,) = y
     return x.shape == y.shape and x.dtype == y.dtype
 
 
@@ -286,7 +286,7 @@ def compare_numba_and_py(
         for j, p in zip(numba_res, py_res):
             assert_fn(j, p)
     else:
-        assert_fn(numba_res, py_res)
+        assert_fn(numba_res[0], py_res[0])
 
     return pytensor_numba_fn, numba_res
 
@@ -532,9 +532,6 @@ def test_AdvancedIncSubtensor1(x, y, indices):
             at.as_tensor(np.arange(3 * 4 * 5).reshape((3, 4, 5))),
             at.as_tensor(rng.poisson(size=(2, 5))),
             ([1, 1], [2, 2]),
-            marks=pytest.mark.xfail(
-                reason="Duplicate index handling hasn't been implemented, yet."
-            ),
         ),
     ],
 )

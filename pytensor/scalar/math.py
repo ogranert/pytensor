@@ -5,8 +5,9 @@ As SciPy is not always available, we treat them separately.
 """
 
 import os
-import warnings
+from functools import reduce
 from textwrap import dedent
+from typing import Tuple
 
 import numpy as np
 import scipy.special
@@ -14,19 +15,27 @@ import scipy.stats
 
 from pytensor.configdefaults import config
 from pytensor.gradient import grad_not_implemented
+from pytensor.scalar.basic import BinaryScalarOp, ScalarOp, UnaryScalarOp
+from pytensor.scalar.basic import abs as scalar_abs
 from pytensor.scalar.basic import (
-    BinaryScalarOp,
-    ScalarOp,
-    UnaryScalarOp,
+    as_scalar,
     complex_types,
+    constant,
     discrete_types,
+    eq,
     exp,
     expm1,
     float64,
     float_types,
+    floor,
+    identity,
+    integer_types,
     isinf,
     log,
     log1p,
+    reciprocal,
+    scalar_maximum,
+    sqrt,
     switch,
     true_div,
     upcast,
@@ -34,6 +43,7 @@ from pytensor.scalar.basic import (
     upgrade_to_float64,
     upgrade_to_float_no_complex,
 )
+from pytensor.scalar.loop import ScalarLoop
 
 
 class Erf(UnaryScalarOp):
@@ -595,7 +605,7 @@ class GammaInc(BinaryScalarOp):
         (k, x) = inputs
         (gz,) = grads
         return [
-            gz * gammainc_der(k, x),
+            gz * gammainc_grad(k, x),
             gz * exp(-x + (k - 1) * log(x) - gammaln(k)),
         ]
 
@@ -644,7 +654,7 @@ class GammaIncC(BinaryScalarOp):
         (k, x) = inputs
         (gz,) = grads
         return [
-            gz * gammaincc_der(k, x),
+            gz * gammaincc_grad(k, x),
             gz * -exp(-x + (k - 1) * log(x) - gammaln(k)),
         ]
 
@@ -675,162 +685,214 @@ class GammaIncC(BinaryScalarOp):
 gammaincc = GammaIncC(upgrade_to_float, name="gammaincc")
 
 
-class GammaIncDer(BinaryScalarOp):
-    """
-    Gradient of the the regularized lower gamma function (P) wrt to the first
-    argument (k, a.k.a. alpha). Adapted from STAN `grad_reg_lower_inc_gamma.hpp`
+def _make_scalar_loop(n_steps, init, constant, inner_loop_fn, name, loop_op=ScalarLoop):
+    init = [as_scalar(x) if x is not None else None for x in init]
+    constant = [as_scalar(x) for x in constant]
+
+    # Create dummy types, in case some variables have the same initial form
+    init_ = [x.type() if x is not None else None for x in init]
+    constant_ = [x.type() for x in constant]
+    update_, until_ = inner_loop_fn(*init_, *constant_)
+
+    # Filter Nones
+    init = [i for i in init if i is not None]
+    init_ = [i for i in init_ if i is not None]
+    update_ = [u for u in update_ if u is not None]
+    op = loop_op(
+        init=init_,
+        constant=constant_,
+        update=update_,
+        until=until_,
+        name=name,
+    )
+    return op(n_steps, *init, *constant)
+
+
+def gammainc_grad(k, x):
+    """Gradient of the regularized lower gamma function (P) wrt to the first
+    argument (k, a.k.a. alpha).
+
+    Adapted from STAN `grad_reg_lower_inc_gamma.hpp`
 
     Reference: Gautschi, W. (1979). A computational procedure for incomplete gamma functions.
     ACM Transactions on Mathematical Software (TOMS), 5(4), 466-481.
     """
+    dtype = upcast(k.type.dtype, x.type.dtype, "float32")
 
-    def impl(self, k, x):
-        if x == 0:
-            return 0
+    def grad_approx(skip_loop):
+        precision = np.array(1e-10, dtype=config.floatX)
+        max_iters = switch(
+            skip_loop, np.array(0, dtype="int32"), np.array(1e5, dtype="int32")
+        )
 
-        sqrt_exp = -756 - x**2 + 60 * x
-        if (
-            (k < 0.8 and x > 15)
-            or (k < 12 and x > 30)
-            or (sqrt_exp > 0 and k < np.sqrt(sqrt_exp))
-        ):
-            return -GammaIncCDer.st_impl(k, x)
+        log_x = log(x)
+        log_gamma_k_plus_1 = gammaln(k + 1)
 
-        precision = 1e-10
-        max_iters = int(1e5)
-
-        log_x = np.log(x)
-        log_gamma_k_plus_1 = scipy.special.gammaln(k + 1)
-
-        k_plus_n = k
+        # First loop
+        k_plus_n = k  # Should not overflow unless k > 2,147,383,647
         log_gamma_k_plus_n_plus_1 = log_gamma_k_plus_1
-        sum_a = 0.0
-        for n in range(0, max_iters + 1):
-            term = np.exp(k_plus_n * log_x - log_gamma_k_plus_n_plus_1)
+        sum_a0 = np.array(0.0, dtype=dtype)
+
+        def inner_loop_a(sum_a, log_gamma_k_plus_n_plus_1, k_plus_n, log_x):
+            term = exp(k_plus_n * log_x - log_gamma_k_plus_n_plus_1)
             sum_a += term
 
-            if term <= precision:
-                break
-
-            log_gamma_k_plus_n_plus_1 += np.log1p(k_plus_n)
+            log_gamma_k_plus_n_plus_1 += log1p(k_plus_n)
             k_plus_n += 1
-
-        if n >= max_iters:
-            warnings.warn(
-                f"gammainc_der did not converge after {n} iterations",
-                RuntimeWarning,
+            return (
+                (sum_a, log_gamma_k_plus_n_plus_1, k_plus_n),
+                (term <= precision),
             )
-            return np.nan
 
-        k_plus_n = k
+        init = [sum_a0, log_gamma_k_plus_n_plus_1, k_plus_n]
+        constant = [log_x]
+        sum_a, *_, sum_a_converges = _make_scalar_loop(
+            max_iters, init, constant, inner_loop_a, name="gammainc_grad_a"
+        )
+        sum_a = switch(sum_a_converges, sum_a, np.nan)
+
+        # Second loop
+        n = np.array(0, dtype="int32")
         log_gamma_k_plus_n_plus_1 = log_gamma_k_plus_1
-        sum_b = 0.0
-        for n in range(0, max_iters + 1):
-            term = np.exp(
-                k_plus_n * log_x - log_gamma_k_plus_n_plus_1
-            ) * scipy.special.digamma(k_plus_n + 1)
+        k_plus_n = k
+        sum_b0 = np.array(0.0, dtype=dtype)
+
+        def inner_loop_b(sum_b, log_gamma_k_plus_n_plus_1, n, k_plus_n, log_x):
+            term = exp(k_plus_n * log_x - log_gamma_k_plus_n_plus_1) * psi(k_plus_n + 1)
             sum_b += term
 
-            if term <= precision and n >= 1:  # Require at least two iterations
-                return np.exp(-x) * (log_x * sum_a - sum_b)
-
-            log_gamma_k_plus_n_plus_1 += np.log1p(k_plus_n)
+            log_gamma_k_plus_n_plus_1 += log1p(k_plus_n)
+            n += 1
             k_plus_n += 1
-
-        warnings.warn(
-            f"gammainc_der did not converge after {n} iterations",
-            RuntimeWarning,
-        )
-        return np.nan
-
-    def c_code(self, *args, **kwargs):
-        raise NotImplementedError()
-
-
-gammainc_der = GammaIncDer(upgrade_to_float, name="gammainc_der")
-
-
-class GammaIncCDer(BinaryScalarOp):
-    """
-    Gradient of the the regularized upper gamma function (Q) wrt to the first
-    argument (k, a.k.a. alpha). Adapted from STAN `grad_reg_inc_gamma.hpp`
-    """
-
-    @staticmethod
-    def st_impl(k, x):
-        gamma_k = scipy.special.gamma(k)
-        digamma_k = scipy.special.digamma(k)
-        log_x = np.log(x)
-
-        # asymptotic expansion http://dlmf.nist.gov/8.11#E2
-        if (x >= k) and (x >= 8):
-            S = 0
-            k_minus_one_minus_n = k - 1
-            fac = k_minus_one_minus_n
-            dfac = 1
-            xpow = x
-            delta = dfac / xpow
-
-            for n in range(1, 10):
-                k_minus_one_minus_n -= 1
-                S += delta
-                xpow *= x
-                dfac = k_minus_one_minus_n * dfac + fac
-                fac *= k_minus_one_minus_n
-                delta = dfac / xpow
-                if np.isinf(delta):
-                    warnings.warn(
-                        "gammaincc_der did not converge",
-                        RuntimeWarning,
-                    )
-                    return np.nan
-
             return (
-                scipy.special.gammaincc(k, x) * (log_x - digamma_k)
-                + np.exp(-x + (k - 1) * log_x) * S / gamma_k
+                (sum_b, log_gamma_k_plus_n_plus_1, n, k_plus_n),
+                # Require at least two iterations
+                ((term <= precision) & (n > 1)),
             )
 
-        # gradient of series expansion http://dlmf.nist.gov/8.7#E3
-        else:
-            log_precision = np.log(1e-6)
-            max_iters = int(1e5)
-            S = 0
-            log_s = 0.0
-            s_sign = 1
-            log_delta = log_s - 2 * np.log(k)
-            for n in range(1, max_iters + 1):
-                S += np.exp(log_delta) if s_sign > 0 else -np.exp(log_delta)
-                s_sign = -s_sign
-                log_s += log_x - np.log(n)
-                log_delta = log_s - 2 * np.log(n + k)
+        init = [sum_b0, log_gamma_k_plus_n_plus_1, n, k_plus_n]
+        constant = [log_x]
+        sum_b, *_, sum_b_converges = _make_scalar_loop(
+            max_iters, init, constant, inner_loop_b, name="gammainc_grad_b"
+        )
+        sum_b = switch(sum_b_converges, sum_b, np.nan)
 
-                if np.isinf(log_delta):
-                    warnings.warn(
-                        "gammaincc_der did not converge",
-                        RuntimeWarning,
-                    )
-                    return np.nan
+        grad_approx = exp(-x) * (log_x * sum_a - sum_b)
+        return grad_approx
 
-                if log_delta <= log_precision:
-                    return (
-                        scipy.special.gammainc(k, x) * (digamma_k - log_x)
-                        + np.exp(k * log_x) * S / gamma_k
-                    )
+    zero_branch = eq(x, 0)
+    sqrt_exp = -756 - x**2 + 60 * x
+    gammaincc_branch = (
+        ((k < 0.8) & (x > 15))
+        | ((k < 12) & (x > 30))
+        | ((sqrt_exp > 0) & (k < sqrt(sqrt_exp)))
+    )
+    grad = switch(
+        zero_branch,
+        0,
+        switch(
+            gammaincc_branch,
+            -gammaincc_grad(k, x, skip_loops=zero_branch | (~gammaincc_branch)),
+            grad_approx(skip_loop=zero_branch | gammaincc_branch),
+        ),
+    )
+    return grad
 
-            warnings.warn(
-                f"gammaincc_der did not converge after {n} iterations",
-                RuntimeWarning,
+
+def gammaincc_grad(k, x, skip_loops=constant(False, dtype="bool")):
+    """Gradient of the regularized upper gamma function (Q) wrt to the first
+    argument (k, a.k.a. alpha).
+
+    Adapted from STAN `grad_reg_inc_gamma.hpp`
+
+    skip_loops is used for faster branching when this function is called by `gammainc_der`
+    """
+    dtype = upcast(k.type.dtype, x.type.dtype, "float32")
+
+    gamma_k = gamma(k)
+    digamma_k = psi(k)
+    log_x = log(x)
+
+    def approx_a(skip_loop):
+        n_steps = switch(
+            skip_loop, np.array(0, dtype="int32"), np.array(9, dtype="int32")
+        )
+        sum_a0 = np.array(0.0, dtype=dtype)
+        dfac = np.array(1.0, dtype=dtype)
+        xpow = x
+        k_minus_one_minus_n = k - 1
+        fac = k_minus_one_minus_n
+        delta = true_div(dfac, xpow)
+
+        def inner_loop_a(sum_a, delta, xpow, k_minus_one_minus_n, fac, dfac, x):
+            sum_a += delta
+            xpow *= x
+            k_minus_one_minus_n -= 1
+            dfac = k_minus_one_minus_n * dfac + fac
+            fac *= k_minus_one_minus_n
+            delta = dfac / xpow
+            return (sum_a, delta, xpow, k_minus_one_minus_n, fac, dfac), ()
+
+        init = [sum_a0, delta, xpow, k_minus_one_minus_n, fac, dfac]
+        constant = [x]
+        sum_a, *_ = _make_scalar_loop(
+            n_steps, init, constant, inner_loop_a, name="gammaincc_grad_a"
+        )
+        grad_approx_a = (
+            gammaincc(k, x) * (log_x - digamma_k)
+            + exp(-x + (k - 1) * log_x) * sum_a / gamma_k
+        )
+        return grad_approx_a
+
+    def approx_b(skip_loop):
+        max_iters = switch(
+            skip_loop, np.array(0, dtype="int32"), np.array(1e5, dtype="int32")
+        )
+        log_precision = np.array(np.log(1e-6), dtype=config.floatX)
+
+        sum_b0 = np.array(0.0, dtype=dtype)
+        log_s = np.array(0.0, dtype=dtype)
+        s_sign = np.array(1, dtype="int8")
+        n = np.array(1, dtype="int32")
+        log_delta = log_s - 2 * log(k).astype(dtype)
+
+        def inner_loop_b(sum_b, log_s, s_sign, log_delta, n, k, log_x):
+            delta = exp(log_delta)
+            sum_b += switch(s_sign > 0, delta, -delta)
+            s_sign = -s_sign
+
+            # log will cast >int16 to float64
+            log_s += log_x - log(n)
+            if log_s.type.dtype != dtype:
+                log_s = log_s.astype(dtype)
+
+            log_delta = log_s - 2 * log(n + k)
+            if log_delta.type.dtype != dtype:
+                log_delta = log_delta.astype(dtype)
+
+            n += 1
+            return (
+                (sum_b, log_s, s_sign, log_delta, n),
+                log_delta <= log_precision,
             )
-            return np.nan
 
-    def impl(self, k, x):
-        return self.st_impl(k, x)
+        init = [sum_b0, log_s, s_sign, log_delta, n]
+        constant = [k, log_x]
+        sum_b, *_, sum_b_converges = _make_scalar_loop(
+            max_iters, init, constant, inner_loop_b, name="gammaincc_grad_b"
+        )
+        sum_b = switch(sum_b_converges, sum_b, np.nan)
+        grad_approx_b = (
+            gammainc(k, x) * (digamma_k - log_x) + exp(k * log_x) * sum_b / gamma_k
+        )
+        return grad_approx_b
 
-    def c_code(self, *args, **kwargs):
-        raise NotImplementedError()
-
-
-gammaincc_der = GammaIncCDer(upgrade_to_float, name="gammaincc_der")
+    branch_a = (x >= k) & (x >= 8)
+    return switch(
+        branch_a,
+        approx_a(skip_loop=~branch_a | skip_loops),
+        approx_b(skip_loop=branch_a | skip_loops),
+    )
 
 
 class GammaU(BinaryScalarOp):
@@ -1277,8 +1339,8 @@ class BetaInc(ScalarOp):
         (gz,) = grads
 
         return [
-            gz * betainc_der(a, b, x, True),
-            gz * betainc_der(a, b, x, False),
+            gz * betainc_grad(a, b, x, True),
+            gz * betainc_grad(a, b, x, False),
             gz
             * exp(
                 log1p(-x) * (b - 1)
@@ -1294,27 +1356,27 @@ class BetaInc(ScalarOp):
 betainc = BetaInc(upgrade_to_float_no_complex, name="betainc")
 
 
-class BetaIncDer(ScalarOp):
+def betainc_grad(p, q, x, wrtp: bool):
+    """Gradient of the regularized lower gamma function (P) wrt to the first
+    argument (k, a.k.a. alpha).
+
+    Adapted from STAN `grad_reg_lower_inc_gamma.hpp`
+
+    Reference: Gautschi, W. (1979). A computational procedure for incomplete gamma functions.
+    ACM Transactions on Mathematical Software (TOMS), 5(4), 466-481.
     """
-    Gradient of the regularized incomplete beta function wrt to the first
-    argument (alpha) or the second argument (beta), depending on whether the
-    fourth argument to betainc_der is `True` or `False`, respectively.
 
-    Reference: Boik, R. J., & Robison-Cox, J. F. (1998). Derivatives of the incomplete beta function.
-    Journal of Statistical Software, 3(1), 1-20.
-    """
+    def _betainc_der(p, q, x, wrtp, skip_loop):
+        dtype = upcast(p.type.dtype, q.type.dtype, x.type.dtype, "float32")
 
-    nin = 4
+        def betaln(a, b):
+            return gammaln(a) + (gammaln(b) - gammaln(a + b))
 
-    def impl(self, p, q, x, wrtp):
         def _betainc_a_n(f, p, q, n):
             """
             Numerator (a_n) of the nth approximant of the continued fraction
             representation of the regularized incomplete beta function
             """
-
-            if n == 1:
-                return p * f * (q - 1) / (q * (p + 1))
 
             p2n = p + 2 * n
             F1 = p**2 * f**2 * (n - 1) / (q**2)
@@ -1325,7 +1387,11 @@ class BetaIncDer(ScalarOp):
                 / ((p2n - 3) * (p2n - 2) ** 2 * (p2n - 1))
             )
 
-            return F1 * F2
+            return switch(
+                eq(n, 1),
+                p * f * (q - 1) / (q * (p + 1)),
+                F1 * F2,
+            )
 
         def _betainc_b_n(f, p, q, n):
             """
@@ -1345,9 +1411,6 @@ class BetaIncDer(ScalarOp):
             Derivative of a_n wrt p
             """
 
-            if n == 1:
-                return -p * f * (q - 1) / (q * (p + 1) ** 2)
-
             pp = p**2
             ppp = pp * p
             p2n = p + 2 * n
@@ -1362,20 +1425,25 @@ class BetaIncDer(ScalarOp):
             D1 = q**2 * (p2n - 3) ** 2
             D2 = (p2n - 2) ** 3 * (p2n - 1) ** 2
 
-            return (N1 / D1) * (N2a + N2b + N2c + N2d + N2e) / D2
+            return switch(
+                eq(n, 1),
+                -p * f * (q - 1) / (q * (p + 1) ** 2),
+                (N1 / D1) * (N2a + N2b + N2c + N2d + N2e) / D2,
+            )
 
         def _betainc_da_n_dq(f, p, q, n):
             """
             Derivative of a_n wrt q
             """
-            if n == 1:
-                return p * f / (q * (p + 1))
-
             p2n = p + 2 * n
             F1 = (p**2 * f**2 / (q**2)) * (n - 1) * (p + n - 1) * (2 * q + p - 2)
             D1 = (p2n - 3) * (p2n - 2) ** 2 * (p2n - 1)
 
-            return F1 / D1
+            return switch(
+                eq(n, 1),
+                p * f / (q * (p + 1)),
+                F1 / D1,
+            )
 
         def _betainc_db_n_dp(f, p, q, n):
             """
@@ -1400,42 +1468,44 @@ class BetaIncDer(ScalarOp):
             p2n = p + 2 * n
             return -(p**2 * f) / (q * (p2n - 2) * p2n)
 
-        # Input validation
-        if not (0 <= x <= 1) or p < 0 or q < 0:
-            return np.nan
+        min_iters = np.array(3, dtype="int32")
+        max_iters = switch(
+            skip_loop, np.array(0, dtype="int32"), np.array(200, dtype="int32")
+        )
+        err_threshold = np.array(1e-12, dtype=config.floatX)
 
-        if x > (p / (p + q)):
-            return -self.impl(q, p, 1 - x, not wrtp)
-
-        min_iters = 3
-        max_iters = 200
-        err_threshold = 1e-12
-
-        derivative_old = 0
-
-        Am2, Am1 = 1, 1
-        Bm2, Bm1 = 0, 1
-        dAm2, dAm1 = 0, 0
-        dBm2, dBm1 = 0, 0
+        Am2, Am1 = np.array(1, dtype=dtype), np.array(1, dtype=dtype)
+        Bm2, Bm1 = np.array(0, dtype=dtype), np.array(1, dtype=dtype)
+        dAm2, dAm1 = np.array(0, dtype=dtype), np.array(0, dtype=dtype)
+        dBm2, dBm1 = np.array(0, dtype=dtype), np.array(0, dtype=dtype)
 
         f = (q * x) / (p * (1 - x))
-        K = np.exp(
-            p * np.log(x)
-            + (q - 1) * np.log1p(-x)
-            - np.log(p)
-            - scipy.special.betaln(p, q)
-        )
+        K = exp(p * log(x) + (q - 1) * log1p(-x) - log(p) - betaln(p, q))
         if wrtp:
-            dK = (
-                np.log(x)
-                - 1 / p
-                + scipy.special.digamma(p + q)
-                - scipy.special.digamma(p)
-            )
+            dK = log(x) - reciprocal(p) + psi(p + q) - psi(p)
         else:
-            dK = np.log1p(-x) + scipy.special.digamma(p + q) - scipy.special.digamma(q)
+            dK = log1p(-x) + psi(p + q) - psi(q)
 
-        for n in range(1, max_iters + 1):
+        derivative = np.array(0, dtype=dtype)
+        n = np.array(1, dtype="int16")  # Enough for 200 max iters
+
+        def inner_loop(
+            derivative,
+            Am2,
+            Am1,
+            Bm2,
+            Bm1,
+            dAm2,
+            dAm1,
+            dBm2,
+            dBm1,
+            n,
+            f,
+            p,
+            q,
+            K,
+            dK,
+        ):
             a_n_ = _betainc_a_n(f, p, q, n)
             b_n_ = _betainc_b_n(f, p, q, n)
             if wrtp:
@@ -1450,36 +1520,53 @@ class BetaIncDer(ScalarOp):
             dA = da_n * Am2 + a_n_ * dAm2 + db_n * Am1 + b_n_ * dAm1
             dB = da_n * Bm2 + a_n_ * dBm2 + db_n * Bm1 + b_n_ * dBm1
 
-            Am2, Am1 = Am1, A
-            Bm2, Bm1 = Bm1, B
-            dAm2, dAm1 = dAm1, dA
-            dBm2, dBm1 = dBm1, dB
-
-            if n < min_iters - 1:
-                continue
+            Am2, Am1 = identity(Am1), identity(A)
+            Bm2, Bm1 = identity(Bm1), identity(B)
+            dAm2, dAm1 = identity(dAm1), identity(dA)
+            dBm2, dBm1 = identity(dBm1), identity(dB)
 
             F1 = A / B
             F2 = (dA - F1 * dB) / B
-            derivative = K * (F1 * dK + F2)
+            derivative_new = K * (F1 * dK + F2)
 
-            errapx = abs(derivative_old - derivative)
-            d_errapx = errapx / max(err_threshold, abs(derivative))
-            derivative_old = derivative
+            errapx = scalar_abs(derivative - derivative_new)
+            d_errapx = errapx / scalar_maximum(
+                err_threshold, scalar_abs(derivative_new)
+            )
 
-            if d_errapx <= err_threshold:
-                return derivative
+            min_iters_cond = n > (min_iters - 1)
+            derivative = switch(
+                min_iters_cond,
+                derivative_new,
+                derivative,
+            )
+            n += 1
 
-        warnings.warn(
-            f"betainc_der did not converge after {n} iterations",
-            RuntimeWarning,
+            return (
+                (derivative, Am2, Am1, Bm2, Bm1, dAm2, dAm1, dBm2, dBm1, n),
+                (d_errapx <= err_threshold) & min_iters_cond,
+            )
+
+        init = [derivative, Am2, Am1, Bm2, Bm1, dAm2, dAm1, dBm2, dBm1, n]
+        constant = [f, p, q, K, dK]
+        grad, *_, grad_converges = _make_scalar_loop(
+            max_iters, init, constant, inner_loop, name="betainc_grad"
         )
-        return np.nan
+        return switch(grad_converges, grad, np.nan)
 
-    def c_code(self, *args, **kwargs):
-        raise NotImplementedError()
-
-
-betainc_der = BetaIncDer(upgrade_to_float_no_complex, name="betainc_der")
+    # Input validation
+    nan_branch = (x < 0) | (x > 1) | (p < 0) | (q < 0)
+    flip_branch = x > (p / (p + q))
+    grad = switch(
+        nan_branch,
+        np.nan,
+        switch(
+            flip_branch,
+            -_betainc_der(q, p, 1 - x, not wrtp, skip_loop=nan_branch | (~flip_branch)),
+            _betainc_der(p, q, x, wrtp, skip_loop=nan_branch | flip_branch),
+        ),
+    )
+    return grad
 
 
 class Hyp2F1(ScalarOp):
@@ -1501,10 +1588,11 @@ class Hyp2F1(ScalarOp):
     def grad(self, inputs, grads):
         a, b, c, z = inputs
         (gz,) = grads
+        grad_a, grad_b, grad_c = hyp2f1_grad(a, b, c, z, wrt=[0, 1, 2])
         return [
-            gz * hyp2f1_der(a, b, c, z, wrt=0),
-            gz * hyp2f1_der(a, b, c, z, wrt=1),
-            gz * hyp2f1_der(a, b, c, z, wrt=2),
+            gz * grad_a,
+            gz * grad_b,
+            gz * grad_c,
             gz * ((a * b) / c) * hyp2f1(a + 1, b + 1, c + 1, z),
         ]
 
@@ -1515,134 +1603,210 @@ class Hyp2F1(ScalarOp):
 hyp2f1 = Hyp2F1(upgrade_to_float, name="hyp2f1")
 
 
-class Hyp2F1Der(ScalarOp):
+def _unsafe_sign(x):
+    # Unlike scalar.sign we don't worry about x being 0 or nan
+    return switch(x > 0, 1, -1)
+
+
+class Grad2F1Loop(ScalarLoop):
+    """Subclass of ScalarLoop for easier targetting in rewrites"""
+
+
+def _grad_2f1_loop(a, b, c, z, *, skip_loop, wrt, dtype):
     """
-    Derivatives of the Gaussian Hypergeometric function ``2F1(a, b; c; z)`` with respect to one of the first 3 inputs.
+    Notes
+    -----
+    The algorithm can be derived by looking at the ratio of two successive terms in the series
+    β_{k+1}/β_{k} = A(k)/B(k)
+    β_{k+1} = A(k)/B(k) * β_{k}
+    d[β_{k+1}] = d[A(k)/B(k)] * β_{k} + A(k)/B(k) * d[β_{k}] via the product rule
 
-    Adapted from https://github.com/stan-dev/math/blob/develop/stan/math/prim/fun/grad_2F1.hpp
+    In the 2F1, A(k)/B(k) corresponds to (((a + k) * (b + k) / ((c + k) (1 + k))) * z
+
+    The partial d[A(k)/B(k)] with respect to the 3 first inputs can be obtained from the ratio A(k)/B(k),
+    by dropping the respective term
+    d/da[A(k)/B(k)] = A(k)/B(k) / (a + k)
+    d/db[A(k)/B(k)] = A(k)/B(k) / (b + k)
+    d/dc[A(k)/B(k)] = A(k)/B(k) * (c + k)
+
+    The algorithm is implemented in the log scale, which adds the complexity of working with absolute terms and
+    tracking their signs.
     """
 
-    nin = 5
+    min_steps = np.array(
+        10, dtype="int32"
+    )  # https://github.com/stan-dev/math/issues/2857
+    max_steps = switch(
+        skip_loop, np.array(0, dtype="int32"), np.array(int(1e6), dtype="int32")
+    )
+    precision = np.array(1e-14, dtype=config.floatX)
 
-    def impl(self, a, b, c, z, wrt):
-        def check_2f1_converges(a, b, c, z) -> bool:
-            num_terms = 0
-            is_polynomial = False
+    grads = [np.array(0, dtype=dtype) if i in wrt else None for i in range(3)]
+    log_gs = [np.array(-np.inf, dtype=dtype) if i in wrt else None for i in range(3)]
+    log_gs_signs = [np.array(1, dtype="int8") if i in wrt else None for i in range(3)]
 
-            def is_nonpositive_integer(x):
-                return x <= 0 and x.is_integer()
+    log_t = np.array(0.0, dtype=dtype)
+    log_t_sign = np.array(1, dtype="int8")
 
-            if is_nonpositive_integer(a) and abs(a) >= num_terms:
-                is_polynomial = True
-                num_terms = int(np.floor(abs(a)))
-            if is_nonpositive_integer(b) and abs(b) >= num_terms:
-                is_polynomial = True
-                num_terms = int(np.floor(abs(b)))
+    log_z = log(scalar_abs(z))
+    sign_z = _unsafe_sign(z)
 
-            is_undefined = is_nonpositive_integer(c) and abs(c) <= num_terms
+    sign_zk = sign_z
+    k = np.array(0, dtype="int32")
 
-            return not is_undefined and (
-                is_polynomial or np.abs(z) < 1 or (np.abs(z) == 1 and c > (a + b))
-            )
+    def inner_loop(*args):
+        (
+            *grads_vars,
+            log_t,
+            log_t_sign,
+            sign_zk,
+            k,
+            a,
+            b,
+            c,
+            log_z,
+            sign_z,
+        ) = args
 
-        def compute_grad_2f1(a, b, c, z, wrt):
-            """
-            Notes
-            -----
-            The algorithm can be derived by looking at the ratio of two successive terms in the series
-            β_{k+1}/β_{k} = A(k)/B(k)
-            β_{k+1} = A(k)/B(k) * β_{k}
-            d[β_{k+1}] = d[A(k)/B(k)] * β_{k} + A(k)/B(k) * d[β_{k}] via the product rule
+        (
+            grad_a,
+            grad_b,
+            grad_c,
+            log_g_a,
+            log_g_b,
+            log_g_c,
+            log_g_sign_a,
+            log_g_sign_b,
+            log_g_sign_c,
+        ) = grads_vars
 
-            In the 2F1, A(k)/B(k) corresponds to (((a + k) * (b + k) / ((c + k) (1 + k))) * z
+        p = (a + k) * (b + k) / ((c + k) * (k + 1))
+        if p.type.dtype != dtype:
+            p = p.astype(dtype)
 
-            The partial d[A(k)/B(k)] with respect to the 3 first inputs can be obtained from the ratio A(k)/B(k),
-            by dropping the respective term
-            d/da[A(k)/B(k)] = A(k)/B(k) / (a + k)
-            d/db[A(k)/B(k)] = A(k)/B(k) / (b + k)
-            d/dc[A(k)/B(k)] = A(k)/B(k) * (c + k)
+        # If p==0, don't update grad and get out of while loop next
+        p_zero = eq(p, 0)
 
-            The algorithm is implemented in the log scale, which adds the complexity of working with absolute terms and
-            tracking their signs.
-            """
+        if 0 in wrt:
+            term_a = log_g_sign_a * log_t_sign * exp(log_g_a - log_t)
+            term_a += reciprocal(a + k)
+            if term_a.type.dtype != dtype:
+                term_a = term_a.astype(dtype)
+        if 1 in wrt:
+            term_b = log_g_sign_b * log_t_sign * exp(log_g_b - log_t)
+            term_b += reciprocal(b + k)
+            if term_b.type.dtype != dtype:
+                term_b = term_b.astype(dtype)
+        if 2 in wrt:
+            term_c = log_g_sign_c * log_t_sign * exp(log_g_c - log_t)
+            term_c -= reciprocal(c + k)
+            if term_c.type.dtype != dtype:
+                term_c = term_c.astype(dtype)
 
-            wrt_a = wrt_b = False
-            if wrt == 0:
-                wrt_a = True
-            elif wrt == 1:
-                wrt_b = True
-            elif wrt != 2:
-                raise ValueError(f"wrt must be 0, 1, or 2, got {wrt}")
+        log_t = log_t + log(scalar_abs(p)) + log_z
+        log_t_sign = (_unsafe_sign(p) * log_t_sign).astype("int8")
 
-            min_steps = 10  # https://github.com/stan-dev/math/issues/2857
-            max_steps = int(1e6)
-            precision = 1e-14
+        grads = [None] * 3
+        log_gs = [None] * 3
+        log_gs_signs = [None] * 3
+        grad_incs = [None] * 3
 
-            res = 0
+        if 0 in wrt:
+            log_g_a = log_t + log(scalar_abs(term_a))
+            log_g_sign_a = (_unsafe_sign(term_a) * log_t_sign).astype("int8")
+            grad_inc_a = log_g_sign_a * exp(log_g_a) * sign_zk
+            grads[0] = switch(p_zero, grad_a, grad_a + grad_inc_a)
+            log_gs[0] = log_g_a
+            log_gs_signs[0] = log_g_sign_a
+            grad_incs[0] = grad_inc_a
+        if 1 in wrt:
+            log_g_b = log_t + log(scalar_abs(term_b))
+            log_g_sign_b = (_unsafe_sign(term_b) * log_t_sign).astype("int8")
+            grad_inc_b = log_g_sign_b * exp(log_g_b) * sign_zk
+            grads[1] = switch(p_zero, grad_b, grad_b + grad_inc_b)
+            log_gs[1] = log_g_b
+            log_gs_signs[1] = log_g_sign_b
+            grad_incs[1] = grad_inc_b
+        if 2 in wrt:
+            log_g_c = log_t + log(scalar_abs(term_c))
+            log_g_sign_c = (_unsafe_sign(term_c) * log_t_sign).astype("int8")
+            grad_inc_c = log_g_sign_c * exp(log_g_c) * sign_zk
+            grads[2] = switch(p_zero, grad_c, grad_c + grad_inc_c)
+            log_gs[2] = log_g_c
+            log_gs_signs[2] = log_g_sign_c
+            grad_incs[2] = grad_inc_c
 
-            if z == 0:
-                return res
+        sign_zk *= sign_z
+        k += 1
 
-            log_g_old = -np.inf
-            log_t_old = 0.0
-            log_t_new = 0.0
-            sign_z = np.sign(z)
-            log_z = np.log(np.abs(z))
+        abs_grad_incs = [
+            scalar_abs(grad_inc) for grad_inc in grad_incs if grad_inc is not None
+        ]
+        if len(grad_incs) == 1:
+            [max_abs_grad_inc] = grad_incs
+        else:
+            max_abs_grad_inc = reduce(scalar_maximum, abs_grad_incs)
 
-            log_g_old_sign = 1
-            log_t_old_sign = 1
-            log_t_new_sign = 1
-            sign_zk = sign_z
+        return (
+            (*grads, *log_gs, *log_gs_signs, log_t, log_t_sign, sign_zk, k),
+            (eq(p, 0) | ((k > min_steps) & (max_abs_grad_inc <= precision))),
+        )
 
-            for k in range(max_steps):
-                p = (a + k) * (b + k) / ((c + k) * (k + 1))
-                if p == 0:
-                    return res
-                log_t_new += np.log(np.abs(p)) + log_z
-                log_t_new_sign = np.sign(p) * log_t_new_sign
-
-                term = log_g_old_sign * log_t_old_sign * np.exp(log_g_old - log_t_old)
-                if wrt_a:
-                    term += np.reciprocal(a + k)
-                elif wrt_b:
-                    term += np.reciprocal(b + k)
-                else:
-                    term -= np.reciprocal(c + k)
-
-                log_g_old = log_t_new + np.log(np.abs(term))
-                log_g_old_sign = np.sign(term) * log_t_new_sign
-                g_current = log_g_old_sign * np.exp(log_g_old) * sign_zk
-                res += g_current
-
-                log_t_old = log_t_new
-                log_t_old_sign = log_t_new_sign
-                sign_zk *= sign_z
-
-                if k >= min_steps and np.abs(g_current) <= precision:
-                    return res
-
-            warnings.warn(
-                f"hyp2f1_der did not converge after {k} iterations",
-                RuntimeWarning,
-            )
-            return np.nan
-
-        # TODO: We could implement the Euler transform to expand supported domain, as Stan does
-        if not check_2f1_converges(a, b, c, z):
-            warnings.warn(
-                f"Hyp2F1 does not meet convergence conditions with given arguments a={a}, b={b}, c={c}, z={z}",
-                RuntimeWarning,
-            )
-            return np.nan
-
-        return compute_grad_2f1(a, b, c, z, wrt=wrt)
-
-    def __call__(self, a, b, c, z, wrt, **kwargs):
-        # This allows wrt to be a keyword argument
-        return super().__call__(a, b, c, z, wrt, **kwargs)
-
-    def c_code(self, *args, **kwargs):
-        raise NotImplementedError()
+    init = [*grads, *log_gs, *log_gs_signs, log_t, log_t_sign, sign_zk, k]
+    constant = [a, b, c, log_z, sign_z]
+    *loop_outs, converges = _make_scalar_loop(
+        max_steps, init, constant, inner_loop, name="hyp2f1_grad", loop_op=Grad2F1Loop
+    )
+    return *loop_outs[: len(wrt)], converges
 
 
-hyp2f1_der = Hyp2F1Der(upgrade_to_float, name="hyp2f1_der")
+def hyp2f1_grad(a, b, c, z, wrt: Tuple[int, ...]):
+    dtype = upcast(a.type.dtype, b.type.dtype, c.type.dtype, z.type.dtype, "float32")
+
+    def check_2f1_converges(a, b, c, z):
+        def is_nonpositive_integer(x):
+            if x.type.dtype not in integer_types:
+                return eq(floor(x), x) & (x <= 0)
+            else:
+                return x <= 0
+
+        a_is_polynomial = is_nonpositive_integer(a) & (scalar_abs(a) >= 0)
+        num_terms = switch(
+            a_is_polynomial,
+            floor(scalar_abs(a)).astype("int64"),
+            0,
+        )
+
+        b_is_polynomial = is_nonpositive_integer(b) & (scalar_abs(b) >= num_terms)
+        num_terms = switch(
+            b_is_polynomial,
+            floor(scalar_abs(b)).astype("int64"),
+            num_terms,
+        )
+
+        is_undefined = is_nonpositive_integer(c) & (scalar_abs(c) <= num_terms)
+        is_polynomial = a_is_polynomial | b_is_polynomial
+
+        return (~is_undefined) & (
+            is_polynomial | (scalar_abs(z) < 1) | (eq(scalar_abs(z), 1) & (c > (a + b)))
+        )
+
+    # We have to pass the converges flag to interrupt the loop, as the switch is not lazy
+    z_is_zero = eq(z, 0)
+    converges = check_2f1_converges(a, b, c, z)
+    *grads, grad_converges = _grad_2f1_loop(
+        a, b, c, z, skip_loop=z_is_zero | (~converges), wrt=wrt, dtype=dtype
+    )
+
+    return [
+        switch(
+            z_is_zero,
+            0,
+            switch(
+                converges,
+                grad,
+                np.nan,
+            ),
+        )
+        for grad in grads
+    ]

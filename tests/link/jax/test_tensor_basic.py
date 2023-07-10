@@ -1,6 +1,9 @@
-import jax.errors
 import numpy as np
 import pytest
+
+
+jax = pytest.importorskip("jax")
+import jax.errors
 
 import pytensor
 import pytensor.tensor.basic as at
@@ -15,7 +18,7 @@ def test_jax_Alloc():
     x = at.alloc(0.0, 2, 3)
     x_fg = FunctionGraph([], [x])
 
-    (jax_res,) = compare_jax_and_py(x_fg, [])
+    _, [jax_res] = compare_jax_and_py(x_fg, [])
 
     assert jax_res.shape == (2, 3)
 
@@ -173,7 +176,7 @@ class TestJaxSplit:
             UserWarning, match="Split node does not have constant split positions."
         ):
             fn = pytensor.function([a], a_splits, mode="JAX")
-        # It raises an informative ConcretizationTypeError, but there's an AttributeError that surpsasses it
+        # It raises an informative ConcretizationTypeError, but there's an AttributeError that surpasses it
         with pytest.raises(AttributeError):
             fn(np.zeros((6, 4), dtype=pytensor.config.floatX))
 
@@ -181,7 +184,9 @@ class TestJaxSplit:
         a_splits = at.split(a, splits_size=[2, 4], n_splits=2, axis=split_axis)
         with pytest.warns(UserWarning, match="Split node does not have constant axis."):
             fn = pytensor.function([a, split_axis], a_splits, mode="JAX")
-        with pytest.raises(jax.errors.TracerIntegerConversionError):
+        # Same as above, an AttributeError surpasses the `TracerIntegerConversionError`
+        # Both errors are included for backwards compatibility
+        with pytest.raises((AttributeError, jax.errors.TracerIntegerConversionError)):
             fn(np.zeros((6, 6), dtype=pytensor.config.floatX), 0)
 
 
@@ -191,3 +196,30 @@ def test_jax_eye():
     out_fg = FunctionGraph([], [out])
 
     compare_jax_and_py(out_fg, [])
+
+
+def test_tri():
+    out = at.tri(10, 10, 0)
+    fgraph = FunctionGraph([], [out])
+    compare_jax_and_py(fgraph, [])
+
+
+def test_tri_nonconcrete():
+    """JAX cannot JIT-compile `jax.numpy.tri` when arguments are not concrete values."""
+
+    m, n, k = (
+        scalar("a", dtype="int64"),
+        scalar("n", dtype="int64"),
+        scalar("k", dtype="int64"),
+    )
+    m.tag.test_value = 10
+    n.tag.test_value = 10
+    k.tag.test_value = 0
+
+    out = at.tri(m, n, k)
+
+    # The actual error the user will see should be jax.errors.ConcretizationTypeError, but
+    # the error handler raises an Attribute error first, so that's what this test needs to pass
+    with pytest.raises(AttributeError):
+        fgraph = FunctionGraph([m, n, k], [out])
+        compare_jax_and_py(fgraph, [get_test_value(i) for i in fgraph.inputs])

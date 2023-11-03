@@ -132,6 +132,7 @@ from pytensor.tensor.shape import (  # noqa
     shape_padaxis,
     shape_padleft,
     shape_padright,
+    specify_broadcastable,
     specify_shape,
 )
 
@@ -145,7 +146,10 @@ from pytensor.tensor.sort import argsort, argtopk, sort, topk, topk_and_argtopk 
 from pytensor.tensor.subtensor import *  # noqa
 from pytensor.tensor.type import *  # noqa
 from pytensor.tensor.type_other import *  # noqa
-from pytensor.tensor.var import TensorConstant, TensorVariable  # noqa
+from pytensor.tensor.variable import TensorConstant, TensorVariable  # noqa
+
+# Allow accessing numpy constants from pytensor.tensor
+from numpy import e, euler_gamma, inf, infty, nan, newaxis, pi  # noqa
 
 
 __all__ = ["random"]  # noqa: F405

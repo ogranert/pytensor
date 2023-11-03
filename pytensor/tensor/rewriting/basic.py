@@ -1,13 +1,36 @@
-""" Tensor optimizations addressing the ops in basic.py."""
+""" Tensor optimizations addressing the ops in basic.py.
+
+Notes
+-----
+There are two ways of broadcasting arrays:
+second(x, y) == alloc(y, broadcast_shapes(x.shape, y.shape))
+
+The second can be more efficient because x doesn't usually need to be computed when we only want its shape.
+It may also allow other rewrites that don't try to modify x when it has multiple clients (for fear of duplicating computation).
+
+However, the first one is easier to reason about.
+Knowing we have such a graph allows to do certain rewrites such as "sinking" broadcasting operations below Elemwise.
+The same rewrites with alloc would be more complicated as we would need to symbolically combine the shapes of each one.
+
+As an example contrast rewriting the following two equivalent graphs
+
+alloc(x, broadcast_shapes(x.shape, y.shape)) + alloc(y, broadcast_shapes(x.shape, y.shape)) -> x + y
+second(y, x) + second(x, y) -> x + y
+
+Theano developers (mostly) preferred to use the first form during canonicalization and introduce the second form later,
+via rewrites like `local_fill_to_alloc`, and using the `alloc_like` helper inside rewrites.
+Many stabilize and stabilization rewrites refuse to be applied when a variable has multiple clients, so this is important.
+"""
 
 import logging
-from typing import TYPE_CHECKING, Optional, Union
+from typing import Union
 
 import numpy as np
 
 import pytensor.scalar.basic as aes
 from pytensor import compile
 from pytensor.compile.ops import ViewOp
+from pytensor.graph import FunctionGraph
 from pytensor.graph.basic import Constant, Variable
 from pytensor.graph.rewriting.basic import (
     NodeRewriter,
@@ -42,58 +65,54 @@ from pytensor.tensor.basic import (
 )
 from pytensor.tensor.elemwise import DimShuffle, Elemwise
 from pytensor.tensor.exceptions import NotScalarConstantError
-from pytensor.tensor.extra_ops import broadcast_shape, broadcast_to
+from pytensor.tensor.extra_ops import broadcast_arrays
+from pytensor.tensor.math import Sum, add
 from pytensor.tensor.math import all as at_all
 from pytensor.tensor.math import eq
-from pytensor.tensor.shape import Shape_i
+from pytensor.tensor.shape import Shape_i, shape_padleft
 from pytensor.tensor.sort import TopKOp
 from pytensor.tensor.type import DenseTensorType, TensorType
-from pytensor.tensor.var import TensorConstant
+from pytensor.tensor.variable import TensorConstant, TensorVariable
 from pytensor.utils import NoDuplicateOptWarningFilter
-
-
-if TYPE_CHECKING:
-    from pytensor.tensor.rewriting.shape import ShapeFeature
 
 
 _logger = logging.getLogger("pytensor.tensor.rewriting.basic")
 _logger.addFilter(NoDuplicateOptWarningFilter())
 
 
-def encompasses_broadcastable(b1, b2):
-    """
+def broadcasted_by(x: TensorVariable, y: TensorVariable) -> bool:
+    """Check whether x would be broadcasted by y in an Elemwise operation
 
     Parameters
     ----------
-    b1
-        The broadcastable attribute of a tensor type.
-    b2
-        The broadcastable attribute of a tensor type.
+    x: TensorVariable
+        The variable that may be broadcasted by y
+    y: TensorVariable
+        The variable that may broadcast x
 
     Returns
     -------
-    bool
-        True if the broadcastable patterns b1 and b2 are such that b2 is
-        broadcasted to b1's shape and not the opposite.
-
+    broadcasted_by: bool
     """
-    if len(b1) < len(b2):
-        return False
-    b1 = b1[-len(b2) :]
-    return not any(v1 and not v2 for v1, v2 in zip(b1, b2))
+    bx = x.type.broadcastable
+    by = y.type.broadcastable
+    if len(bx) < len(by):
+        return True
+    bx = bx[-len(by) :]
+    return any(bx_dim and not by_dim for bx_dim, by_dim in zip(bx, by))
 
 
 def merge_broadcastables(broadcastables):
     return [all(bcast) for bcast in zip(*broadcastables)]
 
 
-def broadcast_like(value, template, fgraph, dtype=None):
-    """
-    Return a Variable with the same shape and dtype as the template,
-    filled by broadcasting value through it. `value` will be cast as
-    necessary.
-
-    """
+def alloc_like(
+    value: TensorVariable,
+    template: TensorVariable,
+    fgraph: FunctionGraph,
+    dtype=None,
+) -> TensorVariable:
+    """Fill value to the same shape and dtype as the template via alloc."""
     value = as_tensor_variable(value)
     if value.type.is_super(template.type):
         return value
@@ -233,36 +252,21 @@ def local_scalar_tensor_scalar(fgraph, node):
             return [s]
 
 
-@register_specialize("local_alloc_elemwise")
+@register_specialize("shape_unsafe")
 @node_rewriter([Elemwise])
 def local_elemwise_alloc(fgraph, node):
     r"""Remove unnecessary `Alloc`\s that occur as inputs of `Elemwise` `Op`\s.
 
-    `Alloc`\s are effectively a type of `Elemwise` operation
-    (e.g. ``Elemwise{second}(y, x)`` is the same as ``Alloc(x, *y.shape)``), so
-    this rewrite uses that fact to reduce `Elemwise`\s on `Alloc`\s to
-    `Elemwise`\s of the `Alloc`\s first/value input (i.e. the value it
-    broadcasts).
-
-    In other words, this rewrite causes `Elemwise` `Op`\s to "absorb" redundant
-    `Alloc`\s.
-
     The rewrite essentially performs the following replacement:
-    ``Elemwise{op}(..., Alloc(x, s), ..., y, ...) -> Elemwise{op}(..., x, ..., y, ...)``,
-    when ``y.shape`` for some input ``y`` (or the combined shapes of the
-    non-`Alloc`\s) is sufficient to maintain the same/correct output shape.
+    ``Elemwise{op}(..., Alloc(x, s), ..., y, ...) -> Elemwise{op}(..., x, ..., y, ...)``
 
-    In it's current form, it also explicitly accounts for `DimShuffle`\s of
+    In its current form, it also explicitly accounts for `DimShuffle`\s of
     `Alloc`\s.  This is largely due to `local_alloc_sink_dimshuffle`, which
     introduces them as a canonicalization of `Alloc`'s with leading
     broadcastable dimensions.
     """
-    # Rewrite is only applicable when there are at least two inputs
     if len(node.inputs) == 1:
-        return False
-
-    if len(node.outputs) > 1:
-        return False
+        return None
 
     def dimshuffled_alloc(i):
         return (
@@ -282,79 +286,43 @@ def local_elemwise_alloc(fgraph, node):
     if len(alloc_idxs) == 0:
         return False
 
-    # Search for a non `Alloc` or `DimShuffle` of `Alloc` input that we can use as a
-    # baseline for the dimensions.
-    ref_var_idx = None
-    for idx, i in enumerate(node.inputs):
-        if i.type.broadcastable == node.outputs[0].type.broadcastable:
-            # Prefer an input that is not an `Alloc` nor a `DimShuffle` of an
-            # `Alloc`, so that all `Alloc`s can be rewritten.
-            if idx not in alloc_idxs:
-                ref_var_idx = idx
-                break
-
-    # If only `Alloc` and `DimShuffle` of `Alloc` exist, we pick the first suitable one
-    if ref_var_idx is None:
-        for idx, i in enumerate(node.inputs):
-            # XXX: This broadcastable comparison doesn't work
-            if (
-                i.type.broadcastable == node.outputs[0].type.broadcastable
-            ) and idx in alloc_idxs:
-                ref_var_idx = idx
-                break
-
-    if not hasattr(fgraph, "shape_feature"):
-        return False
-
-    input_shapes = [
-        tuple(fgraph.shape_feature.get_shape(i, j) for j in range(i.type.ndim))
-        for i in node.inputs
-    ]
-    bcasted_shape = broadcast_shape(
-        *input_shapes,
-        arrays_are_shapes=True,
-    )
-
     new_inputs = list(node.inputs)
     for idx in alloc_idxs:
         i = node.inputs[idx]
 
-        # Remove `Alloc`
+        # Remove simple `Alloc`
         if isinstance(i.owner.op, Alloc):
-            new_alloc = broadcast_to(i.owner.inputs[0], bcasted_shape)
+            new_inp = i.owner.inputs[0]
 
-        # TODO FIXME: This shouldn't be handled here.
-        # `DimShuffle`s should be lifted through `Alloc`s
-        # by other, more general rewrites.
-        # Remove `Alloc` in `DimShuffle`
+        # Remove `Dimshuffle(Alloc)`
         elif isinstance(i.owner.op, DimShuffle):
             old_alloc = i.owner.inputs[0]
-            new_alloc = old_alloc.owner.inputs[0]
+            old_alloc_inp = old_alloc.owner.inputs[0]
+            missing_ndims = old_alloc.type.ndim - old_alloc_inp.type.ndim
+            if missing_ndims > 0:
+                # The `Alloc` added new dimensions to the left.
+                # We replace those cases with a `DimShuffle` here.
+                # Nested dimshuffles will be merged later by other rewrites.
+                old_alloc_inp = shape_padleft(old_alloc_inp, missing_ndims)
             # We need to keep the old `DimShuffle`. It could swap axes or
             # add dimensions anywhere.
-            if new_alloc.ndim != old_alloc.ndim:
-                # The `Alloc` can add dimensions to the value.
-                # We replace those cases with a `DimShuffle` here.
-                nb_dim_to_add = old_alloc.ndim - new_alloc.ndim
-                new_alloc = new_alloc.dimshuffle(
-                    ["x"] * nb_dim_to_add + list(range(new_alloc.ndim))
-                )
-            new_alloc = broadcast_to(i.owner.op(new_alloc), bcasted_shape)
+            new_inp = i.owner.op(old_alloc_inp)
 
-        copy_stack_trace(i, new_alloc)
-        new_inputs[idx] = new_alloc
+        copy_stack_trace(i, new_inp)
+        new_inputs[idx] = new_inp
 
-    # If this assert is triggered, it means we are recreating an equivalent graph
-    # which would result in cyclical merge rewrites.
-    if all(new is old for new, old in zip(new_inputs, node.inputs)):
-        return
+    new_outs = node.op(*new_inputs, return_list=True)
 
-    ret = node.op(*new_inputs, return_list=True)
-    copy_stack_trace(node.outputs, ret)
-    return ret
+    if new_outs[0].type.broadcastable != node.outputs[0].type.broadcastable:
+        new_outs = [
+            alloc_like(new_out, node.outputs[0], fgraph) for new_out in new_outs
+        ]
+
+    copy_stack_trace(node.outputs, new_outs)
+    return new_outs
 
 
-@register_canonicalize
+@register_canonicalize("shape_unsafe")
 @node_rewriter([Elemwise])
 def local_fill_sink(fgraph, node):
     """
@@ -383,6 +351,7 @@ def local_fill_sink(fgraph, node):
 
     # The newly created node c doesn't has 'clients',
     # so this iteration is took place with node.outputs[0]
+    # TODO: This should just be a WalkingGraphRewrite!
     replacements = {node.outputs[0]: c}
     for client, cl_idx in fgraph.clients[node.outputs[0]]:
         if (
@@ -405,8 +374,8 @@ def local_fill_sink(fgraph, node):
     return replacements
 
 
-@register_specialize
-@register_stabilize
+@register_specialize("shape_unsafe")
+@register_stabilize("shape_unsafe")
 @node_rewriter([fill])
 def local_fill_to_alloc(fgraph, node):
     r"""Remove `fill`\s or replace them with `Alloc`\s.
@@ -415,9 +384,8 @@ def local_fill_to_alloc(fgraph, node):
     with their dependencies on those tensors' shapes, and sometimes those
     shapes can be computed without needing to compute the tensors themselves.
 
-    XXX: This rewrite can produce inconsistent results, so do *not* consider
-    making it a canonicalization until those inconsistencies are
-    resolved/justified.
+    Like `local_fill_sink` this rewrites assumes non-broadcastable shapes are equivalent,
+    which could mask shape errors.
     """
     shape_ref, values_ref = node.inputs
     out_type = node.outputs[0].type
@@ -425,22 +393,18 @@ def local_fill_to_alloc(fgraph, node):
     if values_ref.type.broadcastable == out_type.broadcastable:
         # The assumption here is that `values_ref` already has the same shape
         # as `shape_ref`, so a `fill`/`Alloc` is unnecessary.
-
-        # XXX FIXME TODO: The only way this can be determined is if one
-        # absolutely knows that the shapes of `shape_ref` and `values_ref` are
-        # equal.
-        # This is an old rewrite, and it's only a
-        # "specialization/stabilization", so we're going to leave it be for
-        # now.
         return [values_ref]
 
     if shape_ref.type.broadcastable == out_type.broadcastable:
         # In this case, we assume that some broadcasting is needed (otherwise
         # the condition above would've been true), so we replace the `fill`
         # with an `Alloc`.
-        o = broadcast_like(values_ref, shape_ref, fgraph, dtype=values_ref.dtype)
+        o = alloc_like(values_ref, shape_ref, fgraph, dtype=values_ref.dtype)
         copy_stack_trace(node.outputs[0], o)
         return [o]
+
+    # The case that is not covered is when `shape_ref` is broadcasted by `values_ref`
+    # TODO: Return broadcast_to(values_ref, broadcast_shapes(values_ref.shape, shape_ref.shape))
 
     return
 
@@ -456,8 +420,8 @@ compile.optdb.register(
 )
 
 
-@register_canonicalize("fast_compile")
-@register_useless
+@register_canonicalize("fast_compile", "shape_unsafe")
+@register_useless("shape_unsafe")
 @node_rewriter([fill])
 def local_useless_fill(fgraph, node):
     """fill(s,v) -> v
@@ -477,10 +441,10 @@ def local_useless_fill(fgraph, node):
         return [v]
 
 
-@register_specialize
-@register_stabilize
-@register_canonicalize
-@register_useless
+@register_specialize("shape_unsafe")
+@register_stabilize("shape_unsafe")
+@register_canonicalize("shape_unsafe")
+@register_useless("shape_unsafe")
 @node_rewriter([Alloc])
 def local_useless_alloc(fgraph, node):
     """
@@ -956,36 +920,65 @@ def local_join_make_vector(fgraph, node):
         return [ret]
 
 
-@register_useless("local_remove_switch_const_cond")
-@register_canonicalize("fast_compile", "local_remove_switch_const_cond")
 @register_specialize
-@node_rewriter([Elemwise])
+@register_canonicalize
+@register_useless
+@node_rewriter([Sum])
+def local_sum_make_vector(fgraph, node):
+    """A sum of a MakeVector node is just the sum of the elements."""
+    (array,) = node.inputs
+
+    if array.owner is None:
+        return
+
+    if not isinstance(array.owner.op, MakeVector):
+        return
+
+    if node.op.axis == ():
+        return [array]
+
+    # If this is not the case the sum is invalid
+    assert node.op.axis is None or node.op.axis == (0,) or node.op.axis == (-1,)
+
+    elements = array.owner.inputs
+    acc_dtype = node.op.acc_dtype
+    out_dtype = node.op.dtype
+    if len(elements) == 0:
+        element_sum = zeros(dtype=out_dtype, shape=())
+    elif len(elements) == 1:
+        element_sum = cast(elements[0], out_dtype)
+    else:
+        element_sum = cast(
+            add(*[cast(value, acc_dtype) for value in elements]), out_dtype
+        )
+
+    return [element_sum]
+
+
+@register_useless("shape_unsafe")
+@register_canonicalize("fast_compile", "shape_unsafe")
+@register_specialize("shape_unsafe")
+@node_rewriter([switch])
 def local_useless_switch(fgraph, node):
     """
     This rewrite makes the following changes in a graph:
 
-        at.switch(cond, left, right) ->
-                if cond is constant and cond == 0: right
-                if cond is constant and cond != 0: left
-                if left is right -> left
+        switch(cond, left, right) ->
+            if cond is constant and cond == 0: right
+            if cond is constant and cond != 0: left
+            if left is right -> left
 
     and
 
-        at.switch(le(shape_i{id}(X), 0), 0, shape_i{id}(X)) -> shape_i{id}(X)
+        switch(le(shape_i{id}(X), 0), 0, shape_i{id}(X)) -> shape_i{id}(X)
 
     """
-    if not isinstance(node.op.scalar_op, aes.Switch):
-        return False
-
-    shape_feature: Optional["ShapeFeature"] = getattr(fgraph, "shape_feature", None)
-
-    if shape_feature is None:
-        return False
 
     left = node.inputs[1]
     right = node.inputs[2]
     cond_var = node.inputs[0]
     cond = extract_constant(cond_var, only_process_constants=True)
+    out_bcast = node.outputs[0].type.broadcastable
 
     if (isinstance(cond, np.ndarray) and cond.ndim == 0) or isinstance(
         cond, (np.number, np.bool_)
@@ -1000,14 +993,8 @@ def local_useless_switch(fgraph, node):
         else:
             out = correct_out
 
-        input_shapes = [
-            tuple(shape_feature.get_shape(inp, i) for i in range(inp.type.ndim))
-            for inp in node.inputs
-        ]
-
-        out_shape = broadcast_shape(*input_shapes, arrays_are_shapes=True)
-
-        out = alloc(out, *out_shape)
+        if out.type.broadcastable != out_bcast:
+            out = broadcast_arrays(out, *node.inputs)[0]
 
         # Copy over stacktrace from selected output to new output
         copy_stack_trace(node.outputs + correct_out, out)
@@ -1017,10 +1004,10 @@ def local_useless_switch(fgraph, node):
     if left == right:
         # Note: No need to copy over stacktrace, because the input node
         # already has its own stacktrace
-        if cond.type.is_super(left.type):
+        if left.type.broadcastable == out_bcast:
             return [left]
 
-        ret = fill(cond, left)
+        ret = broadcast_arrays(left, cond)[0]
 
         # Copy over stacktrace from switch output and correct branch
         copy_stack_trace(node.outputs + left, ret)

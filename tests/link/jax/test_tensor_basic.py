@@ -1,6 +1,8 @@
 import numpy as np
 import pytest
 
+from pytensor.compile import get_mode
+
 
 jax = pytest.importorskip("jax")
 import jax.errors
@@ -12,6 +14,7 @@ from pytensor.graph.fg import FunctionGraph
 from pytensor.graph.op import get_test_value
 from pytensor.tensor.type import iscalar, matrix, scalar, vector
 from tests.link.jax.test_basic import compare_jax_and_py
+from tests.tensor.test_basic import TestAlloc
 
 
 def test_jax_Alloc():
@@ -50,6 +53,10 @@ def test_jax_Alloc():
     compare_jax_and_py(x_fg, [np.ones(10, dtype=config.floatX)])
 
 
+def test_alloc_runtime_broadcast():
+    TestAlloc.check_runtime_broadcast(get_mode("JAX"))
+
+
 def test_jax_MakeVector():
     x = at.make_vector(1, 2, 3)
     x_fg = FunctionGraph([], [x])
@@ -61,6 +68,13 @@ def test_arange():
     out = at.arange(1, 10, 2)
     fgraph = FunctionGraph([], [out])
     compare_jax_and_py(fgraph, [])
+
+
+def test_arange_of_shape():
+    x = vector("x")
+    out = at.arange(1, x.shape[-1], 2)
+    fgraph = FunctionGraph([x], [out])
+    compare_jax_and_py(fgraph, [np.zeros((5,))])
 
 
 def test_arange_nonconcrete():

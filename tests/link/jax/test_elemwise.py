@@ -4,6 +4,7 @@ import scipy.special
 
 import pytensor
 import pytensor.tensor as at
+from pytensor.compile import get_mode
 from pytensor.configdefaults import config
 from pytensor.graph.fg import FunctionGraph
 from pytensor.graph.op import get_test_value
@@ -12,8 +13,13 @@ from pytensor.tensor.math import all as at_all
 from pytensor.tensor.math import prod
 from pytensor.tensor.math import sum as at_sum
 from pytensor.tensor.special import SoftmaxGrad, log_softmax, softmax
-from pytensor.tensor.type import matrix, tensor, vector
+from pytensor.tensor.type import matrix, tensor, vector, vectors
 from tests.link.jax.test_basic import compare_jax_and_py
+from tests.tensor.test_elemwise import TestElemwise
+
+
+def test_elemwise_runtime_broadcast():
+    TestElemwise.check_runtime_broadcast(get_mode("JAX"))
 
 
 def test_jax_Dimshuffle():
@@ -123,3 +129,11 @@ def test_logsumexp_benchmark(size, axis, benchmark):
 
     exp_res = scipy.special.logsumexp(X_val, axis=axis, keepdims=True)
     np.testing.assert_array_almost_equal(res, exp_res)
+
+
+def test_multiple_input_multiply():
+    x, y, z = vectors("xyz")
+    out = at.mul(x, y, z)
+
+    fg = FunctionGraph(outputs=[out], clone=False)
+    compare_jax_and_py(fg, [[1.5], [2.5], [3.5]])

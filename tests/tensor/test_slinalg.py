@@ -22,6 +22,7 @@ from pytensor.tensor.slinalg import (
     kron,
     solve,
     solve_continuous_lyapunov,
+    solve_discrete_are,
     solve_discrete_lyapunov,
     solve_triangular,
 )
@@ -180,7 +181,7 @@ class TestSolveBase(utt.InferShapeTester):
             (
                 matrix,
                 functools.partial(tensor, dtype="floatX", shape=(None,) * 3),
-                "`b` must be a matrix or a vector.*",
+                "`b` must have 2 dims.*",
             ),
         ],
     )
@@ -189,20 +190,20 @@ class TestSolveBase(utt.InferShapeTester):
         with pytest.raises(ValueError, match=error_message):
             A = A_func()
             b = b_func()
-            SolveBase()(A, b)
+            SolveBase(b_ndim=2)(A, b)
 
     def test__repr__(self):
         np.random.default_rng(utt.fetch_seed())
         A = matrix()
         b = matrix()
-        y = SolveBase()(A, b)
-        assert y.__repr__() == "SolveBase{lower=False, check_finite=True}.0"
+        y = SolveBase(b_ndim=2)(A, b)
+        assert y.__repr__() == "SolveBase{lower=False, check_finite=True, b_ndim=2}.0"
 
 
 class TestSolve(utt.InferShapeTester):
     def test__init__(self):
         with pytest.raises(ValueError) as excinfo:
-            Solve(assume_a="test")
+            Solve(assume_a="test", b_ndim=2)
         assert "is not a recognized matrix structure" in str(excinfo.value)
 
     @pytest.mark.parametrize("b_shape", [(5, 1), (5,)])
@@ -277,7 +278,7 @@ class TestSolve(utt.InferShapeTester):
         if config.floatX == "float64":
             eps = 2e-8
 
-        solve_op = Solve(assume_a=assume_a, lower=lower)
+        solve_op = Solve(assume_a=assume_a, lower=lower, b_ndim=1 if n is None else 2)
         utt.verify_grad(solve_op, [A_val, b_val], 3, rng, eps=eps)
 
 
@@ -348,19 +349,20 @@ class TestSolveTriangular(utt.InferShapeTester):
         if config.floatX == "float64":
             eps = 2e-8
 
-        solve_op = SolveTriangular(lower=lower)
+        solve_op = SolveTriangular(lower=lower, b_ndim=1 if n is None else 2)
         utt.verify_grad(solve_op, [A_val, b_val], 3, rng, eps=eps)
 
 
 class TestCholeskySolve(utt.InferShapeTester):
     def setup_method(self):
         self.op_class = CholeskySolve
-        self.op = CholeskySolve()
-        self.op_upper = CholeskySolve(lower=False)
         super().setup_method()
 
     def test_repr(self):
-        assert repr(CholeskySolve()) == "CholeskySolve{(True, True)}"
+        assert (
+            repr(CholeskySolve(lower=True, b_ndim=1))
+            == "CholeskySolve(lower=True,check_finite=True,b_ndim=1)"
+        )
 
     def test_infer_shape(self):
         rng = np.random.default_rng(utt.fetch_seed())
@@ -368,7 +370,7 @@ class TestCholeskySolve(utt.InferShapeTester):
         b = matrix()
         self._compile_and_check(
             [A, b],  # pytensor.function inputs
-            [self.op(A, b)],  # pytensor.function outputs
+            [self.op_class(b_ndim=2)(A, b)],  # pytensor.function outputs
             # A must be square
             [
                 np.asarray(rng.random((5, 5)), dtype=config.floatX),
@@ -382,7 +384,7 @@ class TestCholeskySolve(utt.InferShapeTester):
         b = vector()
         self._compile_and_check(
             [A, b],  # pytensor.function inputs
-            [self.op(A, b)],  # pytensor.function outputs
+            [self.op_class(b_ndim=1)(A, b)],  # pytensor.function outputs
             # A must be square
             [
                 np.asarray(rng.random((5, 5)), dtype=config.floatX),
@@ -396,10 +398,10 @@ class TestCholeskySolve(utt.InferShapeTester):
         rng = np.random.default_rng(utt.fetch_seed())
         A = matrix()
         b = matrix()
-        y = self.op(A, b)
+        y = self.op_class(lower=True, b_ndim=2)(A, b)
         cho_solve_lower_func = pytensor.function([A, b], y)
 
-        y = self.op_upper(A, b)
+        y = self.op_class(lower=False, b_ndim=2)(A, b)
         cho_solve_upper_func = pytensor.function([A, b], y)
 
         b_val = np.asarray(rng.random((5, 1)), dtype=config.floatX)
@@ -434,12 +436,13 @@ class TestCholeskySolve(utt.InferShapeTester):
 
         A_val = np.eye(2)
         b_val = np.ones((2, 1))
+        op = self.op_class(b_ndim=2)
 
         # try all dtype combinations
         for A_dtype, b_dtype in itertools.product(dtypes, dtypes):
             A = matrix(dtype=A_dtype)
             b = matrix(dtype=b_dtype)
-            x = self.op(A, b)
+            x = op(A, b)
             fn = function([A, b], x)
             x_result = fn(A_val.astype(A_dtype), b_val.astype(b_dtype))
 
@@ -532,7 +535,7 @@ class TestKron(utt.InferShapeTester):
                     scipy_val = scipy.linalg.kron(a[np.newaxis, :], b).flatten()
                 else:
                     scipy_val = scipy.linalg.kron(a, b)
-                utt.assert_allclose(out, scipy_val)
+                np.testing.assert_allclose(out, scipy_val)
 
     def test_numpy_2d(self):
         for shp0 in [(2, 3)]:
@@ -564,7 +567,10 @@ def test_solve_discrete_lyapunov_via_direct_real():
     utt.verify_grad(solve_discrete_lyapunov, pt=[A, Q], rng=rng)
 
 
+@pytest.mark.filterwarnings("ignore::UserWarning")
 def test_solve_discrete_lyapunov_via_direct_complex():
+    # Conj doesn't have C-op; filter the warning.
+
     N = 5
     rng = np.random.default_rng(utt.fetch_seed())
     a = pt.zmatrix()
@@ -574,7 +580,7 @@ def test_solve_discrete_lyapunov_via_direct_complex():
     A = rng.normal(size=(N, N)) + rng.normal(size=(N, N)) * 1j
     Q = rng.normal(size=(N, N))
     X = f(A, Q)
-    assert np.allclose(A @ X @ A.conj().T - X + Q, 0.0)
+    np.testing.assert_array_less(A @ X @ A.conj().T - X + Q, 1e-12)
 
     # TODO: the .conj() method currently does not have a gradient; add this test when gradients are implemented.
     # utt.verify_grad(solve_discrete_lyapunov, pt=[A, Q], rng=rng)
@@ -591,8 +597,8 @@ def test_solve_discrete_lyapunov_via_bilinear():
     Q = rng.normal(size=(N, N))
 
     X = f(A, Q)
-    assert np.allclose(A @ X @ A.conj().T - X + Q, 0.0)
 
+    np.testing.assert_array_less(A @ X @ A.conj().T - X + Q, 1e-12)
     utt.verify_grad(solve_discrete_lyapunov, pt=[A, Q], rng=rng)
 
 
@@ -607,6 +613,51 @@ def test_solve_continuous_lyapunov():
     Q = rng.normal(size=(N, N))
     X = f(A, Q)
 
-    assert np.allclose(A @ X + X @ A.conj().T, Q)
+    Q_recovered = A @ X + X @ A.conj().T
 
+    np.testing.assert_allclose(Q_recovered.squeeze(), Q)
     utt.verify_grad(solve_continuous_lyapunov, pt=[A, Q], rng=rng)
+
+
+def test_solve_discrete_are_forward():
+    # TEST CASE 4 : darex #1 -- taken from Scipy tests
+    a, b, q, r = (
+        np.array([[4, 3], [-4.5, -3.5]]),
+        np.array([[1], [-1]]),
+        np.array([[9, 6], [6, 4]]),
+        np.array([[1]]),
+    )
+    a, b, q, r = (x.astype(config.floatX) for x in [a, b, q, r])
+
+    x = solve_discrete_are(a, b, q, r).eval()
+    res = a.T.dot(x.dot(a)) - x + q
+    res -= (
+        a.conj()
+        .T.dot(x.dot(b))
+        .dot(np.linalg.solve(r + b.conj().T.dot(x.dot(b)), b.T).dot(x.dot(a)))
+    )
+
+    atol = 1e-4 if config.floatX == "float32" else 1e-12
+    np.testing.assert_allclose(res, np.zeros_like(res), atol=atol)
+
+
+def test_solve_discrete_are_grad():
+    a, b, q, r = (
+        np.array([[4, 3], [-4.5, -3.5]]),
+        np.array([[1], [-1]]),
+        np.array([[9, 6], [6, 4]]),
+        np.array([[1]]),
+    )
+    a, b, q, r = (x.astype(config.floatX) for x in [a, b, q, r])
+
+    rng = np.random.default_rng(utt.fetch_seed())
+
+    # TODO: Is there a "theoretically motivated" value to use here? I pulled 1e-4 out of a hat
+    atol = 1e-4 if config.floatX == "float32" else 1e-12
+
+    utt.verify_grad(
+        functools.partial(solve_discrete_are, enforce_Q_symmetric=True),
+        pt=[a, b, q, r],
+        rng=rng,
+        abs_tol=atol,
+    )

@@ -7,13 +7,17 @@ from pytensor.configdefaults import config
 from pytensor.graph.fg import FunctionGraph
 from pytensor.graph.op import get_test_value
 from pytensor.scalar.basic import Composite
+from pytensor.tensor import as_tensor
 from pytensor.tensor.elemwise import Elemwise
 from pytensor.tensor.math import all as at_all
 from pytensor.tensor.math import (
     cosh,
     erf,
     erfc,
+    erfcinv,
+    erfcx,
     erfinv,
+    iv,
     log,
     log1mexp,
     psi,
@@ -25,6 +29,15 @@ from tests.link.jax.test_basic import compare_jax_and_py
 
 
 jax = pytest.importorskip("jax")
+from pytensor.link.jax.dispatch import jax_funcify
+
+
+try:
+    pass
+
+    TFP_INSTALLED = True
+except ModuleNotFoundError:
+    TFP_INSTALLED = False
 
 
 def test_second():
@@ -39,6 +52,25 @@ def test_second():
     out = at.second(a1, b)
     fgraph = FunctionGraph([a1, b], [out])
     compare_jax_and_py(fgraph, [np.zeros([5], dtype=config.floatX), 5.0])
+
+    a2 = matrix("a2", shape=(1, None), dtype="float64")
+    b2 = matrix("b2", shape=(None, 1), dtype="int32")
+    out = at.second(a2, b2)
+    fgraph = FunctionGraph([a2, b2], [out])
+    compare_jax_and_py(
+        fgraph, [np.zeros((1, 3), dtype="float64"), np.ones((5, 1), dtype="int32")]
+    )
+
+
+def test_second_constant_scalar():
+    b = scalar("b", dtype="int")
+    out = at.second(0.0, b)
+    fgraph = FunctionGraph([b], [out])
+    # Test dispatch directly as useless second is removed during compilation
+    fn = jax_funcify(fgraph)
+    [res] = fn(1)
+    assert res == 1
+    assert res.dtype == out.dtype
 
 
 def test_identity():
@@ -112,6 +144,23 @@ def test_erfinv():
     fg = FunctionGraph([x], [out])
 
     compare_jax_and_py(fg, [0.95])
+
+
+@pytest.mark.parametrize(
+    "op, test_values",
+    [
+        (erfcx, (0.7,)),
+        (erfcinv, (0.7,)),
+        (iv, (0.3, 0.7)),
+    ],
+)
+@pytest.mark.skipif(not TFP_INSTALLED, reason="Test requires tensorflow-probability")
+def test_tfp_ops(op, test_values):
+    inputs = [as_tensor(test_value).type() for test_value in test_values]
+    output = op(*inputs)
+
+    fg = FunctionGraph(inputs, [output])
+    compare_jax_and_py(fg, test_values)
 
 
 def test_psi():

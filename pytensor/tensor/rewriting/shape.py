@@ -99,18 +99,6 @@ class ShapeFeature(Feature):
 
     Notes
     -----
-    Right now there is only the ConvOp that could really take
-    advantage of this shape inference, but it is worth it even
-    just for the ConvOp.  All that's necessary to do shape
-    inference is 1) to mark shared inputs as having a particular
-    shape, either via a .tag or some similar hacking; and 2) to
-    add an optional In() argument to promise that inputs will
-    have a certain shape (or even to have certain shapes in
-    certain dimensions).
-
-    We can't automatically infer the shape of shared variables as they can
-    change of shape during the execution by default.
-
     To use this shape information in rewrites, use the
     ``shape_of`` dictionary.
 
@@ -1024,6 +1012,52 @@ def local_Shape_of_SpecifyShape(fgraph, node):
             shape[i] = shape_i(x, i, fgraph)
 
     return [stack(shape).astype(np.int64)]
+
+
+@register_canonicalize
+@register_specialize
+@node_rewriter([SpecifyShape])
+def local_specify_shape_lift(fgraph, node):
+    """Lift SpecifyShape of Elemwise towards the inputs."""
+    inp, *shape = node.inputs
+    if inp.owner and isinstance(inp.owner.op, Elemwise):
+        if len(inp.owner.outputs) != 1:
+            return None
+
+        elem_inps = inp.owner.inputs
+        if len(elem_inps) == 1:
+            new_elem_inps = [specify_shape(elem_inps[0], shape)]
+        else:
+            # Rewrite does not support case where specify_shape provides new broadcastable information,
+            # As that may require a specify_shape for each input
+            out_broadcastable = node.outputs[0].type.broadcastable
+            if out_broadcastable != inp.type.broadcastable:
+                return None
+
+            # All non-broadcastable dimensions of inputs must match the non-broadcastbale specify_shape dims
+            # We look for a sufficient input to assign all the specify_shape dims
+            # We could consider distributing the SpecifyShape across multiple inputs, when none is sufficient
+
+            nonbcast_dims = {
+                i
+                for i, (dim, bcast) in enumerate(zip(shape, out_broadcastable))
+                if (not bcast and not NoneConst.equals(dim))
+            }
+            new_elem_inps = elem_inps.copy()
+            for i, elem_inp in enumerate(elem_inps):
+                if all(
+                    bcast_dim is False
+                    for dim, bcast_dim in enumerate(elem_inp.type.broadcastable)
+                    if dim in nonbcast_dims
+                ):
+                    new_elem_inps[i] = specify_shape(elem_inp, shape)
+                    break
+            else:  # no-break, no sufficient candidate found
+                return None
+
+        new_out = inp.owner.op.make_node(*new_elem_inps).outputs
+        copy_stack_trace(node.outputs, new_out)
+        return new_out
 
 
 @register_useless

@@ -5,6 +5,7 @@ import pytensor.scalar as aes
 import pytensor.tensor as at
 import pytensor.tensor.basic as atb
 from pytensor import config, function
+from pytensor.compile import get_mode
 from pytensor.compile.sharedvalue import SharedVariable
 from pytensor.graph.basic import Constant
 from pytensor.graph.fg import FunctionGraph
@@ -15,6 +16,11 @@ from tests.link.numba.test_basic import (
     compare_shape_dtype,
     set_test_value,
 )
+from tests.tensor.test_basic import TestAlloc
+
+
+pytest.importorskip("numba")
+from pytensor.link.numba.dispatch import numba_funcify
 
 
 rng = np.random.default_rng(42849)
@@ -45,34 +51,16 @@ def test_Alloc(v, shape):
     assert numba_res.shape == shape
 
 
+def test_alloc_runtime_broadcast():
+    TestAlloc.check_runtime_broadcast(get_mode("NUMBA"))
+
+
 def test_AllocEmpty():
     x = at.empty((2, 3), dtype="float32")
     x_fg = FunctionGraph([], [x])
 
     # We cannot compare the values in the arrays, only the shapes and dtypes
     compare_numba_and_py(x_fg, [], assert_fn=compare_shape_dtype)
-
-
-@pytest.mark.parametrize(
-    "v, offset",
-    [
-        (set_test_value(at.vector(), np.arange(10, dtype=config.floatX)), 0),
-        (set_test_value(at.vector(), np.arange(10, dtype=config.floatX)), 1),
-        (set_test_value(at.vector(), np.arange(10, dtype=config.floatX)), -1),
-    ],
-)
-def test_AllocDiag(v, offset):
-    g = atb.AllocDiag(offset=offset)(v)
-    g_fg = FunctionGraph(outputs=[g])
-
-    compare_numba_and_py(
-        g_fg,
-        [
-            i.tag.test_value
-            for i in g_fg.inputs
-            if not isinstance(i, (SharedVariable, Constant))
-        ],
-    )
 
 
 @pytest.mark.parametrize(
@@ -367,6 +355,12 @@ def test_Split_view():
             0,
         ),
         (
+            set_test_value(
+                at.matrix(), np.arange(10 * 10, dtype=config.floatX).reshape((10, 10))
+            ),
+            -1,
+        ),
+        (
             set_test_value(at.vector(), np.arange(10, dtype=config.floatX)),
             0,
         ),
@@ -384,6 +378,23 @@ def test_ExtractDiag(val, offset):
             if not isinstance(i, (SharedVariable, Constant))
         ],
     )
+
+
+@pytest.mark.parametrize("k", range(-5, 4))
+@pytest.mark.parametrize(
+    "axis1, axis2", ((0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3))
+)
+@pytest.mark.parametrize("reverse_axis", (False, True))
+def test_ExtractDiag_exhaustive(k, axis1, axis2, reverse_axis):
+    if reverse_axis:
+        axis1, axis2 = axis2, axis1
+
+    x = at.tensor4("x")
+    x_shape = (2, 3, 4, 5)
+    x_test = np.arange(np.prod(x_shape)).reshape(x_shape)
+    out = at.diagonal(x, k, axis1, axis2)
+    numba_fn = numba_funcify(out.owner.op, out.owner)
+    np.testing.assert_allclose(numba_fn(x_test), np.diagonal(x_test, k, axis1, axis2))
 
 
 @pytest.mark.parametrize(

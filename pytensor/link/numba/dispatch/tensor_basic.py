@@ -7,7 +7,6 @@ from pytensor.link.numba.dispatch.basic import create_tuple_string, numba_funcif
 from pytensor.link.utils import compile_function_src, unique_name_generator
 from pytensor.tensor.basic import (
     Alloc,
-    AllocDiag,
     AllocEmpty,
     ARange,
     ExtractDiag,
@@ -78,30 +77,27 @@ def numba_funcify_Alloc(op, node, **kwargs):
         " " * 4,
     )
 
+    check_runtime_broadcast = []
+    for i, val_static_dim in enumerate(node.inputs[0].type.shape[::-1]):
+        if val_static_dim is None:
+            check_runtime_broadcast.append(
+                f'if val.shape[{-i - 1}] == 1 and scalar_shape[{-i - 1}] != 1: raise ValueError("{Alloc._runtime_broadcast_error_msg}")'
+            )
+    check_runtime_broadcast_src = indent("\n".join(check_runtime_broadcast), " " * 4)
+
     alloc_def_src = f"""
 def alloc(val, {", ".join(shape_var_names)}):
     val_np = np.asarray(val)
 {shapes_to_items_src}
     scalar_shape = {create_tuple_string(shape_var_item_names)}
+{check_runtime_broadcast_src}
     res = np.empty(scalar_shape, dtype=val_np.dtype)
     res[...] = val_np
     return res
     """
-
     alloc_fn = compile_function_src(alloc_def_src, "alloc", {**globals(), **global_env})
 
     return numba_basic.numba_njit(alloc_fn)
-
-
-@numba_funcify.register(AllocDiag)
-def numba_funcify_AllocDiag(op, **kwargs):
-    offset = op.offset
-
-    @numba_basic.numba_njit(inline="always")
-    def allocdiag(v):
-        return np.diag(v, k=offset)
-
-    return allocdiag
 
 
 @numba_funcify.register(ARange)
@@ -150,14 +146,44 @@ def numba_funcify_Split(op, **kwargs):
 
 
 @numba_funcify.register(ExtractDiag)
-def numba_funcify_ExtractDiag(op, **kwargs):
-    offset = op.offset
-    # axis1 = op.axis1
-    # axis2 = op.axis2
+def numba_funcify_ExtractDiag(op, node, **kwargs):
+    view = op.view
+    axis1, axis2, offset = op.axis1, op.axis2, op.offset
 
-    @numba_basic.numba_njit(inline="always")
-    def extract_diag(x):
-        return np.diag(x, k=offset)
+    if node.inputs[0].type.ndim == 2:
+
+        @numba_basic.numba_njit(inline="always")
+        def extract_diag(x):
+            out = np.diag(x, k=offset)
+
+            if not view:
+                out = out.copy()
+
+            return out
+
+    else:
+        axis1p1 = axis1 + 1
+        axis2p1 = axis2 + 1
+        leading_dims = (slice(None),) * axis1
+        middle_dims = (slice(None),) * (axis2 - axis1 - 1)
+
+        @numba_basic.numba_njit(inline="always")
+        def extract_diag(x):
+            if offset >= 0:
+                diag_len = min(x.shape[axis1], max(0, x.shape[axis2] - offset))
+            else:
+                diag_len = min(x.shape[axis2], max(0, x.shape[axis1] + offset))
+            base_shape = x.shape[:axis1] + x.shape[axis1p1:axis2] + x.shape[axis2p1:]
+            out_shape = base_shape + (diag_len,)
+            out = np.empty(out_shape)
+
+            for i in range(diag_len):
+                if offset >= 0:
+                    new_entry = x[leading_dims + (i,) + middle_dims + (i + offset,)]
+                else:
+                    new_entry = x[leading_dims + (i - offset,) + middle_dims + (i,)]
+                out[..., i] = new_entry
+            return out
 
     return extract_diag
 

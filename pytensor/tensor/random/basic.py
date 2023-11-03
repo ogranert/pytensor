@@ -1,14 +1,18 @@
 import abc
+import warnings
 from typing import List, Optional, Union
 
 import numpy as np
 import scipy.stats as stats
 
 import pytensor
-from pytensor.tensor.basic import as_tensor_variable
-from pytensor.tensor.random.op import RandomVariable, default_supp_shape_from_params
+from pytensor.tensor.basic import arange, as_tensor_variable
+from pytensor.tensor.random.op import RandomVariable
 from pytensor.tensor.random.type import RandomGeneratorType, RandomStateType
-from pytensor.tensor.random.utils import broadcast_params
+from pytensor.tensor.random.utils import (
+    broadcast_params,
+    supp_shape_from_ref_param_shape,
+)
 from pytensor.tensor.random.var import (
     RandomGeneratorSharedVariable,
     RandomStateSharedVariable,
@@ -416,7 +420,7 @@ class LogNormalRV(RandomVariable):
 lognormal = LogNormalRV()
 
 
-class GammaRV(ScipyRandomVariable):
+class GammaRV(RandomVariable):
     r"""A gamma continuous random variable.
 
     The probability density function for `gamma` in terms of the shape parameter
@@ -440,7 +444,7 @@ class GammaRV(ScipyRandomVariable):
     dtype = "floatX"
     _print_name = ("Gamma", "\\operatorname{Gamma}")
 
-    def __call__(self, shape, rate, size=None, **kwargs):
+    def __call__(self, shape, scale, size=None, **kwargs):
         r"""Draw samples from a gamma distribution.
 
         Signature
@@ -452,8 +456,8 @@ class GammaRV(ScipyRandomVariable):
         ----------
         shape
             The shape :math:`\alpha` of the gamma distribution. Must be positive.
-        rate
-            The rate :math:`\beta` of the gamma distribution. Must be positive.
+        scale
+            The scale :math:`1/\beta` of the gamma distribution. Must be positive.
         size
             Sample shape. If the given size is, e.g. `(m, n, k)` then `m * n * k`
             independent, identically distributed random variables are
@@ -461,14 +465,26 @@ class GammaRV(ScipyRandomVariable):
             is returned.
 
         """
-        return super().__call__(shape, 1.0 / rate, size=size, **kwargs)
-
-    @classmethod
-    def rng_fn_scipy(cls, rng, shape, scale, size):
-        return stats.gamma.rvs(shape, scale=scale, size=size, random_state=rng)
+        return super().__call__(shape, scale, size=size, **kwargs)
 
 
-gamma = GammaRV()
+_gamma = GammaRV()
+
+
+def gamma(shape, rate=None, scale=None, **kwargs):
+    # TODO: Remove helper when rate is deprecated
+    if rate is not None and scale is not None:
+        raise ValueError("Cannot specify both rate and scale")
+    elif rate is None and scale is None:
+        raise ValueError("Must specify scale")
+    elif rate is not None:
+        warnings.warn(
+            "Gamma rate argument is deprecated and will stop working, use scale instead",
+            FutureWarning,
+        )
+        scale = 1.0 / rate
+
+    return _gamma(shape, scale, **kwargs)
 
 
 class ChiSquareRV(RandomVariable):
@@ -855,6 +871,14 @@ class MvNormalRV(RandomVariable):
     dtype = "floatX"
     _print_name = ("MultivariateNormal", "\\operatorname{MultivariateNormal}")
 
+    def _supp_shape_from_params(self, dist_params, param_shapes=None):
+        return supp_shape_from_ref_param_shape(
+            ndim_supp=self.ndim_supp,
+            dist_params=dist_params,
+            param_shapes=param_shapes,
+            ref_param_idx=0,
+        )
+
     def __call__(self, mean=None, cov=None, size=None, **kwargs):
         r""" "Draw samples from a multivariate normal distribution.
 
@@ -932,6 +956,14 @@ class DirichletRV(RandomVariable):
     ndims_params = [1]
     dtype = "floatX"
     _print_name = ("Dirichlet", "\\operatorname{Dirichlet}")
+
+    def _supp_shape_from_params(self, dist_params, param_shapes=None):
+        return supp_shape_from_ref_param_shape(
+            ndim_supp=self.ndim_supp,
+            dist_params=dist_params,
+            param_shapes=param_shapes,
+            ref_param_idx=0,
+        )
 
     def __call__(self, alphas, size=None, **kwargs):
         r"""Draw samples from a dirichlet distribution.
@@ -1776,9 +1808,12 @@ class MultinomialRV(RandomVariable):
         """
         return super().__call__(n, p, size=size, **kwargs)
 
-    def _supp_shape_from_params(self, dist_params, rep_param_idx=1, param_shapes=None):
-        return default_supp_shape_from_params(
-            self.ndim_supp, dist_params, rep_param_idx, param_shapes
+    def _supp_shape_from_params(self, dist_params, param_shapes=None):
+        return supp_shape_from_ref_param_shape(
+            ndim_supp=self.ndim_supp,
+            dist_params=dist_params,
+            param_shapes=param_shapes,
+            ref_param_idx=1,
         )
 
     @classmethod
@@ -2050,18 +2085,15 @@ class PermutationRV(RandomVariable):
 
     @classmethod
     def rng_fn(cls, rng, x, size):
-        return rng.permutation(x if x.ndim > 0 else x.item())
+        return rng.permutation(x)
 
-    def _infer_shape(self, size, dist_params, param_shapes=None):
-        param_shapes = param_shapes or [p.shape for p in dist_params]
-
-        (x,) = dist_params
-        (x_shape,) = param_shapes
-
-        if x.ndim == 0:
-            return (x,)
-        else:
-            return x_shape
+    def _supp_shape_from_params(self, dist_params, param_shapes=None):
+        return supp_shape_from_ref_param_shape(
+            ndim_supp=self.ndim_supp,
+            dist_params=dist_params,
+            param_shapes=param_shapes,
+            ref_param_idx=0,
+        )
 
     def __call__(self, x, **kwargs):
         r"""Randomly permute a sequence or a range of values.
@@ -2074,15 +2106,35 @@ class PermutationRV(RandomVariable):
         Parameters
         ----------
         x
-            If `x` is an integer, randomly permute `np.arange(x)`. If `x` is a sequence,
-            shuffle its elements randomly.
+            Elements to be shuffled.
 
         """
         x = as_tensor_variable(x)
         return super().__call__(x, dtype=x.dtype, **kwargs)
 
 
-permutation = PermutationRV()
+_permutation = PermutationRV()
+
+
+def permutation(x, **kwargs):
+    r"""Randomly permute a sequence or a range of values.
+
+    Signature
+    ---------
+
+    `(x) -> (x)`
+
+    Parameters
+    ----------
+    x
+        If `x` is an integer, randomly permute `np.arange(x)`. If `x` is a sequence,
+        shuffle its elements randomly.
+
+    """
+    x = as_tensor_variable(x)
+    if x.type.ndim == 0:
+        x = arange(x)
+    return _permutation(x, **kwargs)
 
 
 __all__ = [

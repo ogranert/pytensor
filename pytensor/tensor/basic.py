@@ -20,7 +20,7 @@ import pytensor
 import pytensor.scalar.sharedvar
 from pytensor import compile, config, printing
 from pytensor import scalar as aes
-from pytensor.gradient import DisconnectedType, grad_not_implemented, grad_undefined
+from pytensor.gradient import DisconnectedType, grad_undefined
 from pytensor.graph.basic import Apply, Constant, Variable
 from pytensor.graph.fg import FunctionGraph
 from pytensor.graph.op import Op
@@ -62,7 +62,11 @@ from pytensor.tensor.type import (
     uint_dtypes,
     values_eq_approx_always_true,
 )
-from pytensor.tensor.var import TensorConstant, TensorVariable, get_unique_value
+from pytensor.tensor.variable import (
+    TensorConstant,
+    TensorVariable,
+    get_unique_constant_value,
+)
 
 
 if TYPE_CHECKING:
@@ -323,7 +327,7 @@ def get_underlying_scalar_constant_value(
                 raise NotScalarConstantError()
 
         if isinstance(v, Constant):
-            unique_value = get_unique_value(v)
+            unique_value = get_unique_constant_value(v)
             if unique_value is not None:
                 data = unique_value
             else:
@@ -523,7 +527,7 @@ def get_underlying_scalar_constant_value(
                         grandparent.owner.op, Unbroadcast
                     ):
                         ggp_shape = grandparent.owner.inputs[0].type.shape
-                        l = [s1 == 1 or s2 == 1 for s1, s2 in zip(ggp_shape, gp_shape)]
+                        l = [get_underlying_scalar_constant_value(s) for s in ggp_shape]
                         gp_shape = tuple(l)
 
                     if not (idx < ndim):
@@ -761,7 +765,12 @@ where = switch
 
 @scalar_elemwise
 def second(a, b):
-    """Create a matrix by filling the shape of a with b"""
+    """Create a matrix by filling the broadcasted shapes of a and b with the values of b
+
+    Equivalent to `np.broadcast_arrays(a, b)[1]`
+    Equivalent to `np.array(a).fill(b)` when b is a scalar value.
+
+    """
 
 
 fill = second
@@ -1422,23 +1431,64 @@ class Alloc(COp):
 
     __props__ = ()
 
+    _runtime_broadcast_error_msg = (
+        "Runtime broadcasting not allowed. "
+        "The output of Alloc requires broadcasting a dimension of the input value, which was not marked as broadcastable. "
+        "If broadcasting was intended, use `specify_broadcastable` on the relevant input."
+    )
+
     def make_node(self, value, *shape):
-        v = as_tensor_variable(value)
-        sh, static_shape = infer_static_shape(shape)
-        if v.ndim > len(sh):
+        value = as_tensor_variable(value)
+        shape, static_shape = infer_static_shape(shape)
+        if value.ndim > len(shape):
             raise TypeError(
                 "The Alloc value to use has more dimensions"
                 " than the specified dimensions",
-                v.ndim,
-                len(sh),
+                value.ndim,
+                len(shape),
             )
-        otype = TensorType(dtype=v.dtype, shape=static_shape)
-        return Apply(self, [v] + sh, [otype()])
+
+        # Combine static shape information from value and shape
+        combined_static_shape = list(static_shape).copy()
+        new_dims = len(shape) - value.type.ndim
+        extended_value_static_shape = (None,) * new_dims + value.type.shape
+        extended_value_broadcastable = (False,) * new_dims + value.type.broadcastable
+        for i, (v_bc, v_st, sh_st) in enumerate(
+            zip(
+                extended_value_broadcastable,
+                extended_value_static_shape,
+                static_shape,
+            )
+        ):
+            # If value is not broadcastable and we don't know the target static shape: use value static shape
+            if (not v_bc) and (sh_st is None):
+                combined_static_shape[i] = v_st
+            # Otherwise check if static shapes are compatible
+            elif (v_st is not None) and (sh_st is not None):
+                # They must match or if not, the value must be broadcastable
+                if v_st != sh_st and not v_bc:
+                    raise ValueError(
+                        f"Alloc static input type and target shape are incompatible: {value.type} vs {static_shape}"
+                    )
+
+        otype = TensorType(dtype=value.dtype, shape=combined_static_shape)
+        return Apply(self, [value] + shape, [otype()])
+
+    @staticmethod
+    def _check_runtime_broadcast(node, value, shape):
+        value_static_shape = node.inputs[0].type.shape
+        for v_static_dim, value_dim, out_dim in zip(
+            value_static_shape[::-1], value.shape[::-1], shape[::-1]
+        ):
+            if v_static_dim is None and value_dim == 1 and out_dim != 1:
+                raise ValueError(Alloc._runtime_broadcast_error_msg)
 
     def perform(self, node, inputs, out_):
         (out,) = out_
         v = inputs[0]
         sh = tuple([int(i) for i in inputs[1:]])
+        self._check_runtime_broadcast(node, v, sh)
+
         if out[0] is None or out[0].shape != sh:
             if v.size == 1 and v.item() == 0:
                 out[0] = np.zeros(sh, dtype=v.dtype)
@@ -1451,51 +1501,63 @@ class Alloc(COp):
 
     def c_code(self, node, name, inp, out, sub):
         vv = inp[0]
-        ndim = len(inp[1:])
         (zz,) = out
         fail = sub["fail"]
 
+        v_static_shape = node.inputs[0].type.shape
+        o_static_shape = node.outputs[0].type.shape
+        v_ndim = len(v_static_shape)
+        o_ndim = len(o_static_shape)
+        assert o_ndim == len(inp[1:])
+
+        # Declare variables
         code = f"""
-            npy_intp shape[{ndim}];
+            npy_intp shape[{o_ndim}];
+            int need_new_out;
             """
 
         # Initialize shape
         for i, shp_i in enumerate(inp[1:]):
-            code += """
-                shape[%(i)s] = ((dtype_%(shp_i)s*) PyArray_DATA(%(shp_i)s))[0];
-                """ % dict(
-                i=i, shp_i=shp_i
-            )
+            code += f"""
+                shape[{i}] = ((dtype_{shp_i}*) PyArray_DATA({shp_i}))[0];
+            """
 
-        code += """
-            int need_new_out = (NULL == %(zz)s);
-            for (int i = 0; i < %(ndim)s; i++)
-                need_new_out = (need_new_out
-                                || (PyArray_DIMS(%(zz)s)[i] != shape[i]));
+        # Add checks for runtime broadcasting
+        for i, v_static_dim in enumerate(v_static_shape[::-1]):
+            if v_static_dim is None:
+                code += f"""
+                if (PyArray_DIMS({vv})[{v_ndim - i - 1}] == 1 && shape[{o_ndim - i - 1}] != 1)
+                {{
+                    PyErr_Format(PyExc_ValueError, "{self._runtime_broadcast_error_msg}");
+                    {fail}
+                }}
+                """
+
+        code += f"""
+            need_new_out = (NULL == {zz});
+            for (int i = 0; i < {o_ndim}; i++)
+                need_new_out = (need_new_out || (PyArray_DIMS({zz})[i] != shape[i]));
 
             if (need_new_out)
-            {
-                Py_XDECREF(%(zz)s);
-                %(zz)s = (PyArrayObject*) PyArray_SimpleNew(%(ndim)s,
-                    shape, PyArray_TYPE((PyArrayObject*) py_%(vv)s));
-                if (!%(zz)s)
-                {
+            {{
+                Py_XDECREF({zz});
+                {zz} = (PyArrayObject*) PyArray_SimpleNew({o_ndim}, shape, PyArray_TYPE({vv}));
+                if (!{zz})
+                {{
                     PyErr_SetString(PyExc_MemoryError, "alloc failed");
-                    %(fail)s
-                }
-            }
+                    {fail}
+                }}
+            }}
 
             // This function takes care of broadcasting
-            if (PyArray_CopyInto(%(zz)s, %(vv)s) == -1)
-              %(fail)s
-            """ % dict(
-            vv=vv, ndim=ndim, zz=zz, fail=fail
-        )
+            if (PyArray_CopyInto({zz}, {vv}) == -1)
+              {fail}
+            """
 
         return code
 
     def c_code_cache_version(self):
-        return (2,)
+        return (4,)
 
     def infer_shape(self, fgraph, node, input_shapes):
         return [node.inputs[1:]]
@@ -1535,7 +1597,7 @@ class Alloc(COp):
             for idx, axis in enumerate(axis_kept):
                 new_order[axis] = idx
             gx = gx.dimshuffle(new_order)
-            # Dimshuffle to add back the broadcasted dims
+        # Dimshuffle to add back the broadcasted dims
         # The *elements* of the output are not connected to
         # the inputs that specify the shape. If you grow the
         # shape by epsilon, the existing elements do not
@@ -3314,6 +3376,7 @@ def inverse_permutation(perm):
     )
 
 
+# TODO: optimization to insert ExtractDiag with view=True
 class ExtractDiag(Op):
     """
     Return specified diagonals.
@@ -3374,9 +3437,18 @@ class ExtractDiag(Op):
         self.view = view
         if self.view:
             self.view_map = {0: [0]}
-        self.offset = offset
+        if axis1 < 0 or axis2 < 0:
+            raise NotImplementedError(
+                "ExtractDiag does not support negative axis. Use pytensor.tensor.diagonal instead."
+            )
+        if axis1 == axis2:
+            raise ValueError("axis1 and axis2 cannot be the same")
+        # Sort axis
+        if axis1 > axis2:
+            axis1, axis2, offset = axis2, axis1, -offset
         self.axis1 = axis1
         self.axis2 = axis2
+        self.offset = offset
 
     def make_node(self, x):
         x = as_tensor_variable(x)
@@ -3397,20 +3469,29 @@ class ExtractDiag(Op):
             z[0] = z[0].copy()
 
     def grad(self, inputs, gout):
+        # Avoid circular import
+        from pytensor.tensor.subtensor import set_subtensor
+
         (x,) = inputs
         (gz,) = gout
 
-        if x.ndim == 2:
-            x = zeros_like(x)
-            xdiag = AllocDiag(offset=self.offset)(gz)
-            return [
-                pytensor.tensor.subtensor.set_subtensor(
-                    x[: xdiag.shape[0], : xdiag.shape[1]], xdiag
-                )
-            ]
+        axis1, axis2, offset = self.axis1, self.axis2, self.offset
+
+        # Start with zeros (and axes in the front)
+        x_grad = zeros_like(moveaxis(x, (axis1, axis2), (0, 1)))
+
+        # Fill zeros with output diagonal
+        xdiag = alloc_diag(gz, offset=0, axis1=0, axis2=1)
+        z_len = xdiag.shape[0]
+        if offset >= 0:
+            diag_slices = (slice(None, z_len), slice(offset, offset + z_len))
         else:
-            warnings.warn("Gradient of ExtractDiag only works for matrices.")
-            return [grad_not_implemented(self, 0, x)]
+            diag_slices = (slice(abs(offset), abs(offset) + z_len), slice(None, z_len))
+        x_grad = set_subtensor(x_grad[diag_slices], xdiag)
+
+        # Put axes back in their original positions
+        x_grad = moveaxis(x_grad, (0, 1), (axis1, axis2))
+        return [x_grad]
 
     def infer_shape(self, fgraph, node, shapes):
         from pytensor.tensor.math import clip, minimum
@@ -3446,8 +3527,12 @@ class ExtractDiag(Op):
             self.axis2 = 1
 
 
-extract_diag = ExtractDiag()
-# TODO: optimization to insert ExtractDiag with view=True
+def extract_diag(x):
+    warnings.warn(
+        "pytensor.tensor.extract_diag is deprecated. Use pytensor.tensor.diagonal instead.",
+        FutureWarning,
+    )
+    return diagonal(x)
 
 
 def diagonal(a, offset=0, axis1=0, axis2=1):
@@ -3469,14 +3554,22 @@ def diagonal(a, offset=0, axis1=0, axis2=1):
     tensor : symbolic tensor
 
     """
+    a = as_tensor_variable(a)
+    axis1, axis2 = normalize_axis_tuple((axis1, axis2), ndim=a.type.ndim)
     return ExtractDiag(offset, axis1, axis2)(a)
 
 
-class AllocDiag(Op):
-    """An `Op` that copies a vector to the diagonal of an empty matrix.
-
-    It does the inverse of `ExtractDiag`.
+def trace(a, offset=0, axis1=0, axis2=1):
     """
+    Returns the sum along diagonals of the array.
+
+    Equivalent to `numpy.trace`
+    """
+    return diagonal(a, offset=offset, axis1=axis1, axis2=axis2).sum(-1)
+
+
+class AllocDiag(Op):
+    """An `Op` that copies a vector to the diagonal of a zero-ed matrix."""
 
     __props__ = ("offset", "axis1", "axis2")
 
@@ -3495,7 +3588,15 @@ class AllocDiag(Op):
             Axis to be used as the second axis of the 2-D sub-arrays to which
             the diagonals will be allocated.  Defaults to second axis (i.e. 1).
         """
+        warnings.warn(
+            "AllocDiag is deprecated. Use `alloc_diag` instead",
+            FutureWarning,
+        )
         self.offset = offset
+        if axis1 < 0 or axis2 < 0:
+            raise NotImplementedError("AllocDiag does not support negative axis")
+        if axis1 == axis2:
+            raise ValueError("axis1 and axis2 cannot be the same")
         self.axis1 = axis1
         self.axis2 = axis2
 
@@ -3572,12 +3673,49 @@ class AllocDiag(Op):
             self.axis2 = 1
 
 
+def alloc_diag(diag, offset=0, axis1=0, axis2=1):
+    """Insert a vector on the diagonal of a zero-ed matrix.
+
+    diagonal(alloc_diag(x)) == x
+    """
+    from pytensor.tensor import set_subtensor
+
+    diag = as_tensor_variable(diag)
+    axis1, axis2 = normalize_axis_tuple((axis1, axis2), ndim=diag.type.ndim + 1)
+    if axis1 > axis2:
+        axis1, axis2 = axis2, axis1
+
+    # Create array with one extra dimension for resulting matrix
+    result_shape = tuple(diag.shape)[:-1] + (diag.shape[-1] + abs(offset),) * 2
+    result = zeros(result_shape, dtype=diag.dtype)
+
+    # Create slice for diagonal in final 2 axes
+    idxs = arange(diag.shape[-1])
+    diagonal_slice = (slice(None),) * (len(result_shape) - 2) + (
+        idxs + np.maximum(0, -offset),
+        idxs + np.maximum(0, offset),
+    )
+
+    # Fill in final 2 axes with diag
+    result = set_subtensor(result[diagonal_slice], diag)
+
+    if diag.type.ndim > 1:
+        # Re-order axes so they correspond to diagonals at axis1, axis2
+        axes = list(range(diag.type.ndim - 1))
+        last_idx = axes[-1]
+        axes = axes[:axis1] + [last_idx + 1] + axes[axis1:]
+        axes = axes[:axis2] + [last_idx + 2] + axes[axis2:]
+        result = result.transpose(axes)
+
+    return result
+
+
 def diag(v, k=0):
     """
     A helper function for two ops: `ExtractDiag` and
     `AllocDiag`. The name `diag` is meant to keep it consistent
     with numpy. It both accepts tensor vector and tensor matrix.
-    While the passed tensor variable `v` has `v.ndim>=2`, it builds a
+    While the passed tensor variable `v` has `v.ndim==2`, it builds a
     `ExtractDiag` instance, and returns a vector with its entries equal to
     `v`'s main diagonal; otherwise if `v.ndim` is `1`, it builds an `AllocDiag`
     instance, and returns a matrix with `v` at its k-th diaogonal.
@@ -3597,11 +3735,11 @@ def diag(v, k=0):
     _v = as_tensor_variable(v)
 
     if _v.ndim == 1:
-        return AllocDiag(k)(_v)
-    elif _v.ndim >= 2:
+        return alloc_diag(_v, offset=k)
+    elif _v.ndim == 2:
         return diagonal(_v, offset=k)
     else:
-        raise ValueError("Number of dimensions of `v` must be greater than one.")
+        raise ValueError("Input must be 1- or 2-d.")
 
 
 def stacklists(arg):
@@ -3640,7 +3778,7 @@ def stacklists(arg):
         return arg
 
 
-def swapaxes(y, axis1, axis2):
+def swapaxes(y, axis1: int, axis2: int) -> TensorVariable:
     "Swap the axes of a tensor."
     y = as_tensor_variable(y)
     ndim = y.ndim
@@ -4130,6 +4268,7 @@ __all__ = [
     "full_like",
     "empty",
     "empty_like",
+    "trace",
     "tril_indices",
     "tril_indices_from",
     "triu_indices",

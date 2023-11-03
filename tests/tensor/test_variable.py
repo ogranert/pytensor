@@ -12,7 +12,7 @@ from pytensor.graph.basic import Constant, equal_computations
 from pytensor.tensor import get_vector_length
 from pytensor.tensor.basic import constant
 from pytensor.tensor.elemwise import DimShuffle
-from pytensor.tensor.math import dot, eq
+from pytensor.tensor.math import dot, eq, matmul
 from pytensor.tensor.shape import Shape
 from pytensor.tensor.subtensor import AdvancedSubtensor, Subtensor
 from pytensor.tensor.type import (
@@ -29,7 +29,7 @@ from pytensor.tensor.type import (
     tensor3,
 )
 from pytensor.tensor.type_other import MakeSlice, NoneConst
-from pytensor.tensor.var import (
+from pytensor.tensor.variable import (
     DenseTensorConstant,
     DenseTensorVariable,
     TensorConstant,
@@ -75,17 +75,38 @@ def test_numpy_method(fct, value):
     utt.assert_allclose(np.nan_to_num(f(value)), np.nan_to_num(fct(value)))
 
 
-def test_infix_dot_method():
+def test_dot_method():
+    X = dmatrix("X")
+    y = dvector("y")
+
+    res = X.dot(y)
+    exp_res = dot(X, y)
+    assert equal_computations([res], [exp_res])
+
+    # This doesn't work. Numpy calls TensorVariable.__rmul__ at some point and everything is messed up
+    X_val = np.arange(2 * 3).reshape((2, 3))
+    res = X_val.dot(y)
+    exp_res = dot(X_val, y)
+    with pytest.raises(AssertionError):
+        assert equal_computations([res], [exp_res])
+
+
+def test_infix_matmul_method():
     X = dmatrix("X")
     y = dvector("y")
 
     res = X @ y
-    exp_res = X.dot(y)
+    exp_res = matmul(X, y)
     assert equal_computations([res], [exp_res])
 
     X_val = np.arange(2 * 3).reshape((2, 3))
     res = X_val @ y
-    exp_res = dot(X_val, y)
+    exp_res = matmul(X_val, y)
+    assert equal_computations([res], [exp_res])
+
+    y_val = np.arange(3)
+    res = X @ y_val
+    exp_res = matmul(X, y_val)
     assert equal_computations([res], [exp_res])
 
 
@@ -351,7 +372,8 @@ class TestTensorInstanceMethods:
     def test_trace(self):
         X, _ = self.vars
         x, _ = self.vals
-        assert_array_equal(X.trace().eval({X: x}), x.trace())
+        with pytest.warns(FutureWarning):
+            assert_array_equal(X.trace().eval({X: x}), x.trace())
 
     def test_ravel(self):
         X, _ = self.vars
@@ -405,3 +427,15 @@ class TestTensorInstanceMethods:
         assert_array_equal(X.take(indices, 1).eval({X: x}), x.take(indices, 1))
         # Test equivalent advanced indexing
         assert_array_equal(X[:, indices].eval({X: x}), x[:, indices])
+
+
+def test_deprecated_import():
+    with pytest.warns(
+        DeprecationWarning,
+        match="The module 'pytensor.tensor.var' has been deprecated.",
+    ):
+        import pytensor.tensor.var as _var
+
+        # Make sure the deprecated import provides access to 'variable' module
+        assert hasattr(_var, "TensorVariable")
+        assert hasattr(_var, "TensorConstant")

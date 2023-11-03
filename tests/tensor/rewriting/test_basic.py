@@ -12,7 +12,7 @@ from pytensor.compile.function import function
 from pytensor.compile.mode import get_default_mode, get_mode
 from pytensor.compile.ops import DeepCopyOp, deep_copy_op
 from pytensor.configdefaults import config
-from pytensor.graph.basic import equal_computations
+from pytensor.graph.basic import equal_computations, vars_between
 from pytensor.graph.fg import FunctionGraph
 from pytensor.graph.rewriting.basic import check_stack_trace, out2in
 from pytensor.graph.rewriting.db import RewriteDatabaseQuery
@@ -31,6 +31,7 @@ from pytensor.tensor.basic import (
 )
 from pytensor.tensor.elemwise import DimShuffle, Elemwise
 from pytensor.tensor.math import (
+    Sum,
     add,
     bitwise_and,
     bitwise_or,
@@ -270,27 +271,6 @@ def test_local_fill_to_alloc():
 class TestLocalCanonicalizeAlloc:
     def setup_method(self):
         self.rng = np.random.default_rng(utt.fetch_seed())
-
-    def test_inconsistent_constant(self):
-        x = at.as_tensor(self.rng.standard_normal((3, 7)))
-        a = at.alloc(x, 6, 7)
-
-        assert a.owner and isinstance(a.owner.op, Alloc)
-
-        # `local_useless_alloc` should attempt to replace the `Alloc` with an
-        # `Assert` and fail when the static shape information conflicts.
-        with pytest.raises(TypeError):
-            f = function([], a, mode=rewrite_mode)
-
-        x = at.as_tensor(self.rng.standard_normal((6, 7)))
-        a = at.alloc(x, 6, 7)
-
-        f = function([], a, mode=rewrite_mode)
-
-        # The rewrite should then be applied, and remove Alloc
-        assert not any(
-            isinstance(node.op, (Alloc, Assert)) for node in f.maker.fgraph.toposort()
-        )
 
     def test_inconsistent_shared(self):
         # These shapes don't match!
@@ -1012,7 +992,7 @@ class TestLocalUselessSwitch:
         z = at.switch(1, x, y)
         f = function([x, y], z, mode=self.mode)
 
-        start_var = f.maker.fgraph.outputs[0].owner.inputs[0]
+        start_var = f.maker.fgraph.outputs[0]
         assert isinstance(start_var.owner.op, Elemwise)
         assert isinstance(start_var.owner.op.scalar_op, aes.basic.Cast)
         assert not any(node.op == at.switch for node in f.maker.fgraph.toposort())
@@ -1298,6 +1278,44 @@ def test_local_join_make_vector():
     assert f.maker.fgraph.outputs[0].dtype == config.floatX
 
     assert check_stack_trace(f, ops_to_check="all")
+
+
+def test_local_sum_make_vector():
+    a, b, c = scalars("abc")
+    mv = MakeVector(config.floatX)
+    output = mv(a, b, c).sum()
+
+    output = rewrite_graph(output)
+    between = vars_between([a, b, c], [output])
+    for var in between:
+        assert (var.owner is None) or (not isinstance(var.owner.op, MakeVector))
+
+    # Check for empty sum
+    a, b, c = scalars("abc")
+    mv = MakeVector(config.floatX)
+    output = mv(a, b, c).sum(axis=[])
+
+    output = rewrite_graph(output)
+    between = vars_between([a, b, c], [output])
+    for var in between:
+        assert (var.owner is None) or (not isinstance(var.owner.op, Sum))
+
+    # Check empty MakeVector
+    mv = MakeVector(config.floatX)
+    output = mv().sum()
+
+    output = rewrite_graph(output)
+    between = vars_between([a, b, c], [output])
+    for var in between:
+        assert (var.owner is None) or (not isinstance(var.owner.op, Sum))
+
+    mv = MakeVector(config.floatX)
+    output = mv(a).sum()
+
+    output = rewrite_graph(output)
+    between = vars_between([a, b, c], [output])
+    for var in between:
+        assert (var.owner is None) or (not isinstance(var.owner.op, Sum))
 
 
 @pytest.mark.parametrize(
@@ -1659,50 +1677,50 @@ class TestLocalElemwiseAlloc:
         )
 
     @pytest.mark.parametrize(
-        "expr, x_shape, y_shape",
+        "expr, x_shape, y_shape, needs_alloc",
         [
-            (lambda x, y: at.mul(at.alloc(1, *y.shape), x), (1, 2), (3, 2)),
-            (lambda x, y: at.mul(at.alloc(1, *y.shape), x), (1, 1), (1, 1)),
-            (lambda x, y: at.mul(x, at.alloc(y, 2, 3)), (1, 3), (2, 3)),
+            (lambda x, y: at.mul(at.alloc(1, *y.shape), x), (1, 2), (3, 2), True),
+            (lambda x, y: at.mul(at.alloc(1, *y.shape), x), (1, 1), (1, 1), False),
+            (lambda x, y: at.mul(x, at.alloc(y, 2, 3)), (1, 3), (2, 3), False),
             (
                 lambda x, y: at.mul(
                     at.alloc(x, 3).dimshuffle("x", 0), y.dimshuffle("x", "x")
                 ),
                 (),
                 (),
+                True,
             ),
-            pytest.param(
-                lambda x, y: at.mul(y, at.alloc(1, x)),
-                (),
-                (),
-                marks=pytest.mark.xfail(reason="Not implemented"),
-            ),
-            (lambda x, y: at.mul(at.alloc(x, 15, 1), y), (15, 1), (15, 1)),
-            (lambda x, y: at.mul(at.alloc(x, 15, 2), y), (15, 2), (15, 2)),
+            (lambda x, y: at.mul(y, at.alloc(1, x)), (), (), True),
+            (lambda x, y: at.mul(at.alloc(x, 15, 1), y), (15, 1), (15, 1), False),
+            (lambda x, y: at.mul(at.alloc(x, 15, 2), y), (15, 2), (15, 2), False),
             (
                 lambda x, y: at.mul(at.alloc(x, 15, 1), at.alloc(y, 15, 1)),
                 (15, 1),
                 (15, 1),
+                False,
             ),
             (
                 lambda x, y: at.mul(at.alloc(x, 15, 2), at.alloc(y, 15, 2)),
                 (15, 2),
                 (15, 2),
+                False,
             ),
             (
                 lambda x, y: at.mul(at.alloc(x, 15, 2).dimshuffle(1, 0), y),
                 (15, 2),
                 (2, 15),
+                False,
             ),
-            (lambda x, y: at.mul(at.alloc(x, 1, 15, 2), y), (15, 2), (15, 2)),
+            (lambda x, y: at.mul(at.alloc(x, 1, 15, 2), y), (15, 2), (15, 2), False),
             (
                 lambda x, y: at.mul(at.alloc(x, 1, 15, 2).dimshuffle(0, 2, 1), y),
                 (15, 2),
                 (2, 15),
+                False,
             ),
         ],
     )
-    def test_basic(self, expr, x_shape, y_shape):
+    def test_basic(self, expr, x_shape, y_shape, needs_alloc):
         x = at.tensor(
             dtype="int64", shape=(1 if val == 1 else None for val in x_shape), name="x"
         )
@@ -1718,10 +1736,16 @@ class TestLocalElemwiseAlloc:
             on_unused_input="ignore",
         )
 
-        assert not any(
-            isinstance(node.op, Alloc) for node in z_opt.maker.fgraph.toposort()
-        )
+        nodes = z_opt.maker.fgraph.toposort()
+        if needs_alloc:
+            # When the final result needs an Alloc, this should be the last node
+            # x = scalar; y = vector; mul(x, ones_like(y)) -> alloc(x, y.shape)
+            assert isinstance(nodes[-1].op, Alloc)
+            nodes = nodes[:-1]
 
+        assert not any(isinstance(node.op, Alloc) for node in nodes)
+
+        # Check results are the same without the optimization
         z_no_opt = pytensor.function(
             [x, y],
             z,
@@ -1765,7 +1789,7 @@ class TestLocalElemwiseAlloc:
             [self.vec, self.mat], self.alloc_wo_dep + self.mat, mode=self.fast_run_mode
         )
         self.verify_op_count(func, 0, Alloc)
-        self.verify_op_count(func, 2, Assert)
+        self.verify_op_count(func, 1, SpecifyShape)
 
         func = function(
             [self.vec, self.mat],
@@ -1773,7 +1797,7 @@ class TestLocalElemwiseAlloc:
             mode=self.fast_run_mode,
         )
         self.verify_op_count(func, 0, Alloc)
-        self.verify_op_count(func, 1, Assert)
+        self.verify_op_count(func, 1, SpecifyShape)
 
         # No optimization on alloc without assert
         func = function(
@@ -1805,7 +1829,10 @@ class TestLocalElemwiseAlloc:
             self.alloc_w_dep_broad2 + self.mat,
             mode=self.fast_run_mode,
         )
-        self.verify_op_count(func, 0, Alloc)
+        # This graph requires one outer Alloc and an Assert
+        # To make sure `mat` is square since we end up doing
+        # broadcast_to(x, mat[..., None].shape) + mat[None, ...]
+        self.verify_op_count(func, 1, Alloc)
         self.verify_op_count(func, 1, Assert)
 
     def test_remove_alloc_w_dimshuffle(self):
@@ -1817,16 +1844,13 @@ class TestLocalElemwiseAlloc:
         self.verify_op_count(func, 1, Alloc)
         self.verify_op_count(func, 0, Assert)
 
-        # TODO FIXME: The `BroadcastTo` shapes should use the constants
-        # provided by the first/`Alloc` term, and not the unknown values from
-        # the `tens` term.
         func = function(
             [self.vec, self.tens],
             self.alloc_wo_dep.dimshuffle(0, 1, "x") + self.tens,
             mode=self.fast_run_mode,
         )
         self.verify_op_count(func, 0, Alloc)
-        self.verify_op_count(func, 2, Assert)
+        self.verify_op_count(func, 1, SpecifyShape)
 
         func = function(
             [self.vec, self.tens],
@@ -1854,16 +1878,13 @@ class TestLocalElemwiseAlloc:
         self.verify_op_count(func, 2, Alloc)
         self.verify_op_count(func, 0, Assert)
 
-        # Optimization on dimshuffle with assert
-        # TODO: When we support static shape constraints like `shape[i] != 1`,
-        # reproduce this with such a constraint on `mat` and make sure the
-        # `BroadcastTo` is removed.
         func = function(
             [self.vec, self.mat],
             self.tv_wo_dep + self.tm_wo_dep,
             mode=self.fast_run_mode,
         )
-        self.verify_op_count(func, 0, Alloc)
+        # It still needs an outer alloc to broadcast final shape
+        self.verify_op_count(func, 1, Alloc)
         self.verify_op_count(func, 0, Assert)
 
         # No optimization on dimshuffle without assert
@@ -1875,27 +1896,40 @@ class TestLocalElemwiseAlloc:
         self.verify_op_count(func, 2, Alloc)
         self.verify_op_count(func, 0, Assert)
 
-        # Optimization on dimshuffle without assert
         func = function(
             [self.vec, self.mat, self.s],
             self.tv_w_dep + self.tm_w_dep,
             mode=self.fast_run_mode,
         )
-        self.verify_op_count(func, 0, Alloc)
-        # The second assert is from the shape check...
-        self.verify_op_count(func, 2, Assert)
+        # It still needs an outer alloc to broadcast final shape
+        self.verify_op_count(func, 1, Alloc)
+        self.verify_op_count(func, 0, Assert)
 
     def test_misc(self):
-        x = row(dtype=self.dtype)
-        y = tensor(dtype=self.dtype, shape=(None, None, 1))
+        x = row("x", dtype=self.dtype)
+        y = tensor("y", dtype=self.dtype, shape=(None, None, 1))
 
         out = at.alloc(x, 5, 5).dimshuffle(0, 1, "x") + y
         func = function([y, x], out, mode=self.fast_run_mode)
 
         self.verify_op_count(func, 0, Alloc)
-        self.verify_op_count(func, 2, Assert)
+        self.verify_op_count(func, 1, SpecifyShape)
 
         y_val = np.random.random((5, 5, 1)).astype(self.dtype)
         x_val = np.random.random((1, 5)).astype(self.dtype)
         exp_res = np.broadcast_to(x_val, (5, 5))[..., None] + y_val
         assert np.array_equal(func(y_val, x_val), exp_res)
+
+
+def test_shape_unsafe_tag():
+    mode = get_mode("FAST_RUN")
+    x = vector("x")
+    y = vector("y")
+    out = x * y / y
+
+    fn = function([x, y], out, mode=mode)
+    np.testing.assert_equal(fn([0, 1], [2, 3, 4]), [0, 1])
+
+    fn = function([x, y], out, mode=mode.excluding("shape_unsafe"))
+    with pytest.raises(ValueError):
+        fn([0, 1], [2, 3, 4]), [0, 1]

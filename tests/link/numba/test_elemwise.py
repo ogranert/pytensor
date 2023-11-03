@@ -9,6 +9,7 @@ import pytensor.tensor as at
 import pytensor.tensor.inplace as ati
 import pytensor.tensor.math as aem
 from pytensor import config, function
+from pytensor.compile import get_mode
 from pytensor.compile.ops import deep_copy_op
 from pytensor.compile.sharedvalue import SharedVariable
 from pytensor.gradient import grad
@@ -22,6 +23,7 @@ from tests.link.numba.test_basic import (
     scalar_my_multi_out,
     set_test_value,
 )
+from tests.tensor.test_elemwise import TestElemwise
 
 
 rng = np.random.default_rng(42849)
@@ -117,6 +119,11 @@ def test_Elemwise(inputs, input_vals, output_fn, exc):
     cm = contextlib.suppress() if exc is None else pytest.raises(exc)
     with cm:
         compare_numba_and_py(out_fg, input_vals)
+
+
+@pytest.mark.xfail(reason="Logic had to be reversed due to surprising segfaults")
+def test_elemwise_runtime_broadcast():
+    TestElemwise.check_runtime_broadcast(get_mode("NUMBA"))
 
 
 def test_elemwise_speed(benchmark):
@@ -438,6 +445,16 @@ def test_SoftmaxGrad(dy, sm, axis, exc):
         )
 
 
+def test_SoftMaxGrad_constant_dy():
+    dy = at.constant(np.zeros((3,), dtype=config.floatX))
+    sm = at.vector(shape=(3,))
+
+    g = SoftmaxGrad(axis=None)(dy, sm)
+    g_fg = FunctionGraph(outputs=[g])
+
+    compare_numba_and_py(g_fg, [np.ones((3,), dtype=config.floatX)])
+
+
 @pytest.mark.parametrize(
     "x, axis, exc",
     [
@@ -588,3 +605,18 @@ def test_fused_elemwise_benchmark(benchmark):
     # JIT compile first
     func()
     benchmark(func)
+
+
+def test_elemwise_out_type():
+    # Create a graph with an elemwise
+    # Ravel failes if the elemwise output type is reported incorrectly
+    x = at.matrix()
+    y = (2 * x).ravel()
+
+    # Pass in the input as mutable, to trigger the inplace rewrites
+    func = pytensor.function([pytensor.In(x, mutable=True)], y, mode="NUMBA")
+
+    # Apply it to a numpy array that is neither C or F contigous
+    x_val = np.broadcast_to(np.zeros((3,)), (6, 3))
+
+    assert func(x_val).shape == (18,)

@@ -428,12 +428,11 @@ class TestSameShape:
         # could have shapes `(1,)` and/or `(n,)`, where `n != 1`, or any
         # combination of the two.
         assert not shape_feature.same_shape(x, o)
-        # The following case isn't implemented
         assert not shape_feature.same_shape(y, o)
 
     @pytest.mark.parametrize(
         "y_dim_0",
-        [2, pytest.param(None, marks=pytest.mark.xfail(reason="Not implemented"))],
+        [2, None],
     )
     def test_vector_dim(self, y_dim_0):
         x = at.tensor(dtype="floatX", shape=(2, None))
@@ -489,6 +488,14 @@ def test_local_Shape_of_SpecifyShape_partial(s1):
     assert x in fgraph.variables
     assert s1 in fgraph.variables
     assert not any(isinstance(apply.op, SpecifyShape) for apply in fgraph.apply_nodes)
+
+
+def test_local_specify_shape_lift():
+    x = vector("x")
+    out = specify_shape([1.0] + x, shape=(5,))
+
+    new_out = rewrite_graph(out)
+    assert equal_computations([new_out], [[1.0] + specify_shape(x, shape=(5,))])
 
 
 def test_local_Shape_i_ground():

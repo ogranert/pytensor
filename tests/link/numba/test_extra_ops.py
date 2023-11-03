@@ -37,41 +37,6 @@ def test_Bartlett(val):
 
 
 @pytest.mark.parametrize(
-    "x, shape",
-    [
-        (
-            set_test_value(at.vector(), rng.random(size=(2,)).astype(config.floatX)),
-            [set_test_value(at.lscalar(), np.array(v)) for v in [3, 2]],
-        ),
-        (
-            set_test_value(at.vector(), rng.random(size=(2,)).astype(config.floatX)),
-            [at.as_tensor(3, dtype=np.int64), at.as_tensor(2, dtype=np.int64)],
-        ),
-        (
-            set_test_value(at.vector(), rng.random(size=(2,)).astype(config.floatX)),
-            at.as_tensor([set_test_value(at.lscalar(), np.array(v)) for v in [3, 2]]),
-        ),
-        (
-            set_test_value(at.vector(), rng.random(size=(2,)).astype(config.floatX)),
-            [at.as_tensor(3, dtype=np.int8), at.as_tensor(2, dtype=np.int64)],
-        ),
-    ],
-)
-def test_BroadcastTo(x, shape):
-    g = extra_ops.BroadcastTo()(x, shape)
-    g_fg = FunctionGraph(outputs=[g])
-
-    compare_numba_and_py(
-        g_fg,
-        [
-            i.tag.test_value
-            for i in g_fg.inputs
-            if not isinstance(i, (SharedVariable, Constant))
-        ],
-    )
-
-
-@pytest.mark.parametrize(
     "val, axis, mode",
     [
         (
@@ -106,6 +71,13 @@ def test_BroadcastTo(x, shape):
             set_test_value(
                 at.matrix(), np.arange(6, dtype=config.floatX).reshape((3, 2))
             ),
+            None,
+            "add",
+        ),
+        (
+            set_test_value(
+                at.matrix(), np.arange(6, dtype=config.floatX).reshape((3, 2))
+            ),
             0,
             "mul",
         ),
@@ -114,6 +86,13 @@ def test_BroadcastTo(x, shape):
                 at.matrix(), np.arange(6, dtype=config.floatX).reshape((3, 2))
             ),
             1,
+            "mul",
+        ),
+        (
+            set_test_value(
+                at.matrix(), np.arange(6, dtype=config.floatX).reshape((3, 2))
+            ),
+            None,
             "mul",
         ),
     ],

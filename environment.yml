@@ -9,7 +9,7 @@ channels:
 dependencies:
   - python
   - compilers
-  - numpy>=1.17.0
+  - numpy>=1.17.0,<1.26.0
   - scipy>=0.14
   - filelock
   - etuples
@@ -31,6 +31,7 @@ dependencies:
   - pytest-cov
   - pytest-xdist
   - pytest-benchmark
+  - pytest-mock
   # For building docs
   - sphinx>=5.1.0,<6
   - sphinx_rtd_theme

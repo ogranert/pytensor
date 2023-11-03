@@ -8,7 +8,6 @@ from pytensor.link.jax.dispatch.basic import jax_funcify
 from pytensor.tensor import get_vector_length
 from pytensor.tensor.basic import (
     Alloc,
-    AllocDiag,
     AllocEmpty,
     ARange,
     ExtractDiag,
@@ -22,6 +21,7 @@ from pytensor.tensor.basic import (
     get_underlying_scalar_constant_value,
 )
 from pytensor.tensor.exceptions import NotScalarConstantError
+from pytensor.tensor.shape import Shape_i
 
 
 ARANGE_CONCRETE_VALUE_ERROR = """JAX requires the arguments of `jax.numpy.arange`
@@ -30,16 +30,6 @@ by JAX. An example of a graph that can be compiled to JAX:
 >>> import pytensor.tensor basic
 >>> at.arange(1, 10, 2)
 """
-
-
-@jax_funcify.register(AllocDiag)
-def jax_funcify_AllocDiag(op, **kwargs):
-    offset = op.offset
-
-    def allocdiag(v, offset=offset):
-        return jnp.diag(v, k=offset)
-
-    return allocdiag
 
 
 @jax_funcify.register(AllocEmpty)
@@ -51,9 +41,10 @@ def jax_funcify_AllocEmpty(op, **kwargs):
 
 
 @jax_funcify.register(Alloc)
-def jax_funcify_Alloc(op, **kwargs):
+def jax_funcify_Alloc(op, node, **kwargs):
     def alloc(x, *shape):
         res = jnp.broadcast_to(x, shape)
+        Alloc._check_runtime_broadcast(node, jnp.asarray(x), res.shape)
         return res
 
     return alloc
@@ -72,14 +63,20 @@ def jax_funcify_ARange(op, node, **kwargs):
     arange_args = node.inputs
     constant_args = []
     for arg in arange_args:
-        if not isinstance(arg, Constant):
+        if arg.owner and isinstance(arg.owner.op, Shape_i):
+            constant_args.append(None)
+        elif isinstance(arg, Constant):
+            constant_args.append(arg.value)
+        else:
+            # TODO: This might be failing without need (e.g., if arg = shape(x)[-1] + 1)!
             raise NotImplementedError(ARANGE_CONCRETE_VALUE_ERROR)
 
-        constant_args.append(arg.value)
+    constant_start, constant_stop, constant_step = constant_args
 
-    start, stop, step = constant_args
-
-    def arange(*_):
+    def arange(start, stop, step):
+        start = start if constant_start is None else constant_start
+        stop = stop if constant_stop is None else constant_stop
+        step = step if constant_step is None else constant_step
         return jnp.arange(start, stop, step, dtype=op.dtype)
 
     return arange

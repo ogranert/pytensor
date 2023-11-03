@@ -14,7 +14,7 @@ from pytensor.compile.io import In, Out
 from pytensor.compile.mode import Mode, get_default_mode
 from pytensor.compile.ops import DeepCopyOp
 from pytensor.gradient import grad, hessian
-from pytensor.graph.basic import Apply
+from pytensor.graph.basic import Apply, equal_computations
 from pytensor.graph.op import Op
 from pytensor.graph.replace import clone_replace
 from pytensor.misc.safe_asarray import _asarray
@@ -23,7 +23,6 @@ from pytensor.scalar import autocast_float, autocast_float_as
 from pytensor.tensor import NoneConst
 from pytensor.tensor.basic import (
     Alloc,
-    AllocDiag,
     AllocEmpty,
     ARange,
     Choose,
@@ -78,6 +77,7 @@ from pytensor.tensor.basic import (
     tensor_copy,
     tensor_from_scalar,
     tile,
+    trace,
     tri,
     tril,
     tril_indices,
@@ -92,7 +92,7 @@ from pytensor.tensor.elemwise import DimShuffle
 from pytensor.tensor.exceptions import NotScalarConstantError
 from pytensor.tensor.math import dense_dot
 from pytensor.tensor.math import sum as at_sum
-from pytensor.tensor.shape import Reshape, Shape, Shape_i, shape_padright, specify_shape
+from pytensor.tensor.shape import Reshape, Shape_i, shape_padright, specify_shape
 from pytensor.tensor.type import (
     TensorType,
     bscalar,
@@ -126,7 +126,7 @@ from pytensor.tensor.type import (
     vectors,
     wvector,
 )
-from pytensor.tensor.var import TensorConstant
+from pytensor.tensor.variable import TensorConstant
 from pytensor.utils import PYTHON_INT_BITWIDTH
 from tests import unittest_tools as utt
 from tests.tensor.utils import (
@@ -720,6 +720,39 @@ class TestAlloc:
     shared = staticmethod(pytensor.shared)
     allocs = [Alloc()] * 3
 
+    @staticmethod
+    def check_allocs_in_fgraph(fgraph, n):
+        assert (
+            len([node for node in fgraph.apply_nodes if isinstance(node.op, Alloc)])
+            == n
+        )
+
+    @staticmethod
+    def check_runtime_broadcast(mode):
+        """Check we emmit a clear error when runtime broadcasting would occur according to Numpy rules."""
+        floatX = config.floatX
+        x_v = vector("x", shape=(None,))
+
+        out = alloc(x_v, 5, 3)
+        f = pytensor.function([x_v], out, mode=mode)
+        TestAlloc.check_allocs_in_fgraph(f.maker.fgraph, 1)
+
+        np.testing.assert_array_equal(
+            f(x=np.zeros((3,), dtype=floatX)),
+            np.zeros((5, 3), dtype=floatX),
+        )
+        with pytest.raises(ValueError, match="Runtime broadcasting not allowed"):
+            f(x=np.zeros((1,), dtype=floatX))
+
+        out = alloc(specify_shape(x_v, (1,)), 5, 3)
+        f = pytensor.function([x_v], out, mode=mode)
+        TestAlloc.check_allocs_in_fgraph(f.maker.fgraph, 1)
+
+        np.testing.assert_array_equal(
+            f(x=np.zeros((1,), dtype=floatX)),
+            np.zeros((5, 3), dtype=floatX),
+        )
+
     def setup_method(self):
         self.rng = np.random.default_rng(seed=utt.fetch_seed())
 
@@ -834,6 +867,44 @@ class TestAlloc:
         assert y_new.type.shape == (100,)
         assert y_new.shape.eval({x_new: x_new_test}) == (100,)
         assert y_new.eval({x_new: x_new_test}).shape == (100,)
+
+    def test_static_shape(self):
+        x = tensor(shape=(None, 1, 5))
+        d0 = scalar("d0", dtype=int)
+        d1 = scalar("d1", dtype=int)
+        assert at.alloc(x, 3, 1, 5).type.shape == (3, 1, 5)
+        assert at.alloc(x, 3, 4, 5).type.shape == (3, 4, 5)
+        assert at.alloc(x, d0, d1, 5).type.shape == (None, None, 5)
+        assert at.alloc(x, d0, 1, d1).type.shape == (None, 1, 5)
+
+        msg = "Alloc static input type and target shape are incompatible"
+        with pytest.raises(ValueError, match=msg):
+            at.alloc(x, 3, 1, 1)
+
+        with pytest.raises(ValueError, match=msg):
+            at.alloc(x, 3, 1, 6)
+
+    def test_alloc_of_view_linker(self):
+        """Check we can allocate a new array properly in the C linker when input is a view."""
+        floatX = config.floatX
+
+        x_v = vector("x", shape=(None,))
+        dim_len = scalar("dim_len", dtype=int)
+        out = alloc(specify_shape(x_v, (1,)), 5, dim_len)
+
+        f = pytensor.function([x_v, dim_len], out, mode=Mode("c"))
+        assert equal_computations(
+            f.maker.fgraph.outputs, [alloc(specify_shape(x_v, (1,)), 5, dim_len)]
+        )
+
+        np.testing.assert_array_equal(
+            f(x=np.zeros((1,), dtype=floatX), dim_len=3),
+            np.zeros((5, 3), dtype=floatX),
+        )
+
+    @pytest.mark.parametrize("mode", (Mode("py"), Mode("c")))
+    def test_runtime_broadcast(self, mode):
+        self.check_runtime_broadcast(mode)
 
 
 def test_infer_shape():
@@ -1975,8 +2046,14 @@ class TestJoinAndSplit:
     def test_static_shape_inference(self):
         a = at.tensor(dtype="int8", shape=(2, 3))
         b = at.tensor(dtype="int8", shape=(2, 5))
-        assert at.join(1, a, b).type.shape == (2, 8)
-        assert at.join(-1, a, b).type.shape == (2, 8)
+
+        res = at.join(1, a, b).type.shape
+        assert res == (2, 8)
+        assert all(isinstance(s, int) for s in res)
+
+        res = at.join(-1, a, b).type.shape
+        assert res == (2, 8)
+        assert all(isinstance(s, int) for s in res)
 
         # Check early informative errors from static shape info
         with pytest.raises(ValueError, match="must match exactly"):
@@ -1984,8 +2061,9 @@ class TestJoinAndSplit:
 
         # Check partial inference
         d = at.tensor(dtype="int8", shape=(2, None))
-        assert at.join(1, a, b, d).type.shape == (2, None)
-        return
+        res = at.join(1, a, b, d).type.shape
+        assert res == (2, None)
+        assert isinstance(res[0], int)
 
     def test_split_0elem(self):
         rng = np.random.default_rng(seed=utt.fetch_seed())
@@ -3536,16 +3614,10 @@ class TestDiag:
     """
     Test that linalg.diag has the same behavior as numpy.diag.
     numpy.diag has two behaviors:
-    (1) when given a vector, it returns a matrix with that vector as the
-    diagonal.
-    (2) when given a matrix, returns a vector which is the diagonal of the
-    matrix.
+    (1) when given a vector, it returns a matrix with that vector as the diagonal.
+    (2) when given a matrix, returns a vector which is the diagonal of the matrix.
 
-    (1) and (2) are tested by test_alloc_diag and test_extract_diag
-    respectively.
-
-    test_diag test makes sure that linalg.diag instantiates
-    the right op based on the dimension of the input.
+    (1) and (2) are further tested by TestAllocDiag and TestExtractDiag, respectively.
     """
 
     def setup_method(self):
@@ -3555,12 +3627,12 @@ class TestDiag:
         self.type = TensorType
 
     def test_diag(self):
+        """Makes sure that diag instantiates the right op based on the dimension of the input."""
         rng = np.random.default_rng(utt.fetch_seed())
 
         # test vector input
         x = vector()
         g = diag(x)
-        assert isinstance(g.owner.op, AllocDiag)
         f = pytensor.function([x], g)
         for shp in [5, 0, 1]:
             m = rng.random(shp).astype(self.floatX)
@@ -3582,52 +3654,66 @@ class TestDiag:
             # The right matrix is created
             assert (r == v).all()
 
-        # Test scalar input
-        xx = scalar()
-        with pytest.raises(ValueError):
-            diag(xx)
-
         # Test passing a list
         xx = [[1, 2], [3, 4]]
         g = diag(xx)
         f = function([], g)
         assert np.array_equal(f(), np.diag(xx))
 
-    def test_infer_shape(self):
+    @pytest.mark.parametrize("inp", (scalar, tensor3))
+    def test_diag_invalid_input_ndim(self, inp):
+        x = inp()
+        with pytest.raises(ValueError, match="Input must be 1- or 2-d."):
+            diag(x)
+
+
+class TestExtractDiag:
+    @pytest.mark.parametrize("axis1, axis2", [(0, 1), (1, 0)])
+    @pytest.mark.parametrize("offset", (-1, 0, 2))
+    def test_infer_shape(self, offset, axis1, axis2):
         rng = np.random.default_rng(utt.fetch_seed())
 
-        x = vector()
-        g = diag(x)
-        f = pytensor.function([x], g.shape)
-        topo = f.maker.fgraph.toposort()
-        if config.mode != "FAST_COMPILE":
-            assert sum(isinstance(node.op, AllocDiag) for node in topo) == 0
-        for shp in [5, 0, 1]:
-            m = rng.random(shp).astype(self.floatX)
-            assert (f(m) == np.diag(m).shape).all()
-
-        x = matrix()
-        g = diag(x)
+        x = matrix("x")
+        g = ExtractDiag(offset=offset, axis1=axis1, axis2=axis2)(x)
         f = pytensor.function([x], g.shape)
         topo = f.maker.fgraph.toposort()
         if config.mode != "FAST_COMPILE":
             assert sum(isinstance(node.op, ExtractDiag) for node in topo) == 0
         for shp in [(5, 3), (3, 5), (5, 1), (1, 5), (5, 0), (0, 5), (1, 0), (0, 1)]:
-            m = rng.random(shp).astype(self.floatX)
-            assert (f(m) == np.diag(m).shape).all()
+            m = rng.random(shp).astype(config.floatX)
+            assert (
+                f(m) == np.diagonal(m, offset=offset, axis1=axis1, axis2=axis2).shape
+            ).all()
 
-    def test_diag_grad(self):
+    @pytest.mark.parametrize("axis1, axis2", [(0, 1), (1, 0)])
+    @pytest.mark.parametrize("offset", (0, 1, -1))
+    def test_grad_2d(self, offset, axis1, axis2):
+        diag_fn = ExtractDiag(offset=offset, axis1=axis1, axis2=axis2)
         rng = np.random.default_rng(utt.fetch_seed())
-        x = rng.random(5)
-        utt.verify_grad(diag, [x], rng=rng)
         x = rng.random((5, 3))
-        utt.verify_grad(diag, [x], rng=rng)
+        utt.verify_grad(diag_fn, [x], rng=rng)
+
+    @pytest.mark.parametrize(
+        "axis1, axis2",
+        [
+            (0, 1),
+            (1, 0),
+            (1, 2),
+            (2, 1),
+            (0, 2),
+            (2, 0),
+        ],
+    )
+    @pytest.mark.parametrize("offset", (0, 1, -1))
+    def test_grad_3d(self, offset, axis1, axis2):
+        diag_fn = ExtractDiag(offset=offset, axis1=axis1, axis2=axis2)
+        rng = np.random.default_rng(utt.fetch_seed())
+        x = rng.random((5, 4, 3))
+        utt.verify_grad(diag_fn, [x], rng=rng)
 
 
 class TestAllocDiag:
-    def setup_method(self):
-        self.alloc_diag = AllocDiag
-        self.mode = pytensor.compile.mode.get_default_mode()
+    # TODO: Separate perform, grad and infer_shape tests
 
     def _generator(self):
         dims = 4
@@ -3658,44 +3744,45 @@ class TestAllocDiag:
                 (-2, 0, 1),
                 (-1, 1, 2),
             ]:
-                # Test AllocDiag values
+                # Test perform
                 if np.maximum(axis1, axis2) > len(test_val.shape):
                     continue
-                adiag_op = self.alloc_diag(offset=offset, axis1=axis1, axis2=axis2)
-                f = pytensor.function([x], adiag_op(x))
-                # AllocDiag and extract the diagonal again
-                # to check
+                diag_x = at.alloc_diag(x, offset=offset, axis1=axis1, axis2=axis2)
+                f = pytensor.function([x], diag_x)
+                # alloc_diag and extract the diagonal again to check for correctness
                 diag_arr = f(test_val)
                 rediag = np.diagonal(diag_arr, offset=offset, axis1=axis1, axis2=axis2)
                 assert np.all(rediag == test_val)
 
                 # Test infer_shape
-                f_shape = pytensor.function([x], adiag_op(x).shape, mode="FAST_RUN")
+                f_shape = pytensor.function([x], diag_x.shape, mode="FAST_RUN")
 
-                # pytensor.printing.debugprint(f_shape.maker.fgraph.outputs[0])
                 output_shape = f_shape(test_val)
-                assert not any(
-                    isinstance(node.op, self.alloc_diag)
-                    for node in f_shape.maker.fgraph.toposort()
-                )
                 rediag_shape = np.diagonal(
                     np.ones(output_shape), offset=offset, axis1=axis1, axis2=axis2
                 ).shape
                 assert np.all(rediag_shape == test_val.shape)
 
-                diag_x = adiag_op(x)
+                # Test grad
                 sum_diag_x = at_sum(diag_x)
                 grad_x = pytensor.grad(sum_diag_x, x)
                 grad_diag_x = pytensor.grad(sum_diag_x, diag_x)
-                f_grad_x = pytensor.function([x], grad_x, mode=self.mode)
-                f_grad_diag_x = pytensor.function([x], grad_diag_x, mode=self.mode)
+                f_grad_x = pytensor.function([x], grad_x)
+                f_grad_diag_x = pytensor.function([x], grad_diag_x)
                 grad_input = f_grad_x(test_val)
                 grad_diag_input = f_grad_diag_x(test_val)
                 true_grad_input = np.diagonal(
                     grad_diag_input, offset=offset, axis1=axis1, axis2=axis2
                 )
-
                 assert np.all(true_grad_input == grad_input)
+
+
+def test_diagonal_negative_axis():
+    x = np.arange(2 * 3 * 3).reshape((2, 3, 3))
+    np.testing.assert_allclose(
+        at.diagonal(x, axis1=-1, axis2=-2).eval(),
+        np.diagonal(x, axis1=-1, axis2=-2),
+    )
 
 
 def test_transpose():
@@ -3857,20 +3944,6 @@ class TestInferShape(utt.InferShapeTester):
         self._compile_and_check([atens3], [atens3_diag], [atens3_val], ExtractDiag)
         atens3_diag = ExtractDiag(1, 2, 0)(atens3)
         self._compile_and_check([atens3], [atens3_diag], [atens3_val], ExtractDiag)
-
-    def test_AllocDiag(self):
-        advec = dvector()
-        advec_val = random(4)
-        self._compile_and_check([advec], [AllocDiag()(advec)], [advec_val], AllocDiag)
-
-        # Shape
-        # 'opt.Makevector' precludes optimizer from disentangling
-        # elements of shape
-        adtens = tensor3()
-        adtens_val = random(4, 5, 3)
-        self._compile_and_check(
-            [adtens], [Shape()(adtens)], [adtens_val], (MakeVector, Shape)
-        )
 
     def test_Split(self):
         aiscal = iscalar()
@@ -4424,3 +4497,23 @@ def test_oriented_stack_functions(func):
 
     with pytest.raises(ValueError):
         func(a, a)
+
+
+def test_trace():
+    x_val = np.ones((5, 4, 2))
+    x = at.as_tensor(x_val)
+
+    np.testing.assert_allclose(
+        trace(x).eval(),
+        np.trace(x_val),
+    )
+
+    np.testing.assert_allclose(
+        trace(x, offset=1, axis1=1, axis2=2).eval(),
+        np.trace(x_val, offset=1, axis1=1, axis2=2),
+    )
+
+    np.testing.assert_allclose(
+        trace(x, offset=-1, axis1=0, axis2=-1).eval(),
+        np.trace(x_val, offset=-1, axis1=0, axis2=-1),
+    )

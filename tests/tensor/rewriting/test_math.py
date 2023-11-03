@@ -29,8 +29,9 @@ from pytensor.graph.rewriting.db import RewriteDatabaseQuery
 from pytensor.graph.rewriting.utils import is_same_graph, rewrite_graph
 from pytensor.misc.safe_asarray import _asarray
 from pytensor.printing import debugprint
+from pytensor.scalar import Pow
 from pytensor.tensor import inplace
-from pytensor.tensor.basic import Alloc, join, switch
+from pytensor.tensor.basic import Alloc, constant, join, second, switch
 from pytensor.tensor.blas import Dot22, Gemv
 from pytensor.tensor.blas_c import CGemv
 from pytensor.tensor.elemwise import CAReduce, DimShuffle, Elemwise
@@ -69,7 +70,7 @@ from pytensor.tensor.math import max as at_max
 from pytensor.tensor.math import maximum
 from pytensor.tensor.math import min as at_min
 from pytensor.tensor.math import minimum, mul, neg, neq
-from pytensor.tensor.math import pow as at_pow
+from pytensor.tensor.math import pow as pt_pow
 from pytensor.tensor.math import (
     prod,
     rad2deg,
@@ -96,7 +97,7 @@ from pytensor.tensor.rewriting.math import (
     perform_sigm_times_exp,
     simplify_mul,
 )
-from pytensor.tensor.shape import Reshape, Shape_i, SpecifyShape
+from pytensor.tensor.shape import Reshape, Shape_i, SpecifyShape, specify_shape
 from pytensor.tensor.type import (
     TensorType,
     cmatrix,
@@ -125,7 +126,7 @@ from pytensor.tensor.type import (
     vectors,
     zscalar,
 )
-from pytensor.tensor.var import TensorConstant
+from pytensor.tensor.variable import TensorConstant
 from tests import unittest_tools as utt
 
 
@@ -607,8 +608,7 @@ class TestAlgebraicCanonizer:
                 ((fx / fy) / fx, [fx, fy], [fxv, fyv], 1, "float32"),
                 ((dv / dy) / dv, [dv, dy], [dvv, dyv], 1, "float64"),
                 ((fv / fy) / fv, [fv, fy], [fvv, fyv], 1, "float32"),
-                # must broadcast as their is a dimshuffle in the computation
-                # The broadcast leads to an extra elemwise to check compatibility
+                # must broadcast as there is a dimshuffle in the computation
                 ((dx / dv) / dx, [dx, dv], [dxv, dvv], 2, "float64"),
                 # topo: [Shape_i, Shape_i, Elemwise{reciprocal,no_inplace}(<TensorType(float64, row)>), Alloc]
                 ((fx / fv) / fx, [fx, fv], [fxv, fvv], 2, "float32"),
@@ -978,6 +978,28 @@ class TestAlgebraicCanonizer:
         )
         # No rewrite was applied
         assert z_rewritten is z
+
+    def test_shape_specified_by_constant(self):
+        x = vector("x")
+        const = np.full(shape=(5,), fill_value=2.0).astype(config.floatX)
+        out = x * const
+
+        new_out = rewrite_graph(
+            out, custom_rewrite=in2out(local_mul_canonizer, name="test")
+        )
+        expected_out = np.array([2.0]).astype(config.floatX) * specify_shape(x, (5,))
+        assert equal_computations([new_out], [expected_out])
+
+    def test_broadcasted_by_constant(self):
+        x = vector("x")
+        const = np.full(shape=(3, 5), fill_value=2.0).astype(config.floatX)
+        out = x * const
+
+        new_out = rewrite_graph(
+            out, custom_rewrite=in2out(local_mul_canonizer, name="test")
+        )
+        expected_out = second(const, np.array([[2.0]], dtype=config.floatX) * x)
+        assert equal_computations([new_out], [expected_out])
 
 
 def test_local_merge_abs():
@@ -1725,6 +1747,29 @@ def test_local_pow_to_nested_squaring():
     utt.assert_allclose(f(val_no0), val_no0 ** (-16))
 
 
+def test_local_pow_to_nested_squaring_fails_gracefully():
+    # Reported in #456
+
+    x = vector("x", shape=(1,))
+    # Create an Apply that does not have precise output shape
+    node = Apply(
+        op=pt_pow,
+        inputs=[x, constant([2.0])],
+        outputs=[tensor(shape=(None,))],
+    )
+    y = node.default_output()
+
+    fn = function([x], y)
+
+    # Check rewrite is not applied (this could change in the future)
+    assert any(
+        (isinstance(node.op, Elemwise) and isinstance(node.op.scalar_op, Pow))
+        for node in fn.maker.fgraph.apply_nodes
+    )
+
+    np.testing.assert_allclose(fn([2.0]), np.array([4.0]))
+
+
 class TestFuncInverse:
     def setup_method(self):
         mode = get_default_mode()
@@ -2428,7 +2473,7 @@ class TestLocalMergeSwitchSameCond:
             le,
             eq,
             neq,
-            at_pow,
+            pt_pow,
         ):
             g = rewrite(FunctionGraph(mats, [op(s1, s2)]))
             assert debugprint(g, file="str").count("Switch") == 1

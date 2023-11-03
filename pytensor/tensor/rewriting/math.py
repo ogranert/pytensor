@@ -30,7 +30,6 @@ from pytensor.tensor.basic import (
     cast,
     constant,
     extract_constant,
-    fill,
     get_underlying_scalar_constant_value,
     ones_like,
     switch,
@@ -38,6 +37,7 @@ from pytensor.tensor.basic import (
 )
 from pytensor.tensor.elemwise import CAReduce, DimShuffle, Elemwise
 from pytensor.tensor.exceptions import NotScalarConstantError
+from pytensor.tensor.extra_ops import broadcast_arrays
 from pytensor.tensor.math import (
     All,
     Any,
@@ -83,8 +83,8 @@ from pytensor.tensor.math import (
 from pytensor.tensor.math import sum as at_sum
 from pytensor.tensor.math import true_div
 from pytensor.tensor.rewriting.basic import (
-    broadcast_like,
-    encompasses_broadcastable,
+    alloc_like,
+    broadcasted_by,
     local_fill_sink,
     register_canonicalize,
     register_specialize,
@@ -101,7 +101,7 @@ from pytensor.tensor.type import (
     values_eq_approx_remove_inf_nan,
     values_eq_approx_remove_nan,
 )
-from pytensor.tensor.var import TensorConstant, get_unique_value
+from pytensor.tensor.variable import TensorConstant, get_unique_constant_value
 
 
 def scalarconsts_rest(inputs, elemwise=True, only_process_constants=False):
@@ -133,7 +133,7 @@ def get_constant(v):
 
     """
     if isinstance(v, Constant):
-        unique_value = get_unique_value(v)
+        unique_value = get_unique_constant_value(v)
         if unique_value is not None:
             data = unique_value
         else:
@@ -146,12 +146,6 @@ def get_constant(v):
         return None
     else:
         return v
-
-
-def fill_chain(new_out, orig_inputs):
-    for i in orig_inputs:
-        new_out = fill(i, new_out)
-    return [new_out]
 
 
 @register_canonicalize
@@ -1135,10 +1129,12 @@ class AlgebraicCanonizer(NodeRewriter):
         if new.type.dtype != out.type.dtype:
             new = cast(new, out.type.dtype)
 
-        if new.type != out.type:
-            new = fill_chain(new, node.inputs)[0]
+        if new.type.broadcastable != out.type.broadcastable:
+            new = broadcast_arrays(new, *node.inputs)[0]
 
-        if new.type == out.type:
+        if (new.type.dtype == out.type.dtype) and (
+            new.type.broadcastable == out.type.broadcastable
+        ):
             new.tag.values_eq_approx = values_eq_approx_remove_inf_nan
             copy_stack_trace(out, new)
             return [new]
@@ -1180,7 +1176,7 @@ def mul_calculate(num, denum, aslist=False, out_type=None):
 local_mul_canonizer = AlgebraicCanonizer(
     mul, true_div, reciprocal, mul_calculate, False
 )
-register_canonicalize(local_mul_canonizer, name="local_mul_canonizer")
+register_canonicalize(local_mul_canonizer, "shape_unsafe", name="local_mul_canonizer")
 
 
 @register_canonicalize
@@ -1959,7 +1955,9 @@ def local_mul_zero(fgraph, node):
             # print 'MUL by value', value, node.inputs
             if value == 0:
                 # print '... returning zeros'
-                return fill_chain(_asarray(0, dtype=otype.dtype), node.inputs)
+                return [
+                    broadcast_arrays(_asarray(0, dtype=otype.dtype), *node.inputs)[0]
+                ]
 
 
 # TODO: Add this to the canonicalization to reduce redundancy.
@@ -1974,7 +1972,7 @@ def local_div_to_reciprocal(fgraph, node):
             new_out = cast(new_out, dtype=out.dtype)
         # The ones could have forced a specific length
         if not out.type.is_super(new_out.type):
-            new_out = broadcast_like(new_out, out, fgraph)
+            new_out = alloc_like(new_out, out, fgraph)
         return [new_out]
     else:
         return False
@@ -1995,9 +1993,9 @@ def local_pow_canonicalize(fgraph, node):
     if node.op == at_pow:
         cst = get_constant(node.inputs[1])
         if cst == 0:
-            return [broadcast_like(1, node.outputs[0], fgraph)]
+            return [alloc_like(1, node.outputs[0], fgraph)]
         if cst == 1:
-            return [broadcast_like(node.inputs[0], node.outputs[0], fgraph)]
+            return [alloc_like(node.inputs[0], node.outputs[0], fgraph)]
     else:
         return False
 
@@ -2034,7 +2032,7 @@ def local_zero_div(fgraph, node):
         node.op.scalar_op, (aes.IntDiv, aes.TrueDiv)
     ):
         if get_constant(node.inputs[0]) == 0:
-            ret = broadcast_like(0, node.outputs[0], fgraph)
+            ret = alloc_like(0, node.outputs[0], fgraph)
             ret.tag.values_eq_approx = values_eq_approx_remove_nan
             return [ret]
 
@@ -2042,17 +2040,13 @@ def local_zero_div(fgraph, node):
 @register_specialize
 @node_rewriter([at_pow])
 def local_pow_specialize(fgraph, node):
-    # here, we are past the point of canonicalization, so we don't want
-    # to put in un-necessary fills.
     if node.op == at_pow:
         # the idea here is that we have pow(x, y)
         odtype = node.outputs[0].dtype
         xsym = node.inputs[0]
         ysym = node.inputs[1]
         y = get_constant(ysym)
-        if (y is not None) and encompasses_broadcastable(
-            xsym.type.broadcastable, ysym.type.broadcastable
-        ):
+        if (y is not None) and not broadcasted_by(xsym, ysym):
             rval = None
 
             if np.all(y == 2):
@@ -2060,7 +2054,7 @@ def local_pow_specialize(fgraph, node):
             if np.all(y == 1):
                 rval = [xsym]
             if np.all(y == 0):
-                rval = [fill(xsym, np.asarray(1, dtype=odtype))]
+                rval = [alloc_like(1, xsym, fgraph)]
             if np.all(y == 0.5):
                 rval = [sqrt(xsym)]
             if np.all(y == -0.5):
@@ -2070,11 +2064,10 @@ def local_pow_specialize(fgraph, node):
             if np.all(y == -2):
                 rval = [reciprocal(sqr(xsym))]
             if rval:
+                if not rval[0].type.broadcastable == node.outputs[0].type.broadcastable:
+                    return None
                 rval[0] = cast(rval[0], odtype)
-                assert rval[0].type.is_super(node.outputs[0].type), (
-                    rval[0].type,
-                    node.outputs[0].type,
-                )
+                assert rval[0].type.dtype == node.outputs[0].type.dtype
                 return rval
     else:
         return False
@@ -2088,65 +2081,65 @@ def local_pow_to_nested_squaring(fgraph, node):
     Note: This sounds like the kind of thing any half-decent compiler can do by itself?
     """
 
-    if node.op == at_pow:
-        # the idea here is that we have pow(x, y)
-        odtype = node.outputs[0].dtype
-        xsym = node.inputs[0]
-        ysym = node.inputs[1]
-        y = get_constant(ysym)
+    # the idea here is that we have pow(x, y)
+    odtype = node.outputs[0].dtype
+    xsym = node.inputs[0]
+    ysym = node.inputs[1]
+    y = get_constant(ysym)
 
-        # the next line is needed to fix a strange case that I don't
-        # know how to make a separate test.
-        # That happen in the `test_log_erfc` test.
-        # y is a ndarray with dtype int8 and value 2,4 or 6. This make
-        # the abs(y) <= 512 fail!
-        # taking the value outside ndarray solve the problem.
-        # it could be that in that case, numpy make the comparison
-        # into the wrong type(do in int8 that overflow.)
-        if isinstance(y, np.ndarray):
-            assert y.size == 1
-            try:
-                y = y[0]
-            except IndexError:
-                pass
-        if (y is not None) and encompasses_broadcastable(
-            xsym.type.broadcastable, ysym.type.broadcastable
-        ):
-            rval = None
-            # 512 is too small for the cpu and too big for some gpu!
-            if abs(y) == int(abs(y)) and abs(y) <= 512:
-                pow2 = [xsym]
-                pow2_scal = [aes.get_scalar_type(xsym.dtype)()]
-                y_to_do = abs(y)
-                for i in range(int(np.log2(y_to_do))):
-                    pow2.append(sqr(pow2[i]))
-                    pow2_scal.append(aes.sqr(pow2_scal[i]))
-                rval1 = None
-                rval1_scal = None
-                while y_to_do > 0:
-                    log_to_do = int(np.log2(y_to_do))
-                    if rval1:
-                        rval1 *= pow2[log_to_do]
-                        rval1_scal *= pow2_scal[log_to_do]
-                    else:
-                        rval1 = pow2[log_to_do]
-                        rval1_scal = pow2_scal[log_to_do]
-                    y_to_do -= 2**log_to_do
-
-                if abs(y) > 2:
-                    # We fuse all the pow together here to make
-                    # compilation faster
-                    rval1 = Elemwise(
-                        aes.Composite([pow2_scal[0]], [rval1_scal])
-                    ).make_node(xsym)
-                if y < 0:
-                    rval = [reciprocal(rval1)]
+    # the next line is needed to fix a strange case that I don't
+    # know how to make a separate test.
+    # That happen in the `test_log_erfc` test.
+    # y is a ndarray with dtype int8 and value 2,4 or 6. This make
+    # the abs(y) <= 512 fail!
+    # taking the value outside ndarray solve the problem.
+    # it could be that in that case, numpy make the comparison
+    # into the wrong type(do in int8 that overflow.)
+    if isinstance(y, np.ndarray):
+        assert y.size == 1
+        try:
+            y = y[0]
+        except IndexError:
+            pass
+    if (y is not None) and not broadcasted_by(xsym, ysym):
+        rval = None
+        # 512 is too small for the cpu and too big for some gpu!
+        if abs(y) == int(abs(y)) and abs(y) <= 512:
+            pow2 = [xsym]
+            pow2_scal = [aes.get_scalar_type(xsym.dtype)()]
+            y_to_do = abs(y)
+            for i in range(int(np.log2(y_to_do))):
+                pow2.append(sqr(pow2[i]))
+                pow2_scal.append(aes.sqr(pow2_scal[i]))
+            rval1 = None
+            rval1_scal = None
+            while y_to_do > 0:
+                log_to_do = int(np.log2(y_to_do))
+                if rval1:
+                    rval1 *= pow2[log_to_do]
+                    rval1_scal *= pow2_scal[log_to_do]
                 else:
-                    rval = [rval1]
-            if rval:
-                rval[0] = cast(rval[0], odtype)
-                assert rval[0].type == node.outputs[0].type, (rval, node.outputs)
-                return rval
+                    rval1 = pow2[log_to_do]
+                    rval1_scal = pow2_scal[log_to_do]
+                y_to_do -= 2**log_to_do
+
+            if abs(y) > 2:
+                # We fuse all the pow together here to make
+                # compilation faster
+                rval1 = Elemwise(aes.Composite([pow2_scal[0]], [rval1_scal])).make_node(
+                    xsym
+                )
+            if y < 0:
+                rval = [reciprocal(rval1)]
+            else:
+                rval = [rval1]
+        if rval:
+            rval[0] = cast(rval[0], odtype)
+            # TODO: We can add a specify_broadcastable and/or unbroadcast to make the
+            #  output types compatible. Or work on #408 and let TensorType.filter_variable do it.
+            if rval[0].type.broadcastable != node.outputs[0].type.broadcastable:
+                return None
+            return rval
 
 
 @register_specialize
@@ -2164,9 +2157,7 @@ def local_mul_specialize(fgraph, node):
     mul(-1, x, y) -/-> neg(mul(x, y))
 
     """
-    # here, we are past the point of canonicalization, so we don't
-    # want to put in un-necessary fills.
-    #
+
     # at this point [post canonicalize], mul() may have many inputs.
     if node.op == mul:
         # the idea here is that we have pow(x, y)
@@ -2190,7 +2181,7 @@ def local_mul_specialize(fgraph, node):
                 has_neg ^= True  # toggles
             elif y == 0.0:
                 # if we find any zero, we just return right away
-                return [broadcast_like(0, node.outputs[0], fgraph)]
+                return [alloc_like(0, node.outputs[0], fgraph)]
             else:
                 new_inputs.append(inp)
 
@@ -2215,28 +2206,19 @@ def local_mul_specialize(fgraph, node):
                         new_inputs = [m1] + new_inputs
                     rval = mul(*new_inputs)
 
-                return [broadcast_like(rval, node.outputs[0], fgraph)]
+                return [alloc_like(rval, node.outputs[0], fgraph)]
             else:
                 # there are no variable inputs to mul
                 # N.B. this could have been constant-folded...
                 if has_neg:
-                    return [broadcast_like(-1, node.outputs[0], fgraph)]
+                    return [alloc_like(-1, node.outputs[0], fgraph)]
                 else:
-                    return [broadcast_like(1, node.outputs[0], fgraph)]
+                    return [alloc_like(1, node.outputs[0], fgraph)]
 
 
 @register_specialize
 @node_rewriter([add])
-def local_add_specialize(fgraph, node):
-    """Remove zeros from ``add``s.
-
-    TODO: This should be a canonicalization, no?
-    """
-    # here, we are past the point of canonicalization, so we don't want
-    # to put in un-necessary fills.
-    if node.op != add:
-        return False
-
+def local_add_remove_zeros(fgraph, node):
     new_inputs = []
     for inp in node.inputs:
         try:
@@ -2259,12 +2241,12 @@ def local_add_specialize(fgraph, node):
         # Reuse call to constant for cache()
         cst = constant(np.zeros((1,) * ndim, dtype=dtype))
         assert cst.type.broadcastable == (True,) * ndim
-        return fill_chain(cst, node.inputs)
+        return [alloc_like(cst, node_output, fgraph)]
 
     if len(new_inputs) == 1:
-        ret = fill_chain(new_inputs[0], node.inputs)
+        ret = [alloc_like(new_inputs[0], node_output, fgraph)]
     else:
-        ret = fill_chain(add(*new_inputs), node.inputs)
+        ret = [alloc_like(add(*new_inputs), node_output, fgraph)]
 
     # The dtype should not be changed. It can happen if the input
     # that was forcing upcasting was equal to 0.
@@ -2382,7 +2364,7 @@ def local_log1p(fgraph, node):
                         ninp = nonconsts[0]
                     if ninp.dtype != log_arg.type.dtype:
                         ninp = ninp.astype(node.outputs[0].dtype)
-                    return fill_chain(log1p(ninp), scalar_inputs)
+                    return [alloc_like(log1p(ninp), node.outputs[0], fgraph)]
 
         elif log_arg.owner and log_arg.owner.op == sub:
             one = extract_constant(log_arg.owner.inputs[0], only_process_constants=True)
@@ -2513,7 +2495,7 @@ add_canonizer = in2out(
 )
 
 
-register_canonicalize(local_add_canonizer, name="local_add_canonizer")
+register_canonicalize(local_add_canonizer, "shape_unsafe", name="local_add_canonizer")
 
 
 def distribute_greedy(pos_pairs, neg_pairs, num, denum, out_type, minscore=0):
@@ -3577,10 +3559,13 @@ def local_reciprocal_1_plus_exp(fgraph, node):
             if len(nonconsts) == 1:
                 if nonconsts[0].owner and nonconsts[0].owner.op == exp:
                     if scalars_ and np.allclose(np.sum(scalars_), 1):
-                        out = fill_chain(
-                            sigmoid(neg(nonconsts[0].owner.inputs[0])),
-                            scalar_inputs,
-                        )
+                        out = [
+                            alloc_like(
+                                sigmoid(neg(nonconsts[0].owner.inputs[0])),
+                                node.outputs[0],
+                                fgraph,
+                            )
+                        ]
                         # keep combined stack traces of
                         #     exp(x):           nonconsts[0],
                         #     1 + exp(x):       reciprocal_arg,

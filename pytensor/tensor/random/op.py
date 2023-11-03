@@ -5,81 +5,29 @@ import numpy as np
 
 import pytensor
 from pytensor.configdefaults import config
-from pytensor.graph.basic import Apply, Variable
+from pytensor.graph.basic import Apply, Variable, equal_computations
 from pytensor.graph.op import Op
+from pytensor.graph.replace import _vectorize_node
 from pytensor.misc.safe_asarray import _asarray
 from pytensor.scalar import ScalarVariable
 from pytensor.tensor.basic import (
     as_tensor_variable,
+    concatenate,
     constant,
     get_underlying_scalar_constant_value,
     get_vector_length,
     infer_static_shape,
 )
 from pytensor.tensor.random.type import RandomGeneratorType, RandomStateType, RandomType
-from pytensor.tensor.random.utils import normalize_size_param, params_broadcast_shapes
+from pytensor.tensor.random.utils import (
+    broadcast_params,
+    normalize_size_param,
+    params_broadcast_shapes,
+)
 from pytensor.tensor.shape import shape_tuple
 from pytensor.tensor.type import TensorType, all_dtypes
 from pytensor.tensor.type_other import NoneConst
-from pytensor.tensor.var import TensorVariable
-
-
-def default_supp_shape_from_params(
-    ndim_supp: int,
-    dist_params: Sequence[Variable],
-    rep_param_idx: int = 0,
-    param_shapes: Optional[Sequence[Tuple[ScalarVariable, ...]]] = None,
-) -> Union[TensorVariable, Tuple[ScalarVariable, ...]]:
-    """Infer the dimensions for the output of a `RandomVariable`.
-
-    This is a function that derives a random variable's support
-    shape/dimensions from one of its parameters.
-
-    XXX: It's not always possible to determine a random variable's support
-    shape from its parameters, so this function has fundamentally limited
-    applicability and must be replaced by custom logic in such cases.
-
-    XXX: This function is not expected to handle `ndim_supp = 0` (i.e.
-    scalars), since that is already definitively handled in the `Op` that
-    calls this.
-
-    TODO: Consider using `pytensor.compile.ops.shape_i` alongside `ShapeFeature`.
-
-    Parameters
-    ----------
-    ndim_supp: int
-        Total number of dimensions for a single draw of the random variable
-        (e.g. a multivariate normal draw is 1D, so `ndim_supp = 1`).
-    dist_params: list of `pytensor.graph.basic.Variable`
-        The distribution parameters.
-    rep_param_idx: int (optional)
-        The index of the distribution parameter to use as a reference
-        In other words, a parameter in `dist_param` with a shape corresponding
-        to the support's shape.
-        The default is the first parameter (i.e. the value 0).
-    param_shapes: list of tuple of `ScalarVariable` (optional)
-        Symbolic shapes for each distribution parameter.  These will
-        be used in place of distribution parameter-generated shapes.
-
-    Results
-    -------
-    out: a tuple representing the support shape for a distribution with the
-    given `dist_params`.
-
-    """
-    if ndim_supp <= 0:
-        raise ValueError("ndim_supp must be greater than 0")
-    if param_shapes is not None:
-        ref_param = param_shapes[rep_param_idx]
-        return (ref_param[-ndim_supp],)
-    else:
-        ref_param = dist_params[rep_param_idx]
-        if ref_param.ndim < ndim_supp:
-            raise ValueError(
-                "Reference parameter does not match the "
-                f"expected dimensions; {ref_param} has less than {ndim_supp} dim(s)."
-            )
-        return ref_param.shape[-ndim_supp:]
+from pytensor.tensor.variable import TensorVariable
 
 
 class RandomVariable(Op):
@@ -151,15 +99,29 @@ class RandomVariable(Op):
         if self.inplace:
             self.destroy_map = {0: [0]}
 
-    def _supp_shape_from_params(self, dist_params, **kwargs):
-        """Determine the support shape of a `RandomVariable`'s output given its parameters.
+    def _supp_shape_from_params(self, dist_params, param_shapes=None):
+        """Determine the support shape of a multivariate `RandomVariable`'s output given its parameters.
 
         This does *not* consider the extra dimensions added by the `size` parameter
         or independent (batched) parameters.
 
-        Defaults to `param_supp_shape_fn`.
+        When provided, `param_shapes` should be given preference over `[d.shape for d in dist_params]`,
+        as it will avoid redundancies in PyTensor shape inference.
+
+        Examples
+        --------
+        Common multivariate `RandomVariable`s derive their support shapes implicitly from the
+        last dimension of some of their parameters. For example `multivariate_normal` support shape
+        corresponds to the last dimension of the mean or covariance parameters, `support_shape=(mu.shape[-1])`.
+        For this case the helper `pytensor.tensor.random.utils.supp_shape_from_ref_param_shape` can be used.
+
+        Other variables have fixed support shape such as `support_shape=(2,)` or it is determined by the
+        values (not shapes) of some parameters. For instance, a `gaussian_random_walk(steps, size=(2,))`,
+        might have `support_shape=(steps,)`.
         """
-        return default_supp_shape_from_params(self.ndim_supp, dist_params, **kwargs)
+        raise NotImplementedError(
+            "`_supp_shape_from_params` must be implemented for multivariate RVs"
+        )
 
     def rng_fn(self, rng, *args, **kwargs) -> Union[int, float, np.ndarray]:
         """Sample a numeric random variate."""
@@ -191,6 +153,8 @@ class RandomVariable(Op):
 
         """
 
+        from pytensor.tensor.extra_ops import broadcast_shape_iter
+
         size_len = get_vector_length(size)
 
         if size_len > 0:
@@ -216,57 +180,52 @@ class RandomVariable(Op):
 
         # Broadcast the parameters
         param_shapes = params_broadcast_shapes(
-            param_shapes or [shape_tuple(p) for p in dist_params], self.ndims_params
+            param_shapes or [shape_tuple(p) for p in dist_params],
+            self.ndims_params,
         )
 
-        def slice_ind_dims(p, ps, n):
+        def extract_batch_shape(p, ps, n):
             shape = tuple(ps)
 
             if n == 0:
-                return (p, shape)
+                return shape
 
-            ind_slice = (slice(None),) * (p.ndim - n) + (0,) * n
-            ind_shape = [
-                s if b is False else constant(1, "int64")
-                for s, b in zip(shape[:-n], p.broadcastable[:-n])
+            batch_shape = [
+                s if not b else constant(1, "int64")
+                for s, b in zip(shape[:-n], p.type.broadcastable[:-n])
             ]
-            return (
-                p[ind_slice],
-                ind_shape,
-            )
+            return batch_shape
 
         # These are versions of our actual parameters with the anticipated
         # dimensions (i.e. support dimensions) removed so that only the
         # independent variate dimensions are left.
-        params_ind_slice = tuple(
-            slice_ind_dims(p, ps, n)
+        params_batch_shape = tuple(
+            extract_batch_shape(p, ps, n)
             for p, ps, n in zip(dist_params, param_shapes, self.ndims_params)
         )
 
-        if len(params_ind_slice) == 1:
-            _, shape_ind = params_ind_slice[0]
-        elif len(params_ind_slice) > 1:
+        if len(params_batch_shape) == 1:
+            [batch_shape] = params_batch_shape
+        elif len(params_batch_shape) > 1:
             # If there are multiple parameters, the dimensions of their
             # independent variates should broadcast together.
-            p_slices, p_shapes = zip(*params_ind_slice)
-
-            shape_ind = pytensor.tensor.extra_ops.broadcast_shape_iter(
-                p_shapes, arrays_are_shapes=True
+            batch_shape = broadcast_shape_iter(
+                params_batch_shape,
+                arrays_are_shapes=True,
             )
-
         else:
             # Distribution has no parameters
-            shape_ind = ()
+            batch_shape = ()
 
         if self.ndim_supp == 0:
-            shape_supp = ()
+            supp_shape = ()
         else:
-            shape_supp = self._supp_shape_from_params(
+            supp_shape = self._supp_shape_from_params(
                 dist_params,
                 param_shapes=param_shapes,
             )
 
-        shape = tuple(shape_ind) + tuple(shape_supp)
+        shape = tuple(batch_shape) + tuple(supp_shape)
         if not shape:
             shape = constant([], dtype="int64")
 
@@ -430,3 +389,22 @@ class DefaultGeneratorMakerOp(AbstractRNGConstructor):
 
 
 default_rng = DefaultGeneratorMakerOp()
+
+
+@_vectorize_node.register(RandomVariable)
+def vectorize_random_variable(
+    op: RandomVariable, node: Apply, rng, size, dtype, *dist_params
+) -> Apply:
+    # If size was provided originally and a new size hasn't been provided,
+    # We extend it to accommodate the new input batch dimensions.
+    # Otherwise, we assume the new size already has the right values
+    old_size = node.inputs[1]
+    len_old_size = get_vector_length(old_size)
+    if len_old_size and equal_computations([old_size], [size]):
+        bcasted_param = broadcast_params(dist_params, op.ndims_params)[0]
+        new_param_ndim = (bcasted_param.type.ndim - op.ndims_params[0]) - len_old_size
+        if new_param_ndim >= 0:
+            new_size_dims = bcasted_param.shape[:new_param_ndim]
+            size = concatenate([new_size_dims, size])
+
+    return op.make_node(rng, size, dtype, *dist_params)

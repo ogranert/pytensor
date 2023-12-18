@@ -6,7 +6,7 @@ import logging
 import time
 import warnings
 from itertools import chain
-from typing import TYPE_CHECKING, List, Optional, Tuple, Type
+from typing import TYPE_CHECKING, Optional
 
 import numpy as np
 
@@ -170,13 +170,13 @@ class Supervisor(Feature):
 
 
 def std_fgraph(
-    input_specs: List[SymbolicInput],
-    output_specs: List[SymbolicOutput],
+    input_specs: list[SymbolicInput],
+    output_specs: list[SymbolicOutput],
     accept_inplace: bool = False,
     fgraph: Optional[FunctionGraph] = None,
-    features: List[Type[Feature]] = [PreserveVariableAttributes],
+    features: list[type[Feature]] = [PreserveVariableAttributes],
     force_clone=False,
-) -> Tuple[FunctionGraph, List[SymbolicOutput]]:
+) -> tuple[FunctionGraph, list[SymbolicOutput]]:
     """Make or set up `FunctionGraph` corresponding to the input specs and the output specs.
 
     Any `SymbolicInput` in the `input_specs`, if its `update` field is not
@@ -1474,7 +1474,7 @@ class FunctionMaker:
         if getattr(mode, "profile", None):
             raise TypeError("profile passed via 'mode'. This isn't supported anymore")
         self.profile = profile
-        if profile:
+        if profile and config.cxx:
             # This is very important:
             # 1) We preload the cache here to not have its timing
             #    included with the rewrites.
@@ -1482,7 +1482,12 @@ class FunctionMaker:
             #    too much execution time during testing as we compile
             #    much more functions then the number of compile c
             #    module.
+            start_get_cache = time.perf_counter()
             pytensor.link.c.basic.get_module_cache().refresh()
+            get_cache_time = time.perf_counter() - start_get_cache
+            self.profile.linker_time += get_cache_time
+            self.profile.preload_cache_time += get_cache_time
+
         # Handle the case where inputs and/or outputs is a single
         # Variable (not in a list)
         unpack_single = False
@@ -1722,7 +1727,8 @@ def orig_function(
 
     """
 
-    t1 = time.perf_counter()
+    if profile:
+        t1 = time.perf_counter()
     mode = pytensor.compile.mode.get_mode(mode)
 
     inputs = list(map(convert_function_input, inputs))
@@ -1755,8 +1761,8 @@ def orig_function(
         with config.change_flags(compute_test_value="off"):
             fn = m.create(defaults)
     finally:
-        t2 = time.perf_counter()
-        if fn and profile:
+        if profile and fn:
+            t2 = time.perf_counter()
             profile.compile_time += t2 - t1
             # TODO: append
             profile.nb_nodes = len(fn.maker.fgraph.apply_nodes)

@@ -1,14 +1,13 @@
 from functools import partial
 
 import numpy as np
-import numpy.linalg
 import pytest
 import scipy.linalg
 from numpy.testing import assert_allclose
 
 import pytensor
 from pytensor import function
-from pytensor import tensor as at
+from pytensor import tensor as pt
 from pytensor.compile import get_default_mode
 from pytensor.configdefaults import config
 from pytensor.tensor import swapaxes
@@ -17,7 +16,16 @@ from pytensor.tensor.elemwise import DimShuffle
 from pytensor.tensor.math import _allclose, dot, matmul
 from pytensor.tensor.nlinalg import Det, MatrixInverse, matrix_inverse
 from pytensor.tensor.rewriting.linalg import inv_as_solve
-from pytensor.tensor.slinalg import Cholesky, Solve, SolveTriangular, cholesky, solve
+from pytensor.tensor.slinalg import (
+    Cholesky,
+    Solve,
+    SolveBase,
+    SolveTriangular,
+    cho_solve,
+    cholesky,
+    solve,
+    solve_triangular,
+)
 from pytensor.tensor.type import dmatrix, matrix, tensor, vector
 from tests import unittest_tools as utt
 from tests.test_rop import break_op
@@ -34,7 +42,7 @@ def test_rop_lop():
 
     sy, _ = pytensor.scan(
         lambda i, y, x, v: (pytensor.gradient.grad(y[i], x) * v).sum(),
-        sequences=at.arange(y.shape[0]),
+        sequences=pt.arange(y.shape[0]),
         non_sequences=[y, mx, mv],
     )
     scan_f = function([mx, mv], sy)
@@ -219,8 +227,8 @@ def test_cholesky_ldotlt(tag, cholesky_form, product, op):
 
 def test_local_det_chol():
     X = matrix("X")
-    L = at.linalg.cholesky(X)
-    det_X = at.linalg.det(X)
+    L = pt.linalg.cholesky(X)
+    det_X = pt.linalg.det(X)
 
     f = function([X], [L, det_X])
 
@@ -231,3 +239,70 @@ def test_local_det_chol():
     f = function([X], [L, det_X, X])
     nodes = f.maker.fgraph.toposort()
     assert not any(isinstance(node, Det) for node in nodes)
+
+
+class TestBatchedVectorBSolveToMatrixBSolve:
+    rewrite_name = "batched_vector_b_solve_to_matrix_b_solve"
+
+    @staticmethod
+    def any_vector_b_solve(fn):
+        return any(
+            (
+                isinstance(node.op, Blockwise)
+                and isinstance(node.op.core_op, SolveBase)
+                and node.op.core_op.b_ndim == 1
+            )
+            for node in fn.maker.fgraph.apply_nodes
+        )
+
+    @pytest.mark.parametrize("solve_op", (solve, solve_triangular, cho_solve))
+    def test_valid_cases(self, solve_op):
+        rng = np.random.default_rng(sum(map(ord, solve_op.__name__)))
+
+        a = tensor(shape=(None, None))
+        b = tensor(shape=(None, None, None))
+
+        if solve_op is cho_solve:
+            # cho_solves expects a tuple (a, lower) as the first input
+            out = solve_op((a, True), b, b_ndim=1)
+        else:
+            out = solve_op(a, b, b_ndim=1)
+
+        mode = get_default_mode().excluding(self.rewrite_name)
+        ref_fn = pytensor.function([a, b], out, mode=mode)
+        assert self.any_vector_b_solve(ref_fn)
+
+        mode = get_default_mode().including(self.rewrite_name)
+        opt_fn = pytensor.function([a, b], out, mode=mode)
+        assert not self.any_vector_b_solve(opt_fn)
+
+        test_a = rng.normal(size=(3, 3)).astype(config.floatX)
+        test_b = rng.normal(size=(7, 5, 3)).astype(config.floatX)
+        np.testing.assert_allclose(
+            opt_fn(test_a, test_b),
+            ref_fn(test_a, test_b),
+            rtol=1e-7 if config.floatX == "float64" else 1e-5,
+        )
+
+    def test_invalid_batched_a(self):
+        rng = np.random.default_rng(sum(map(ord, self.rewrite_name)))
+
+        # Rewrite is not applicable if a has batched dims
+        a = tensor(shape=(None, None, None))
+        b = tensor(shape=(None, None, None))
+
+        out = solve(a, b, b_ndim=1)
+
+        mode = get_default_mode().including(self.rewrite_name)
+        opt_fn = pytensor.function([a, b], out, mode=mode)
+        assert self.any_vector_b_solve(opt_fn)
+
+        ref_fn = np.vectorize(np.linalg.solve, signature="(m,m),(m)->(m)")
+
+        test_a = rng.normal(size=(5, 3, 3)).astype(config.floatX)
+        test_b = rng.normal(size=(7, 5, 3)).astype(config.floatX)
+        np.testing.assert_allclose(
+            opt_fn(test_a, test_b),
+            ref_fn(test_a, test_b),
+            rtol=1e-7 if config.floatX == "float64" else 1e-5,
+        )

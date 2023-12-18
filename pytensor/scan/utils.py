@@ -4,14 +4,15 @@ import copy
 import dataclasses
 import logging
 from collections import OrderedDict, namedtuple
+from collections.abc import Sequence
 from itertools import chain
-from typing import TYPE_CHECKING, Callable, List, Optional, Sequence, Set, Tuple, Union
+from typing import TYPE_CHECKING, Callable, Optional, Union
 from typing import cast as type_cast
 
 import numpy as np
 
-from pytensor import scalar as aes
-from pytensor import tensor as at
+from pytensor import scalar as ps
+from pytensor import tensor as pt
 from pytensor.compile.profiling import ProfileStats
 from pytensor.configdefaults import config
 from pytensor.graph.basic import Constant, Variable, equal_computations, graph_inputs
@@ -65,9 +66,9 @@ def safe_new(
     # Note, `as_tensor_variable` will convert the `ScalarType` into a
     # `TensorScalar` that will require a `ScalarFromTensor` `Op`, making the
     # push-out optimization fail
-    elif isinstance(x, aes.ScalarVariable):
+    elif isinstance(x, ps.ScalarVariable):
         if dtype:
-            nw_x = aes.get_scalar_type(dtype=dtype)()
+            nw_x = ps.get_scalar_type(dtype=dtype)()
         else:
             nw_x = x.type()
         nw_x.name = nw_name
@@ -83,7 +84,7 @@ def safe_new(
         return nw_x
     else:
         try:
-            x = at.as_tensor_variable(x)
+            x = pt.as_tensor_variable(x)
         except TypeError:
             # This could happen for example for random states
             pass
@@ -126,7 +127,7 @@ class until:
     """
 
     def __init__(self, condition):
-        self.condition = at.as_tensor_variable(condition)
+        self.condition = pt.as_tensor_variable(condition)
         assert self.condition.ndim == 0
 
 
@@ -669,7 +670,7 @@ class ScanArgs:
         n_mit_mot_outs = info.n_mit_mot_outs
         self.outer_out_mit_mot = list(outer_outputs[p : p + n_mit_mot])
         iomm = list(inner_outputs[q : q + n_mit_mot_outs])
-        self.inner_out_mit_mot: Tuple[List[Variable], ...] = ()
+        self.inner_out_mit_mot: tuple[list[Variable], ...] = ()
         qq = 0
         for sl in self.mit_mot_out_slices:
             self.inner_out_mit_mot += (iomm[qq : qq + len(sl)],)
@@ -916,8 +917,8 @@ class ScanArgs:
         return field_info
 
     def get_dependent_nodes(
-        self, i: Variable, seen: Optional[Set[Variable]] = None
-    ) -> Set[Variable]:
+        self, i: Variable, seen: Optional[set[Variable]] = None
+    ) -> set[Variable]:
         if seen is None:
             seen = {i}
         else:
@@ -990,13 +991,13 @@ class ScanArgs:
 
     def remove_from_fields(
         self, i: Variable, rm_dependents: bool = True
-    ) -> List[Tuple[Variable, Optional[FieldInfo]]]:
+    ) -> list[tuple[Variable, Optional[FieldInfo]]]:
         if rm_dependents:
             vars_to_remove = self.get_dependent_nodes(i) | {i}
         else:
             vars_to_remove = {i}
 
-        rm_info: List[Tuple[Variable, Optional[FieldInfo]]] = []
+        rm_info: list[tuple[Variable, Optional[FieldInfo]]] = []
         for v in vars_to_remove:
             dependent_rm_info = self._remove_from_fields(v)
             rm_info.append((v, dependent_rm_info))

@@ -1,7 +1,8 @@
 """Symbolic tensor types and constructor functions."""
 
+from collections.abc import Sequence
 from functools import singledispatch
-from typing import TYPE_CHECKING, Any, Callable, NoReturn, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Any, Callable, NoReturn, Optional, Union
 
 from pytensor.graph.basic import Constant, Variable
 from pytensor.graph.op import Op
@@ -147,6 +148,7 @@ from pytensor.tensor.subtensor import *  # noqa
 from pytensor.tensor.type import *  # noqa
 from pytensor.tensor.type_other import *  # noqa
 from pytensor.tensor.variable import TensorConstant, TensorVariable  # noqa
+from pytensor.tensor.functional import vectorize  # noqa
 
 # Allow accessing numpy constants from pytensor.tensor
 from numpy import e, euler_gamma, inf, infty, nan, newaxis, pi  # noqa

@@ -6,6 +6,7 @@ import numpy as np
 
 from pytensor.gradient import DisconnectedType
 from pytensor.graph.basic import Apply, Variable
+from pytensor.graph.replace import _vectorize_node
 from pytensor.link.c.op import COp
 from pytensor.link.c.params_type import ParamsType
 from pytensor.link.c.type import Generic
@@ -72,13 +73,13 @@ class CheckAndRaise(COp):
         conds
             The conditions to evaluate.
         """
-        import pytensor.tensor as at
+        import pytensor.tensor as pt
 
         if not isinstance(value, Variable):
-            value = at.as_tensor_variable(value)
+            value = pt.as_tensor_variable(value)
 
         conds = [
-            at.as_tensor_variable(c) if not isinstance(c, Variable) else c
+            pt.as_tensor_variable(c) if not isinstance(c, Variable) else c
             for c in conds
         ]
 
@@ -90,7 +91,7 @@ class CheckAndRaise(COp):
             [value.type()],
         )
 
-    def perform(self, node, inputs, outputs, params):
+    def perform(self, node, inputs, outputs):
         (out,) = outputs
         val, *conds = inputs
         out[0] = val
@@ -182,9 +183,9 @@ class Assert(CheckAndRaise):
     Examples
     --------
     >>> import pytensor
-    >>> import pytensor.tensor as at
+    >>> import pytensor.tensor as pt
     >>> from pytensor.raise_op import Assert
-    >>> x = at.vector("x")
+    >>> x = pt.vector("x")
     >>> assert_op = Assert("This assert failed")
     >>> func = pytensor.function([x], assert_op(x, x.size < 2))
 
@@ -198,3 +199,21 @@ class Assert(CheckAndRaise):
 
 
 assert_op = Assert()
+
+
+@_vectorize_node.register(CheckAndRaise)
+def vectorize_check_and_raise(op, node, batch_x, batch_cond):
+    from pytensor.tensor.extra_ops import broadcast_arrays
+    from pytensor.tensor.shape import shape_padright
+
+    batch_cond_dims = batch_cond.type.ndim
+
+    if batch_cond_dims:
+        out = op(batch_x, batch_cond.all())
+        # Condition may broadcast batch dims of x
+        # We broadcast after the Check Op, so it can be removed more easily if not needed
+        x_core_ndim = node.inputs[0].type.ndim
+        batch_out, _ = broadcast_arrays(out, shape_padright(batch_cond, x_core_ndim))
+        return batch_out.owner
+    else:
+        return op.make_node(batch_x, batch_cond)

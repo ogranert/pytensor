@@ -1,5 +1,4 @@
 from copy import copy
-from typing import List, Tuple
 
 import numpy as np
 
@@ -8,7 +7,7 @@ from pytensor.configdefaults import config
 from pytensor.gradient import DisconnectedType
 from pytensor.graph.basic import Apply
 from pytensor.graph.null_type import NullType
-from pytensor.graph.replace import _vectorize_node
+from pytensor.graph.replace import _vectorize_node, _vectorize_not_needed
 from pytensor.graph.utils import MethodNotDefined
 from pytensor.link.c.basic import failure_code
 from pytensor.link.c.op import COp, ExternalCOp, OpenMPOp
@@ -23,7 +22,6 @@ from pytensor.scalar.basic import transfer_type, upcast
 from pytensor.tensor import elemwise_cgen as cgen
 from pytensor.tensor import get_vector_length
 from pytensor.tensor.basic import _get_vector_length, as_tensor_variable
-from pytensor.tensor.blockwise import vectorize_not_needed
 from pytensor.tensor.type import (
     TensorType,
     continuous_dtypes,
@@ -235,7 +233,7 @@ class DimShuffle(ExternalCOp):
             return f"Transpose{{axes={self.shuffle}}}"
         return f"DimShuffle{{order=[{','.join(map(str, self.new_order))}]}}"
 
-    def perform(self, node, inp, out, params=None):
+    def perform(self, node, inp, out):
         (res,) = inp
         (storage,) = out
 
@@ -533,7 +531,7 @@ class Elemwise(OpenMPOp):
         return [[True for output in node.outputs] for ipt in node.inputs]
 
     def L_op(self, inputs, outs, ograds):
-        from pytensor.tensor.math import sum as at_sum
+        from pytensor.tensor.math import sum as pt_sum
 
         # Compute grad with respect to broadcasted input
         rval = self._bgrad(inputs, outs, ograds)
@@ -574,7 +572,7 @@ class Elemwise(OpenMPOp):
             ]
 
             if to_sum:
-                sr = at_sum(rval[i], axis=to_sum, keepdims=True)
+                sr = pt_sum(rval[i], axis=to_sum, keepdims=True)
                 rval[i] = sr
 
         return rval
@@ -803,7 +801,7 @@ class Elemwise(OpenMPOp):
                     "If broadcasting was intended, use `specify_broadcastable` on the relevant input."
                 )
 
-    def infer_shape(self, fgraph, node, i_shapes) -> List[Tuple[TensorVariable, ...]]:
+    def infer_shape(self, fgraph, node, i_shapes) -> list[tuple[TensorVariable, ...]]:
         from pytensor.tensor.extra_ops import broadcast_shape
 
         out_shape = broadcast_shape(*i_shapes, arrays_are_shapes=True)
@@ -1742,7 +1740,7 @@ def _get_vector_length_Elemwise(op, var):
     raise ValueError(f"Length of {var} cannot be determined")
 
 
-_vectorize_node.register(Elemwise, vectorize_not_needed)
+_vectorize_node.register(Elemwise, _vectorize_not_needed)
 
 
 @_vectorize_node.register(DimShuffle)

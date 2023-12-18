@@ -1,4 +1,5 @@
-from typing import Callable, Iterator, List, Optional, Union
+from collections.abc import Iterator
+from typing import Callable, Optional, Union
 
 from etuples.core import ExpressionTuple
 from kanren import run
@@ -23,15 +24,15 @@ class KanrenRelationSub(NodeRewriter):
 
         from kanren import eq, conso, var
 
-        import pytensor.tensor as at
+        import pytensor.tensor as pt
         from pytensor.graph.rewriting.kanren import KanrenRelationSub
 
 
         def relation(in_lv, out_lv):
-            # A `kanren` goal that changes `at.log` terms to `at.exp`
+            # A `kanren` goal that changes `pt.log` terms to `pt.exp`
             cdr_lv = var()
-            return eq(conso(at.log, cdr_lv, in_lv),
-                    conso(at.exp, cdr_lv, out_lv))
+            return eq(conso(pt.log, cdr_lv, in_lv),
+                    conso(pt.exp, cdr_lv, out_lv))
 
 
         kanren_sub_opt = KanrenRelationSub(relation)
@@ -44,7 +45,7 @@ class KanrenRelationSub(NodeRewriter):
         self,
         kanren_relation: Callable[[Variable, Var], Callable],
         results_filter: Optional[
-            Callable[[Iterator], Optional[List[Union[ExpressionTuple, Variable]]]]
+            Callable[[Iterator], Optional[list[Union[ExpressionTuple, Variable]]]]
         ] = None,
         node_filter: Callable[[Apply], bool] = lambda x: True,
     ):
@@ -67,7 +68,7 @@ class KanrenRelationSub(NodeRewriter):
 
             def results_filter(
                 x: Iterator,
-            ) -> Optional[List[Union[ExpressionTuple, Variable]]]:
+            ) -> Optional[list[Union[ExpressionTuple, Variable]]]:
                 return next(x, None)
 
         self.kanren_relation = kanren_relation

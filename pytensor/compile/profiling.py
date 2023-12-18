@@ -16,7 +16,7 @@ import sys
 import time
 from collections import defaultdict
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Optional, Union
 
 import numpy as np
 
@@ -48,7 +48,7 @@ total_fct_exec_time: float = 0.0
 total_graph_rewrite_time: float = 0.0
 total_time_linker: float = 0.0
 
-_atexit_print_list: List["ProfileStats"] = []
+_atexit_print_list: list["ProfileStats"] = []
 _atexit_registered: bool = False
 
 
@@ -234,11 +234,11 @@ class ProfileStats:
     # Total time spent in Function.vm.__call__
     #
 
-    apply_time: Optional[Dict[Union["FunctionGraph", Variable], float]] = None
+    apply_time: Optional[dict[Union["FunctionGraph", Variable], float]] = None
 
-    apply_callcount: Optional[Dict[Union["FunctionGraph", Variable], int]] = None
+    apply_callcount: Optional[dict[Union["FunctionGraph", Variable], int]] = None
 
-    apply_cimpl: Optional[Dict[Apply, bool]] = None
+    apply_cimpl: Optional[dict[Apply, bool]] = None
     # dict from node -> bool (1 if c, 0 if py)
     #
 
@@ -246,15 +246,15 @@ class ProfileStats:
     # pretty string to print in summary, to identify this output
     #
 
-    variable_shape: Dict[Variable, Any] = {}
+    variable_shape: dict[Variable, Any] = {}
     # Variable -> shapes
     #
 
-    variable_strides: Dict[Variable, Any] = {}
+    variable_strides: dict[Variable, Any] = {}
     # Variable -> strides
     #
 
-    variable_offset: Dict[Variable, Any] = {}
+    variable_offset: dict[Variable, Any] = {}
     # Variable -> offset
     #
 
@@ -269,12 +269,15 @@ class ProfileStats:
     linker_time: float = 0.0
     # time spent linking graph (FunctionMaker.create)
 
+    preload_cache_time: float = 0.0
+    # time spent preloading the cache, so it does not affect rewrites profiling
+
     import_time: float = 0.0
     # time spent in importing compiled python module.
 
     linker_node_make_thunks: float = 0.0
 
-    linker_make_thunk_time: Dict = {}
+    linker_make_thunk_time: dict = {}
 
     line_width = config.profiling__output_line_width
 
@@ -811,6 +814,7 @@ class ProfileStats:
             ),
             file=file,
         )
+        print(f"       C-cache preloading {self.preload_cache_time:e}s", file=file)
         print(f"       Import time {self.import_time:e}s", file=file)
         print(
             f"       Node make_thunk time {self.linker_node_make_thunks:e}s", file=file
@@ -1481,65 +1485,65 @@ class ProfileStats:
             file=file,
         )
 
-        from pytensor import scalar as aes
+        from pytensor import scalar as ps
         from pytensor.tensor.elemwise import Elemwise
         from pytensor.tensor.math import Dot
 
         scalar_op_amdlibm_no_speed_up = [
-            aes.LT,
-            aes.GT,
-            aes.LE,
-            aes.GE,
-            aes.EQ,
-            aes.NEQ,
-            aes.InRange,
-            aes.Switch,
-            aes.OR,
-            aes.XOR,
-            aes.AND,
-            aes.Invert,
-            aes.ScalarMaximum,
-            aes.ScalarMinimum,
-            aes.Add,
-            aes.Mul,
-            aes.Sub,
-            aes.TrueDiv,
-            aes.IntDiv,
-            aes.Clip,
-            aes.Second,
-            aes.Identity,
-            aes.Cast,
-            aes.Sign,
-            aes.Neg,
-            aes.Reciprocal,
-            aes.Sqr,
+            ps.LT,
+            ps.GT,
+            ps.LE,
+            ps.GE,
+            ps.EQ,
+            ps.NEQ,
+            ps.InRange,
+            ps.Switch,
+            ps.OR,
+            ps.XOR,
+            ps.AND,
+            ps.Invert,
+            ps.ScalarMaximum,
+            ps.ScalarMinimum,
+            ps.Add,
+            ps.Mul,
+            ps.Sub,
+            ps.TrueDiv,
+            ps.IntDiv,
+            ps.Clip,
+            ps.Second,
+            ps.Identity,
+            ps.Cast,
+            ps.Sign,
+            ps.Neg,
+            ps.Reciprocal,
+            ps.Sqr,
         ]
         scalar_op_amdlibm_speed_up = [
-            aes.Mod,
-            aes.Pow,
-            aes.Ceil,
-            aes.Floor,
-            aes.RoundHalfToEven,
-            aes.RoundHalfAwayFromZero,
-            aes.Log,
-            aes.Log2,
-            aes.Log10,
-            aes.Log1p,
-            aes.Exp,
-            aes.Sqrt,
-            aes.Abs,
-            aes.Cos,
-            aes.Sin,
-            aes.Tan,
-            aes.Tanh,
-            aes.Cosh,
-            aes.Sinh,
-            aes.Sigmoid,
-            aes.Softplus,
+            ps.Mod,
+            ps.Pow,
+            ps.Ceil,
+            ps.Floor,
+            ps.RoundHalfToEven,
+            ps.RoundHalfAwayFromZero,
+            ps.Log,
+            ps.Log2,
+            ps.Log10,
+            ps.Log1p,
+            ps.Exp,
+            ps.Sqrt,
+            ps.Abs,
+            ps.Cos,
+            ps.Sin,
+            ps.Tan,
+            ps.Tanh,
+            ps.Cosh,
+            ps.Sinh,
+            ps.Sigmoid,
+            ps.Softplus,
         ]
 
         def get_scalar_ops(s):
-            if isinstance(s, aes.Composite):
+            if isinstance(s, ps.Composite):
                 l = []
                 for node in s.fgraph.toposort():
                     l += get_scalar_ops(node.op)
@@ -1548,7 +1552,7 @@ class ProfileStats:
                 return [s]
 
         def list_scalar_op(op):
-            if isinstance(op.scalar_op, aes.Composite):
+            if isinstance(op.scalar_op, ps.Composite):
                 return get_scalar_ops(op.scalar_op)
             else:
                 return [op.scalar_op]
@@ -1575,7 +1579,7 @@ class ProfileStats:
                 return False
             else:
                 l = list_scalar_op(op)
-                return any(s_op.__class__ in [aes.Exp] for s_op in l)
+                return any(s_op.__class__ in [ps.Exp] for s_op in l)
 
         printed_tip = False
         # tip 1

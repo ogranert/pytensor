@@ -1,11 +1,12 @@
 import logging
 import warnings
-from typing import TYPE_CHECKING, Iterable, Literal, Optional, Tuple, Union
+from collections.abc import Iterable
+from typing import TYPE_CHECKING, Literal, Optional, Union
 
 import numpy as np
 
 import pytensor
-from pytensor import scalar as aes
+from pytensor import scalar as ps
 from pytensor.configdefaults import config
 from pytensor.graph.basic import Variable
 from pytensor.graph.type import HasDataType, HasShape
@@ -25,14 +26,14 @@ _logger = logging.getLogger("pytensor.tensor.type")
 
 
 # Define common subsets of dtypes (as strings).
-complex_dtypes = list(map(str, aes.complex_types))
-continuous_dtypes = list(map(str, aes.continuous_types))
-float_dtypes = list(map(str, aes.float_types))
-integer_dtypes = list(map(str, aes.integer_types))
-discrete_dtypes = list(map(str, aes.discrete_types))
-all_dtypes = list(map(str, aes.all_types))
-int_dtypes = list(map(str, aes.int_types))
-uint_dtypes = list(map(str, aes.uint_types))
+complex_dtypes = list(map(str, ps.complex_types))
+continuous_dtypes = list(map(str, ps.continuous_types))
+float_dtypes = list(map(str, ps.float_types))
+integer_dtypes = list(map(str, ps.integer_types))
+discrete_dtypes = list(map(str, ps.discrete_types))
+all_dtypes = list(map(str, ps.all_types))
+int_dtypes = list(map(str, ps.int_types))
+uint_dtypes = list(map(str, ps.uint_types))
 
 # TODO: add more type correspondences for e.g. int32, int64, float32,
 # complex64, etc.
@@ -57,7 +58,7 @@ dtype_specs_map = {
 class TensorType(CType[np.ndarray], HasDataType, HasShape):
     r"""Symbolic `Type` representing `numpy.ndarray`\s."""
 
-    __props__: Tuple[str, ...] = ("dtype", "shape")
+    __props__: tuple[str, ...] = ("dtype", "shape")
 
     dtype_specs_map = dtype_specs_map
     context_name = "cpu"
@@ -184,7 +185,7 @@ class TensorType(CType[np.ndarray], HasDataType, HasShape):
                 if isinstance(data, np.ndarray):
                     # Check if self.dtype can accurately represent data
                     # (do not try to convert the data)
-                    up_dtype = aes.upcast(self.dtype, data.dtype)
+                    up_dtype = ps.upcast(self.dtype, data.dtype)
                     if up_dtype == self.dtype:
                         # Bug in the following line when data is a
                         # scalar array, see
@@ -296,7 +297,7 @@ class TensorType(CType[np.ndarray], HasDataType, HasShape):
             )
 
     def to_scalar_type(self):
-        return aes.get_scalar_type(dtype=self.dtype)
+        return ps.get_scalar_type(dtype=self.dtype)
 
     def in_same_class(self, otype):
         r"""Determine if `otype` is in the same class of fixed broadcastable types as `self`.
@@ -614,22 +615,22 @@ class TensorType(CType[np.ndarray], HasDataType, HasShape):
         )
 
     def c_headers(self, **kwargs):
-        return aes.get_scalar_type(self.dtype).c_headers(**kwargs)
+        return ps.get_scalar_type(self.dtype).c_headers(**kwargs)
 
     def c_libraries(self, **kwargs):
-        return aes.get_scalar_type(self.dtype).c_libraries(**kwargs)
+        return ps.get_scalar_type(self.dtype).c_libraries(**kwargs)
 
     def c_compile_args(self, **kwargs):
-        return aes.get_scalar_type(self.dtype).c_compile_args(**kwargs)
+        return ps.get_scalar_type(self.dtype).c_compile_args(**kwargs)
 
     def c_support_code(self, **kwargs):
-        return aes.get_scalar_type(self.dtype).c_support_code(**kwargs)
+        return ps.get_scalar_type(self.dtype).c_support_code(**kwargs)
 
     def c_init_code(self, **kwargs):
-        return aes.get_scalar_type(self.dtype).c_init_code(**kwargs)
+        return ps.get_scalar_type(self.dtype).c_init_code(**kwargs)
 
     def c_code_cache_version(self):
-        scalar_version = aes.get_scalar_type(self.dtype).c_code_cache_version()
+        scalar_version = ps.get_scalar_type(self.dtype).c_code_cache_version()
         if scalar_version:
             return (11,) + scalar_version
         else:
@@ -793,7 +794,7 @@ def tensor(
     name: Optional[str] = None,
     *,
     dtype: Optional["DTypeLike"] = None,
-    shape: Optional[Tuple[ST, ...]] = None,
+    shape: Optional[tuple[ST, ...]] = None,
     **kwargs,
 ) -> "TensorVariable":
     if name is not None:
@@ -868,7 +869,7 @@ ivector = TensorType("int32", shape=(None,))
 lvector = TensorType("int64", shape=(None,))
 
 
-def _validate_static_shape(shape, ndim: int) -> Tuple[ST, ...]:
+def _validate_static_shape(shape, ndim: int) -> tuple[ST, ...]:
     if not isinstance(shape, tuple):
         raise TypeError(f"Shape must be a tuple, got {type(shape)}")
 
@@ -885,7 +886,7 @@ def vector(
     name: Optional[str] = None,
     *,
     dtype: Optional["DTypeLike"] = None,
-    shape: Optional[Tuple[ST]] = (None,),
+    shape: Optional[tuple[ST]] = (None,),
 ) -> "TensorVariable":
     """Return a symbolic vector variable.
 
@@ -931,7 +932,7 @@ def matrix(
     name: Optional[str] = None,
     *,
     dtype: Optional["DTypeLike"] = None,
-    shape: Optional[Tuple[ST, ST]] = (None, None),
+    shape: Optional[tuple[ST, ST]] = (None, None),
 ) -> "TensorVariable":
     """Return a symbolic matrix variable.
 
@@ -975,7 +976,7 @@ def row(
     name: Optional[str] = None,
     *,
     dtype: Optional["DTypeLike"] = None,
-    shape: Optional[Tuple[Literal[1], ST]] = (1, None),
+    shape: Optional[tuple[Literal[1], ST]] = (1, None),
 ) -> "TensorVariable":
     """Return a symbolic row variable (i.e. shape ``(1, None)``).
 
@@ -1019,7 +1020,7 @@ def col(
     name: Optional[str] = None,
     *,
     dtype: Optional["DTypeLike"] = None,
-    shape: Optional[Tuple[ST, Literal[1]]] = (None, 1),
+    shape: Optional[tuple[ST, Literal[1]]] = (None, 1),
 ) -> "TensorVariable":
     """Return a symbolic column variable (i.e. shape ``(None, 1)``).
 
@@ -1061,7 +1062,7 @@ def tensor3(
     name: Optional[str] = None,
     *,
     dtype: Optional["DTypeLike"] = None,
-    shape: Optional[Tuple[ST, ST, ST]] = (None, None, None),
+    shape: Optional[tuple[ST, ST, ST]] = (None, None, None),
 ) -> "TensorVariable":
     """Return a symbolic 3D variable.
 
@@ -1101,7 +1102,7 @@ def tensor4(
     name: Optional[str] = None,
     *,
     dtype: Optional["DTypeLike"] = None,
-    shape: Optional[Tuple[ST, ST, ST, ST]] = (None, None, None, None),
+    shape: Optional[tuple[ST, ST, ST, ST]] = (None, None, None, None),
 ) -> "TensorVariable":
     """Return a symbolic 4D variable.
 
@@ -1141,7 +1142,7 @@ def tensor5(
     name: Optional[str] = None,
     *,
     dtype: Optional["DTypeLike"] = None,
-    shape: Optional[Tuple[ST, ST, ST, ST, ST]] = (None, None, None, None, None),
+    shape: Optional[tuple[ST, ST, ST, ST, ST]] = (None, None, None, None, None),
 ) -> "TensorVariable":
     """Return a symbolic 5D variable.
 
@@ -1181,7 +1182,7 @@ def tensor6(
     name: Optional[str] = None,
     *,
     dtype: Optional["DTypeLike"] = None,
-    shape: Optional[Tuple[ST, ST, ST, ST, ST, ST]] = (
+    shape: Optional[tuple[ST, ST, ST, ST, ST, ST]] = (
         None,
         None,
         None,
@@ -1228,7 +1229,7 @@ def tensor7(
     name: Optional[str] = None,
     *,
     dtype: Optional["DTypeLike"] = None,
-    shape: Optional[Tuple[ST, ST, ST, ST, ST, ST, ST]] = (
+    shape: Optional[tuple[ST, ST, ST, ST, ST, ST, ST]] = (
         None,
         None,
         None,

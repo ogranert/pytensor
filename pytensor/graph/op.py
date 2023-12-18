@@ -2,16 +2,13 @@ import copy
 import sys
 import warnings
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from typing import (
     TYPE_CHECKING,
     Any,
     Callable,
-    Dict,
-    List,
     Optional,
     Protocol,
-    Sequence,
-    Tuple,
     TypeVar,
     Union,
     cast,
@@ -19,15 +16,13 @@ from typing import (
 
 import pytensor
 from pytensor.configdefaults import config
-from pytensor.graph.basic import Apply, NoParams, Variable
+from pytensor.graph.basic import Apply, Variable
 from pytensor.graph.utils import (
     MetaObject,
-    MethodNotDefined,
     TestValueError,
     add_tag_trace,
     get_variable_trace_string,
 )
-from pytensor.link.c.params_type import Params, ParamsType
 
 
 if TYPE_CHECKING:
@@ -35,15 +30,12 @@ if TYPE_CHECKING:
     from pytensor.graph.fg import FunctionGraph
     from pytensor.graph.type import Type
 
-StorageCellType = List[Optional[Any]]
-StorageMapType = Dict[Variable, StorageCellType]
-ComputeMapType = Dict[Variable, List[bool]]
-InputStorageType = List[StorageCellType]
-OutputStorageType = List[StorageCellType]
-ParamsInputType = Optional[Tuple[Any, ...]]
-PerformMethodType = Callable[
-    [Apply, List[Any], OutputStorageType, ParamsInputType], None
-]
+StorageCellType = list[Optional[Any]]
+StorageMapType = dict[Variable, StorageCellType]
+ComputeMapType = dict[Variable, list[bool]]
+InputStorageType = list[StorageCellType]
+OutputStorageType = list[StorageCellType]
+PerformMethodType = Callable[[Apply, list[Any], OutputStorageType], None]
 BasicThunkType = Callable[[], None]
 ThunkCallableType = Callable[
     [PerformMethodType, StorageMapType, ComputeMapType, Apply], None
@@ -53,8 +45,8 @@ C = TypeVar("C", bound=Callable)
 
 
 class ThunkType(Protocol[C]):
-    inputs: List[List[Optional[List[Any]]]]
-    outputs: List[List[Optional[List[Any]]]]
+    inputs: list[list[Optional[list[Any]]]]
+    outputs: list[list[Optional[list[Any]]]]
     lazy: bool
     __call__: C
     perform: PerformMethodType
@@ -173,7 +165,7 @@ class Op(MetaObject):
 
     """
 
-    view_map: Dict[int, List[int]] = {}
+    view_map: dict[int, list[int]] = {}
     """
     A ``dict`` that maps output indices to the input indices of which they are
     a view.
@@ -188,7 +180,7 @@ class Op(MetaObject):
 
     """
 
-    destroy_map: Dict[int, List[int]] = {}
+    destroy_map: dict[int, list[int]] = {}
     """
     A ``dict`` that maps output indices to the input indices upon which they
     operate in-place.
@@ -205,7 +197,6 @@ class Op(MetaObject):
 
     itypes: Optional[Sequence["Type"]] = None
     otypes: Optional[Sequence["Type"]] = None
-    params_type: Optional[ParamsType] = None
 
     _output_type_depends_on_input_value = False
     """
@@ -258,7 +249,7 @@ class Op(MetaObject):
             )
         return Apply(self, inputs, [o() for o in self.otypes])
 
-    def __call__(self, *inputs: Any, **kwargs) -> Union[Variable, List[Variable]]:
+    def __call__(self, *inputs: Any, **kwargs) -> Union[Variable, list[Variable]]:
         r"""Construct an `Apply` node using :meth:`Op.make_node` and return its outputs.
 
         This method is just a wrapper around :meth:`Op.make_node`.
@@ -328,7 +319,7 @@ class Op(MetaObject):
 
     def grad(
         self, inputs: Sequence[Variable], output_grads: Sequence[Variable]
-    ) -> List[Variable]:
+    ) -> list[Variable]:
         r"""Construct a graph for the gradient with respect to each input variable.
 
         Each returned `Variable` represents the gradient with respect to that
@@ -376,7 +367,7 @@ class Op(MetaObject):
         inputs: Sequence[Variable],
         outputs: Sequence[Variable],
         output_grads: Sequence[Variable],
-    ) -> List[Variable]:
+    ) -> list[Variable]:
         r"""Construct a graph for the L-operator.
 
         The L-operator computes a row vector times the Jacobian.
@@ -401,8 +392,8 @@ class Op(MetaObject):
         return self.grad(inputs, output_grads)
 
     def R_op(
-        self, inputs: List[Variable], eval_points: Union[Variable, List[Variable]]
-    ) -> List[Variable]:
+        self, inputs: list[Variable], eval_points: Union[Variable, list[Variable]]
+    ) -> list[Variable]:
         r"""Construct a graph for the R-operator.
 
         This method is primarily used by `Rop`.
@@ -429,7 +420,6 @@ class Op(MetaObject):
         node: Apply,
         inputs: Sequence[Any],
         output_storage: OutputStorageType,
-        params: ParamsInputType = None,
     ) -> None:
         """Calculate the function on the inputs and put the variables in the output storage.
 
@@ -445,8 +435,6 @@ class Op(MetaObject):
             these lists).  Each sub-list corresponds to value of each
             `Variable` in :attr:`node.outputs`.  The primary purpose of this method
             is to set the values of these sub-lists.
-        params
-            A tuple containing the values of each entry in :attr:`Op.__props__`.
 
         Notes
         -----
@@ -484,22 +472,6 @@ class Op(MetaObject):
         """
         return True
 
-    def get_params(self, node: Apply) -> Params:
-        """Try to get parameters for the `Op` when :attr:`Op.params_type` is set to a `ParamsType`."""
-        if isinstance(self.params_type, ParamsType):
-            wrapper = self.params_type
-            if not all(hasattr(self, field) for field in wrapper.fields):
-                # Let's print missing attributes for debugging.
-                not_found = tuple(
-                    field for field in wrapper.fields if not hasattr(self, field)
-                )
-                raise AttributeError(
-                    f"{type(self).__name__}: missing attributes {not_found} for ParamsType."
-                )
-            # ParamsType.get_params() will apply filtering to attributes.
-            return self.params_type.get_params(self)
-        raise MethodNotDefined("get_params")
-
     def prepare_node(
         self,
         node: Apply,
@@ -525,7 +497,7 @@ class Op(MetaObject):
         node: Apply,
         storage_map: StorageMapType,
         compute_map: ComputeMapType,
-        no_recycling: List[Variable],
+        no_recycling: list[Variable],
         debug: bool = False,
     ) -> ThunkType:
         """Make a Python thunk.
@@ -541,34 +513,12 @@ class Op(MetaObject):
         else:
             p = node.op.perform
 
-        params = node.run_params()
-
-        if params is NoParams:
-            # default arguments are stored in the closure of `rval`
-            @is_thunk_type
-            def rval(
-                p=p, i=node_input_storage, o=node_output_storage, n=node, params=None
-            ):
-                r = p(n, [x[0] for x in i], o)
-                for o in node.outputs:
-                    compute_map[o][0] = True
-                return r
-
-        else:
-            params_val = node.params_type.filter(params)
-
-            @is_thunk_type
-            def rval(
-                p=p,
-                i=node_input_storage,
-                o=node_output_storage,
-                n=node,
-                params=params_val,
-            ):
-                r = p(n, [x[0] for x in i], o, params)
-                for o in node.outputs:
-                    compute_map[o][0] = True
-                return r
+        @is_thunk_type
+        def rval(p=p, i=node_input_storage, o=node_output_storage, n=node):
+            r = p(n, [x[0] for x in i], o)
+            for o in node.outputs:
+                compute_map[o][0] = True
+            return r
 
         rval.inputs = node_input_storage
         rval.outputs = node_output_storage
@@ -581,7 +531,7 @@ class Op(MetaObject):
         node: Apply,
         storage_map: StorageMapType,
         compute_map: ComputeMapType,
-        no_recycling: List[Variable],
+        no_recycling: list[Variable],
         impl: Optional[str] = None,
     ) -> ThunkType:
         r"""Create a thunk.
@@ -643,7 +593,7 @@ class _NoPythonOp(Op):
 
     """
 
-    def perform(self, node, inputs, output_storage, params=None):
+    def perform(self, node, inputs, output_storage):
         raise NotImplementedError("No Python implementation is provided by this Op.")
 
 
@@ -660,12 +610,12 @@ class HasInnerGraph(ABC):
 
     @property
     @abstractmethod
-    def inner_inputs(self) -> List[Variable]:
+    def inner_inputs(self) -> list[Variable]:
         """The inner function's inputs."""
 
     @property
     @abstractmethod
-    def inner_outputs(self) -> List[Variable]:
+    def inner_outputs(self) -> list[Variable]:
         """The inner function's outputs."""
 
     @abstractmethod
@@ -721,7 +671,7 @@ def missing_test_message(msg: str) -> None:
         assert action in ("ignore", "off")
 
 
-def get_test_values(*args: Variable) -> Union[Any, List[Any]]:
+def get_test_values(*args: Variable) -> Union[Any, list[Any]]:
     r"""Get test values for multiple `Variable`\s.
 
     Intended use:

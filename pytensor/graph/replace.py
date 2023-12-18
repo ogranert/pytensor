@@ -1,7 +1,15 @@
+import warnings
+from collections.abc import Iterable, Mapping, Sequence
 from functools import partial, singledispatch
-from typing import Iterable, Mapping, Optional, Sequence, Union, cast, overload
+from typing import Optional, Union, cast, overload
 
-from pytensor.graph.basic import Apply, Constant, Variable, truncated_graph_inputs
+from pytensor.graph.basic import (
+    Apply,
+    Constant,
+    Variable,
+    io_toposort,
+    truncated_graph_inputs,
+)
 from pytensor.graph.fg import FunctionGraph
 from pytensor.graph.op import Op
 
@@ -202,7 +210,7 @@ def graph_replace(
 
 
 @singledispatch
-def _vectorize_node(op: Op, node: Apply, *bached_inputs) -> Apply:
+def _vectorize_node(op: Op, node: Apply, *batched_inputs) -> Apply:
     # Default implementation is provided in pytensor.tensor.blockwise
     raise NotImplementedError
 
@@ -213,8 +221,12 @@ def vectorize_node(node: Apply, *batched_inputs) -> Apply:
     return _vectorize_node(op, node, *batched_inputs)
 
 
+def _vectorize_not_needed(op, node, *batched_inputs):
+    return op.make_node(*batched_inputs)
+
+
 @overload
-def vectorize(
+def vectorize_graph(
     outputs: Variable,
     replace: Mapping[Variable, Variable],
 ) -> Variable:
@@ -222,14 +234,14 @@ def vectorize(
 
 
 @overload
-def vectorize(
+def vectorize_graph(
     outputs: Sequence[Variable],
     replace: Mapping[Variable, Variable],
 ) -> Sequence[Variable]:
     ...
 
 
-def vectorize(
+def vectorize_graph(
     outputs: Union[Variable, Sequence[Variable]],
     replace: Mapping[Variable, Variable],
 ) -> Union[Variable, Sequence[Variable]]:
@@ -244,7 +256,7 @@ def vectorize(
         import pytensor
         import pytensor.tensor as pt
 
-        from pytensor.graph import vectorize
+        from pytensor.graph import vectorize_graph
 
         # Original graph
         x = pt.vector("x")
@@ -252,7 +264,7 @@ def vectorize(
 
         # Vectorized graph
         new_x = pt.matrix("new_x")
-        new_y = vectorize(y, replace={x: new_x})
+        new_y = vectorize_graph(y, replace={x: new_x})
 
         fn = pytensor.function([new_x], new_y)
         fn([[0, 1, 2], [2, 1, 0]])
@@ -265,7 +277,7 @@ def vectorize(
         import pytensor
         import pytensor.tensor as pt
 
-        from pytensor.graph import vectorize
+        from pytensor.graph import vectorize_graph
 
         # Original graph
         x = pt.vector("x")
@@ -274,7 +286,7 @@ def vectorize(
 
         # Vectorized graph
         new_x = pt.matrix("new_x")
-        [new_y1, new_y2] = vectorize([y1, y2], replace={x: new_x})
+        [new_y1, new_y2] = vectorize_graph([y1, y2], replace={x: new_x})
 
         fn = pytensor.function([new_x], [new_y1, new_y2])
         fn([[-10, 0, 10], [-11, 0, 11]])
@@ -289,22 +301,22 @@ def vectorize(
     inputs = truncated_graph_inputs(seq_outputs, ancestors_to_include=replace.keys())
     new_inputs = [replace.get(inp, inp) for inp in inputs]
 
-    def transform(var: Variable) -> Variable:
-        if var in inputs:
-            return new_inputs[inputs.index(var)]
+    vect_vars = dict(zip(inputs, new_inputs))
+    for node in io_toposort(inputs, seq_outputs):
+        vect_inputs = [vect_vars.get(inp, inp) for inp in node.inputs]
+        vect_node = vectorize_node(node, *vect_inputs)
+        for output, vect_output in zip(node.outputs, vect_node.outputs):
+            vect_vars[output] = vect_output
 
-        node = var.owner
-        batched_inputs = [transform(inp) for inp in node.inputs]
-        batched_node = vectorize_node(node, *batched_inputs)
-        batched_var = batched_node.outputs[var.owner.outputs.index(var)]
-
-        return cast(Variable, batched_var)
-
-    # TODO: MergeOptimization or node caching?
-    seq_vect_outputs = [transform(out) for out in seq_outputs]
+    seq_vect_outputs = [vect_vars[out] for out in seq_outputs]
 
     if isinstance(outputs, Sequence):
         return seq_vect_outputs
     else:
         [vect_output] = seq_vect_outputs
         return vect_output
+
+
+def vectorize(*args, **kwargs):
+    warnings.warn("vectorize was renamed to vectorize_graph", UserWarning)
+    return vectorize_graph(*args, **kwargs)

@@ -6,6 +6,7 @@ import atexit
 import importlib
 import logging
 import os
+import pathlib
 import pickle
 import platform
 import re
@@ -19,17 +20,7 @@ import textwrap
 import time
 import warnings
 from io import BytesIO, StringIO
-from typing import (
-    TYPE_CHECKING,
-    Callable,
-    Dict,
-    List,
-    Optional,
-    Protocol,
-    Set,
-    Tuple,
-    cast,
-)
+from typing import TYPE_CHECKING, Callable, Optional, Protocol, cast
 
 import numpy as np
 from setuptools._distutils.sysconfig import (
@@ -60,12 +51,12 @@ if TYPE_CHECKING:
 
 
 class StdLibDirsAndLibsType(Protocol):
-    data: Optional[Tuple[List[str], ...]]
-    __call__: Callable[[], Optional[Tuple[List[str], ...]]]
+    data: Optional[tuple[list[str], ...]]
+    __call__: Callable[[], Optional[tuple[list[str], ...]]]
 
 
 def is_StdLibDirsAndLibsType(
-    fn: Callable[[], Optional[Tuple[List[str], ...]]]
+    fn: Callable[[], Optional[tuple[list[str], ...]]]
 ) -> StdLibDirsAndLibsType:
     return cast(StdLibDirsAndLibsType, fn)
 
@@ -683,33 +674,33 @@ class ModuleCache:
     The working directory that is managed by this interface.
 
     """
-    module_from_name: Dict = {}
+    module_from_name: dict = {}
     """
     Maps a module filename to the loaded module object.
 
     """
-    entry_from_key: Dict = {}
+    entry_from_key: dict = {}
     """
     Maps keys to the filename of a ``.so/.pyd``.
 
     """
-    similar_keys: Dict = {}
+    similar_keys: dict = {}
     """
     Maps a part-of-key to all keys that share this same part.
 
     """
-    module_hash_to_key_data: Dict = {}
+    module_hash_to_key_data: dict = {}
     """
     Maps a module hash to its corresponding `KeyData` object.
 
     """
-    stats: List = []
+    stats: list = []
     """
     A list with counters for the number of hits, loads, compiles issued by
     `ModuleCache.module_from_key`.
 
     """
-    loaded_key_pkl: Set = set()
+    loaded_key_pkl: set = set()
     """
     Set of all ``key.pkl`` files that have been loaded.
 
@@ -1693,7 +1684,7 @@ def std_include_dirs():
 
 
 @is_StdLibDirsAndLibsType
-def std_lib_dirs_and_libs() -> Optional[Tuple[List[str], ...]]:
+def std_lib_dirs_and_libs() -> Optional[tuple[list[str], ...]]:
     # We cache the results as on Windows, this trigger file access and
     # this method is called many times.
     if std_lib_dirs_and_libs.data is not None:
@@ -2430,10 +2421,10 @@ class GCC_compiler(Compiler):
         )
 
     @staticmethod
-    def patch_ldflags(flag_list: List[str]) -> List[str]:
+    def patch_ldflags(flag_list: list[str]) -> list[str]:
         lib_dirs = [flag[2:].lstrip() for flag in flag_list if flag.startswith("-L")]
-        flag_idxs: List[int] = []
-        libs: List[str] = []
+        flag_idxs: list[int] = []
+        libs: list[str] = []
         for i, flag in enumerate(flag_list):
             if flag.startswith("-l"):
                 flag_idxs.append(i)
@@ -2446,7 +2437,7 @@ class GCC_compiler(Compiler):
         return flag_list
 
     @staticmethod
-    def linking_patch(lib_dirs: List[str], libs: List[str]) -> List[str]:
+    def linking_patch(lib_dirs: list[str], libs: list[str]) -> list[str]:
         if sys.platform != "win32":
             return [f"-l{l}" for l in libs]
         else:
@@ -2715,203 +2706,192 @@ def default_blas_ldflags():
     str
 
     """
-    warn_record = []
-    try:
-        blas_info = np.__config__.get_info("blas_opt")
 
-        # If we are in a EPD installation, mkl is available
-        if "EPD" in sys.version:
-            use_unix_epd = True
-            if sys.platform == "win32":
-                return " ".join(
-                    ['-L"%s"' % os.path.join(sys.prefix, "Scripts")]
-                    +
-                    # Why on Windows, the library used are not the
-                    # same as what is in
-                    # blas_info['libraries']?
-                    [f"-l{l}" for l in ("mk2_core", "mk2_intel_thread", "mk2_rt")]
-                )
-            elif sys.platform == "darwin":
-                # The env variable is needed to link with mkl
-                new_path = os.path.join(sys.prefix, "lib")
-                v = os.getenv("DYLD_FALLBACK_LIBRARY_PATH", None)
-                if v is not None:
-                    # Explicit version could be replaced by a symbolic
-                    # link called 'Current' created by EPD installer
-                    # This will resolve symbolic links
-                    v = os.path.realpath(v)
+    def check_required_file(paths, required_regexs):
+        libs = []
+        for req in required_regexs:
+            found = False
+            for path in paths:
+                m = re.search(req, path.name)
+                if m:
+                    libs.append((str(path.parent), m.string[slice(*m.span())]))
+                    found = True
+                    break
+            if not found:
+                _logger.debug("Required file '%s' not found", req)
+                raise RuntimeError(f"Required file {req} not found")
+        return libs
 
-                # The python __import__ don't seam to take into account
-                # the new env variable "DYLD_FALLBACK_LIBRARY_PATH"
-                # when we set with os.environ['...'] = X or os.putenv()
-                # So we warn the user and tell him what todo.
-                if v is None or new_path not in v.split(":"):
-                    _logger.warning(
-                        "The environment variable "
-                        "'DYLD_FALLBACK_LIBRARY_PATH' does not contain "
-                        "the '{new_path}' path in its value. This will make "
-                        "PyTensor use a slow version of BLAS. Update "
-                        "'DYLD_FALLBACK_LIBRARY_PATH' to contain the "
-                        "said value, this will disable this warning."
-                    )
-
-                    use_unix_epd = False
-            if use_unix_epd:
-                return " ".join(
-                    ["-L%s" % os.path.join(sys.prefix, "lib")]
-                    + ["-l%s" % l for l in blas_info["libraries"]]
-                )
-
-                # Canopy
-        if "Canopy" in sys.prefix:
-            subsub = "lib"
-            if sys.platform == "win32":
-                subsub = "Scripts"
-            lib_path = os.path.join(sys.base_prefix, subsub)
-            if not os.path.exists(lib_path):
-                # Old logic to find the path. I don't think we still
-                # need it, but I don't have the time to test all
-                # installation configuration. So I keep this as a fall
-                # back in case the current expectation don't work.
-
-                # This old logic don't work when multiple version of
-                # Canopy is installed.
-                p = os.path.join(sys.base_prefix, "..", "..", "appdata")
-                assert os.path.exists(p), "Canopy changed the location of MKL"
-                lib_paths = os.listdir(p)
-                # Try to remove subdir that can't contain MKL
-                for sub in lib_paths:
-                    if not os.path.exists(os.path.join(p, sub, subsub)):
-                        lib_paths.remove(sub)
-                assert len(lib_paths) == 1, (
-                    "Unexpected case when looking for Canopy MKL libraries",
-                    p,
-                    lib_paths,
-                    [os.listdir(os.path.join(p, sub)) for sub in lib_paths],
-                )
-                lib_path = os.path.join(p, lib_paths[0], subsub)
-                assert os.path.exists(lib_path), "Canopy changed the location of MKL"
-
-            if sys.platform == "linux2" or sys.platform == "darwin":
-                return " ".join(
-                    ["-L%s" % lib_path] + ["-l%s" % l for l in blas_info["libraries"]]
-                )
-            elif sys.platform == "win32":
-                return " ".join(
-                    ['-L"%s"' % lib_path]
-                    +
-                    # Why on Windows, the library used are not the
-                    # same as what is in blas_info['libraries']?
-                    [f"-l{l}" for l in ("mk2_core", "mk2_intel_thread", "mk2_rt")]
-                )
-
-        # MKL
-        # If mkl can be imported then use it. On conda:
-        # "conda install mkl-service" installs the Python wrapper and
-        # the low-level C libraries as well as optimised version of
-        # numpy and scipy.
-        try:
-            import mkl  # noqa
-        except ImportError:
-            pass
-        else:
-            # This branch is executed if no exception was raised
-            if sys.platform == "win32":
-                lib_path = os.path.join(sys.prefix, "Library", "bin")
-                flags = [f'-L"{lib_path}"']
-            else:
-                lib_path = blas_info.get("library_dirs", [])
-                flags = []
-                if lib_path:
-                    flags = [f"-L{lib_path[0]}"]
-            if "2018" in mkl.get_version_string():
-                thr = "mkl_gnu_thread"
-            else:
-                thr = "mkl_intel_thread"
-            base_flags = list(flags)
-            flags += [f"-l{l}" for l in ("mkl_core", thr, "mkl_rt")]
-            res = try_blas_flag(flags)
-
-            if not res and sys.platform == "win32" and thr == "mkl_gnu_thread":
-                # Check if it would work for intel OpenMP on windows
-                flags = base_flags + [
-                    f"-l{l}" for l in ("mkl_core", "mkl_intel_thread", "mkl_rt")
-                ]
-                res = try_blas_flag(flags)
-
-            if res:
-                check_mkl_openmp()
-                return res
-
-            flags.extend(["-Wl,-rpath," + l for l in blas_info.get("library_dirs", [])])
-            res = try_blas_flag(flags)
-            if res:
-                check_mkl_openmp()
-                maybe_add_to_os_environ_pathlist("PATH", lib_path[0])
-                return res
-
-        # to support path that includes spaces, we need to wrap it with double quotes on Windows
-        path_wrapper = '"' if os.name == "nt" else ""
-        ret = (
-            # TODO: the Gemm op below should separate the
-            # -L and -l arguments into the two callbacks
-            # that CLinker uses for that stuff.  for now,
-            # we just pass the whole ldflags as the -l
-            # options part.
-            [
-                f"-L{path_wrapper}{l}{path_wrapper}"
-                for l in blas_info.get("library_dirs", [])
-            ]
-            + [f"-l{l}" for l in blas_info.get("libraries", [])]
-            + blas_info.get("extra_link_args", [])
+    def get_cxx_library_dirs():
+        cmd = f"{config.cxx} -print-search-dirs"
+        p = subprocess_Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.PIPE,
+            shell=True,
         )
-        # For some very strange reason, we need to specify -lm twice
-        # to get mkl to link correctly.  I have no idea why.
-        if any("mkl" in fl for fl in ret):
-            ret.extend(["-lm", "-lm"])
-        res = try_blas_flag(ret)
+        (stdout, stderr) = p.communicate(input=b"")
+        if p.returncode != 0:
+            warnings.warn(
+                "Pytensor cxx failed to communicate its search dirs. As a consequence, "
+                "it might not be possible to automatically determine the blas link flags to use.\n"
+                f"Command that was run: {config.cxx} -print-search-dirs\n"
+                f"Output printed to stderr: {stderr.decode(sys.stderr.encoding)}"
+            )
+            return []
+
+        maybe_lib_dirs = [
+            [pathlib.Path(p).resolve() for p in line[len("libraries: =") :].split(":")]
+            for line in stdout.decode(sys.stdout.encoding).splitlines()
+            if line.startswith("libraries: =")
+        ]
+        if len(maybe_lib_dirs) > 0:
+            maybe_lib_dirs = maybe_lib_dirs[0]
+        return [str(d) for d in maybe_lib_dirs if d.exists() and d.is_dir()]
+
+    def check_libs(
+        all_libs, required_libs, extra_compile_flags=None, cxx_library_dirs=None
+    ):
+        if cxx_library_dirs is None:
+            cxx_library_dirs = []
+        if extra_compile_flags is None:
+            extra_compile_flags = []
+        found_libs = check_required_file(
+            all_libs,
+            required_libs,
+        )
+        path_quote = '"' if sys.platform == "win32" else ""
+        libdir_ldflags = list(
+            dict.fromkeys(
+                [
+                    f"-L{path_quote}{lib_path}{path_quote}"
+                    for lib_path, _ in found_libs
+                    if lib_path not in cxx_library_dirs
+                ]
+            )
+        )
+
+        flags = (
+            libdir_ldflags
+            + [f"-l{lib_name}" for _, lib_name in found_libs]
+            + extra_compile_flags
+        )
+        res = try_blas_flag(flags)
         if res:
-            if "mkl" in res:
-                check_mkl_openmp()
-            return res
-
-        # If we are using conda and can't reuse numpy blas, then doing
-        # the fallback and test -lblas could give slow computation, so
-        # warn about this.
-        for warn in warn_record:
-            _logger.warning(warn)
-        del warn_record
-
-        # Some environment don't have the lib dir in LD_LIBRARY_PATH.
-        # So add it.
-        ret.extend(["-Wl,-rpath," + l for l in blas_info.get("library_dirs", [])])
-        res = try_blas_flag(ret)
-        if res:
-            if "mkl" in res:
-                check_mkl_openmp()
-            return res
-
-        # Add sys.prefix/lib to the runtime search path. On
-        # non-system installations of Python that use the
-        # system linker, this is generally necessary.
-        if sys.platform in ("linux", "darwin"):
-            lib_path = os.path.join(sys.prefix, "lib")
-            ret.append("-Wl,-rpath," + lib_path)
-            res = try_blas_flag(ret)
-            if res:
-                if "mkl" in res:
+            if any("mkl" in flag for flag in flags):
+                try:
                     check_mkl_openmp()
-                return res
+                except Exception as e:
+                    _logger.debug(e)
+            _logger.debug("The following blas flags will be used: '%s'", res)
+            return res
+        else:
+            _logger.debug(f"Supplied flags {res} failed to compile")
+            _logger.debug("Supplied flags '%s' failed to compile", res)
+            raise RuntimeError(f"Supplied flags {flags} failed to compile")
 
-    except KeyError:
-        pass
+    # If no compiler is available we default to empty ldflags
+    if not config.cxx:
+        return ""
+    _std_lib_dirs = std_lib_dirs()
+    if len(_std_lib_dirs) > 0:
+        rpath = _std_lib_dirs[0]
+    else:
+        rpath = None
 
-    # Even if we could not detect what was used for numpy, or if these
-    # libraries are not found, most Linux systems have a libblas.so
-    # readily available. We try to see if that's the case, rather
-    # than disable blas. To test it correctly, we must load a program.
-    # Otherwise, there could be problem in the LD_LIBRARY_PATH.
-    return try_blas_flag(["-lblas"])
+    cxx_library_dirs = get_cxx_library_dirs()
+    searched_library_dirs = cxx_library_dirs + _std_lib_dirs
+    if sys.platform == "win32":
+        # Conda on Windows saves MKL libraries under CONDA_PREFIX\Library\bin
+        # From the conda manual (https://docs.conda.io/projects/conda-build/en/stable/user-guide/environment-variables.html)
+        # it seems like conda could also save some libraries into the CONDA_PREFIX\Library\lib
+        # directory. We will include both in our searched library dirs
+        searched_library_dirs.append(os.path.join(sys.prefix, "Library", "bin"))
+        searched_library_dirs.append(os.path.join(sys.prefix, "Library", "lib"))
+    search_dirs = "\n".join(searched_library_dirs)
+    _logger.debug(
+        "Will search for BLAS libraries in the following directories:\n%s",
+        search_dirs,
+    )
+    all_libs = [
+        l
+        for path in [
+            pathlib.Path(library_dir)
+            for library_dir in searched_library_dirs
+            if pathlib.Path(library_dir).exists()
+        ]
+        for l in path.iterdir()
+        if l.suffix in {".so", ".dll", ".dylib"}
+    ]
+
+    if rpath is not None:
+        maybe_add_to_os_environ_pathlist("PATH", rpath)
+    try:
+        # 1. Try to use MKL with INTEL OpenMP threading
+        _logger.debug("Checking MKL flags with intel threading")
+        return check_libs(
+            all_libs,
+            required_libs=[
+                "mkl_core",
+                "mkl_rt",
+                "mkl_intel_thread",
+                "iomp5",
+                "pthread",
+            ],
+            extra_compile_flags=[f"-Wl,-rpath,{rpath}"] if rpath is not None else [],
+            cxx_library_dirs=cxx_library_dirs,
+        )
+    except Exception as e:
+        _logger.debug(e)
+    try:
+        # 2. Try to use MKL with GNU OpenMP threading
+        _logger.debug("Checking MKL flags with GNU OpenMP threading")
+        return check_libs(
+            all_libs,
+            required_libs=["mkl_core", "mkl_rt", "mkl_gnu_thread", "gomp", "pthread"],
+            extra_compile_flags=[f"-Wl,-rpath,{rpath}"] if rpath is not None else [],
+            cxx_library_dirs=cxx_library_dirs,
+        )
+    except Exception as e:
+        _logger.debug(e)
+    try:
+        _logger.debug("Checking Lapack + blas")
+        # 3. Try to use LAPACK + BLAS
+        return check_libs(
+            all_libs,
+            required_libs=["lapack", "blas", "cblas", "m"],
+            extra_compile_flags=[f"-Wl,-rpath,{rpath}"] if rpath is not None else [],
+            cxx_library_dirs=cxx_library_dirs,
+        )
+    except Exception as e:
+        _logger.debug(e)
+    try:
+        # 4. Try to use BLAS alone
+        _logger.debug("Checking blas alone")
+        return check_libs(
+            all_libs,
+            required_libs=["blas", "cblas"],
+            extra_compile_flags=[f"-Wl,-rpath,{rpath}"] if rpath is not None else [],
+            cxx_library_dirs=cxx_library_dirs,
+        )
+    except Exception as e:
+        _logger.debug(e)
+    try:
+        # 5. Try to use openblas
+        _logger.debug("Checking openblas")
+        return check_libs(
+            all_libs,
+            required_libs=["openblas", "gfortran", "gomp", "m"],
+            extra_compile_flags=["-fopenmp", f"-Wl,-rpath,{rpath}"]
+            if rpath is not None
+            else ["-fopenmp"],
+            cxx_library_dirs=cxx_library_dirs,
+        )
+    except Exception as e:
+        _logger.debug(e)
+    _logger.debug("Failed to identify blas ldflags. Will leave them empty.")
+    return ""
 
 
 def add_blas_configvars():

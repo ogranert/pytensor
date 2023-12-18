@@ -1,10 +1,11 @@
 """Define new Ops from existing Ops"""
 from collections import OrderedDict
+from collections.abc import Sequence
 from copy import copy
 from functools import partial
-from typing import Dict, List, Optional, Sequence, Tuple, cast
+from typing import Optional, cast
 
-import pytensor.tensor as at
+import pytensor.tensor as pt
 from pytensor import function
 from pytensor.compile.function.pfunc import rebuild_collect_shared
 from pytensor.compile.mode import optdb
@@ -83,11 +84,11 @@ def infer_shape(outs, inputs, input_shapes):
 
 def construct_nominal_fgraph(
     inputs: Sequence[Variable], outputs: Sequence[Variable]
-) -> Tuple[
+) -> tuple[
     FunctionGraph,
     Sequence[Variable],
-    Dict[Variable, Variable],
-    Dict[Variable, Variable],
+    dict[Variable, Variable],
+    dict[Variable, Variable],
 ]:
     """Construct an inner-`FunctionGraph` with ordered nominal inputs."""
     dummy_inputs = []
@@ -204,9 +205,9 @@ class OpFromGraph(Op, HasInnerGraph):
 
     .. code-block:: python
 
-        from pytensor import function, tensor as at
+        from pytensor import function, tensor as pt
         from pytensor.compile.builders import OpFromGraph
-        x, y, z = at.scalars('xyz')
+        x, y, z = pt.scalars('xyz')
         e = x + y * z
         op = OpFromGraph([x, y, z], [e])
         # op behaves like a normal pytensor op
@@ -219,10 +220,10 @@ class OpFromGraph(Op, HasInnerGraph):
 
         import numpy as np
         import pytensor
-        from pytensor import config, function, tensor as at
+        from pytensor import config, function, tensor as pt
         from pytensor.compile.builders import OpFromGraph
 
-        x, y, z = at.scalars('xyz')
+        x, y, z = pt.scalars('xyz')
         s = pytensor.shared(np.random.random((2, 2)).astype(config.floatX))
         e = x + y * z + s
         op = OpFromGraph([x, y, z], [e])
@@ -234,10 +235,10 @@ class OpFromGraph(Op, HasInnerGraph):
 
     .. code-block:: python
 
-        from pytensor import function, tensor as at, grad
+        from pytensor import function, tensor as pt, grad
         from pytensor.compile.builders import OpFromGraph
 
-        x, y, z = at.scalars('xyz')
+        x, y, z = pt.scalars('xyz')
         e = x + y * z
         def rescale_dy(inps, grads):
             x, y, z = inps
@@ -288,7 +289,7 @@ class OpFromGraph(Op, HasInnerGraph):
             if hasattr(inp, "zeros_like"):
                 return inp.zeros_like(), grad
             else:
-                return at.constant(0.0), grad
+                return pt.constant(0.0), grad
         else:
             return grad, None
 
@@ -306,13 +307,13 @@ class OpFromGraph(Op, HasInnerGraph):
 
     def __init__(
         self,
-        inputs: List[Variable],
-        outputs: List[Variable],
+        inputs: list[Variable],
+        outputs: list[Variable],
         inline: bool = False,
         lop_overrides: str = "default",
         grad_overrides: str = "default",
         rop_overrides: str = "default",
-        connection_pattern: Optional[List[List[bool]]] = None,
+        connection_pattern: Optional[list[list[bool]]] = None,
         name: Optional[str] = None,
         **kwargs,
     ):

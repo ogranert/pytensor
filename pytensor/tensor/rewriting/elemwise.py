@@ -1,11 +1,12 @@
 import sys
 from collections import defaultdict, deque
+from collections.abc import Generator
 from functools import lru_cache
-from typing import DefaultDict, Generator, List, Set, Tuple, TypeVar
+from typing import DefaultDict, TypeVar
 from warnings import warn
 
 import pytensor
-import pytensor.scalar.basic as aes
+import pytensor.scalar.basic as ps
 from pytensor import clone_replace, compile
 from pytensor.compile.mode import get_target_language
 from pytensor.configdefaults import config
@@ -78,7 +79,7 @@ class InplaceElemwiseOptimizer(GraphRewriter):
         #  and ScalarLoops
         if isinstance(node.op.scalar_op, ScalarLoop):
             return []
-        if isinstance(node.op.scalar_op, aes.Composite) and (len(node.outputs) > 1):
+        if isinstance(node.op.scalar_op, ps.Composite) and (len(node.outputs) > 1):
             return []
         else:
             return range(len(node.outputs))
@@ -277,7 +278,7 @@ class InplaceElemwiseOptimizer(GraphRewriter):
                     try:
                         if hasattr(op.scalar_op, "make_new_inplace"):
                             new_scal = op.scalar_op.make_new_inplace(
-                                aes.transfer_type(
+                                ps.transfer_type(
                                     *[
                                         inplace_pattern.get(i, o.dtype)
                                         for i, o in enumerate(node.outputs)
@@ -286,7 +287,7 @@ class InplaceElemwiseOptimizer(GraphRewriter):
                             )
                         else:
                             new_scal = op.scalar_op.__class__(
-                                aes.transfer_type(
+                                ps.transfer_type(
                                     *[
                                         inplace_pattern.get(i, None)
                                         for i in range(len(node.outputs))
@@ -502,8 +503,8 @@ def local_upcast_elemwise_constant_inputs(fgraph, node):
         scalar_op = node.op.scalar_op
         # print "aa", scalar_op.output_types_preference
         if getattr(scalar_op, "output_types_preference", None) in (
-            aes.upgrade_to_float,
-            aes.upcast_out,
+            ps.upgrade_to_float,
+            ps.upcast_out,
         ):
             # this is the kind of op that we can screw with the input
             # dtypes by upcasting explicitly
@@ -569,7 +570,7 @@ def local_add_mul_fusion(fgraph, node):
     but it catches a few edge cases that are not canonicalized by it
     """
     if not isinstance(node.op, Elemwise) or not isinstance(
-        node.op.scalar_op, (aes.Add, aes.Mul)
+        node.op.scalar_op, (ps.Add, ps.Mul)
     ):
         return False
 
@@ -633,7 +634,7 @@ class FusionOptimizer(GraphRewriter):
         middle_inputs = []
 
         scalar_inputs = [
-            aes.get_scalar_type(inp.type.dtype).make_variable() for inp in inputs
+            ps.get_scalar_type(inp.type.dtype).make_variable() for inp in inputs
         ]
         middle_scalar_inputs = []
 
@@ -647,7 +648,7 @@ class FusionOptimizer(GraphRewriter):
                         middle_scalar_inputs[middle_inputs.index(inp)]
                     )
                 else:
-                    new_scalar_input = aes.get_scalar_type(
+                    new_scalar_input = ps.get_scalar_type(
                         inp.type.dtype
                     ).make_variable()
                     node_scalar_inputs.append(new_scalar_input)
@@ -675,7 +676,7 @@ class FusionOptimizer(GraphRewriter):
 
         def find_next_fuseable_subgraph(
             fg: FunctionGraph,
-        ) -> Generator[Tuple[List[Variable], List[Variable]], None, None]:
+        ) -> Generator[tuple[list[Variable], list[Variable]], None, None]:
             """Find all subgraphs in a FunctionGraph that can be fused together
 
             Yields
@@ -685,12 +686,12 @@ class FusionOptimizer(GraphRewriter):
             Elemwise Composite before being accessed again in the next iteration.
             """
 
-            FUSEABLE_MAPPING = DefaultDict[Variable, List[Apply]]
-            UNFUSEABLE_MAPPING = DefaultDict[Variable, Set[ApplyOrOutput]]
+            FUSEABLE_MAPPING = DefaultDict[Variable, list[Apply]]
+            UNFUSEABLE_MAPPING = DefaultDict[Variable, set[ApplyOrOutput]]
 
             def initialize_fuseable_mappings(
                 *, fg: FunctionGraph
-            ) -> Tuple[FUSEABLE_MAPPING, UNFUSEABLE_MAPPING]:
+            ) -> tuple[FUSEABLE_MAPPING, UNFUSEABLE_MAPPING]:
                 @lru_cache(maxsize=None)
                 def elemwise_scalar_op_has_c_code(node: Apply) -> bool:
                     # TODO: This should not play a role in non-c backends!
@@ -720,7 +721,7 @@ class FusionOptimizer(GraphRewriter):
                     out_maybe_fuseable = (
                         out.owner
                         and isinstance(out.owner.op, Elemwise)
-                        # and not isinstance(out.owner.op.scalar_op, aes.Composite)
+                        # and not isinstance(out.owner.op.scalar_op, ps.Composite)
                         and len(out.owner.outputs) == 1
                         and elemwise_scalar_op_has_c_code(out.owner)
                     )
@@ -729,7 +730,7 @@ class FusionOptimizer(GraphRewriter):
                             out_maybe_fuseable
                             and not isinstance(client, str)  # "output"
                             and isinstance(client.op, Elemwise)
-                            # and not isinstance(client.op.scalar_op, aes.Composite)
+                            # and not isinstance(client.op.scalar_op, ps.Composite)
                             and len(client.outputs) == 1
                             and out.type.broadcastable
                             == client.outputs[0].type.broadcastable
@@ -745,10 +746,10 @@ class FusionOptimizer(GraphRewriter):
             def find_fuseable_subgraph(
                 *,
                 fg: FunctionGraph,
-                visited_nodes: Set[Apply],
+                visited_nodes: set[Apply],
                 fuseable_clients: FUSEABLE_MAPPING,
                 unfuseable_clients: UNFUSEABLE_MAPPING,
-            ) -> Tuple[List[Variable], List[Variable]]:
+            ) -> tuple[list[Variable], list[Variable]]:
                 KT = TypeVar("KT")
                 VT = TypeVar("VT", list, set)
 
@@ -777,9 +778,9 @@ class FusionOptimizer(GraphRewriter):
                         visited_nodes.add(starting_node)
                         continue
 
-                    subgraph_inputs: List[Variable] = []
-                    subgraph_outputs: List[Variable] = []
-                    unfuseable_clients_subgraph: Set[Variable] = set()
+                    subgraph_inputs: list[Variable] = []
+                    subgraph_outputs: list[Variable] = []
+                    unfuseable_clients_subgraph: set[Variable] = set()
 
                     # Shallow cloning of maps so that they can be manipulated in place
                     fuseable_clients_temp = shallow_clone_defaultdict(fuseable_clients)
@@ -948,10 +949,10 @@ class FusionOptimizer(GraphRewriter):
             def update_fuseable_mappings_after_fg_replace(
                 *,
                 fg: FunctionGraph,
-                visited_nodes: Set[Apply],
+                visited_nodes: set[Apply],
                 fuseable_clients: FUSEABLE_MAPPING,
                 unfuseable_clients: UNFUSEABLE_MAPPING,
-                starting_nodes: Set[Apply],
+                starting_nodes: set[Apply],
             ) -> None:
                 # Find new composite node and dropped intermediate nodes
                 # by comparing the current fg.apply nodes with the cached
@@ -995,7 +996,7 @@ class FusionOptimizer(GraphRewriter):
             # broadcast type) and 2) from each node to each certainly unfuseable
             # client (those that don't fit into 1))
             fuseable_clients, unfuseable_clients = initialize_fuseable_mappings(fg=fg)
-            visited_nodes: Set[Apply] = set()
+            visited_nodes: set[Apply] = set()
             while True:
                 starting_nodes = fg.apply_nodes.copy()
                 try:
@@ -1032,7 +1033,7 @@ class FusionOptimizer(GraphRewriter):
                 break
 
             scalar_inputs, scalar_outputs = self.elemwise_to_scalar(inputs, outputs)
-            composite_outputs = Elemwise(aes.Composite(scalar_inputs, scalar_outputs))(
+            composite_outputs = Elemwise(ps.Composite(scalar_inputs, scalar_outputs))(
                 *inputs
             )
             if not isinstance(composite_outputs, list):
@@ -1095,7 +1096,7 @@ class FusionOptimizer(GraphRewriter):
 def local_useless_composite_outputs(fgraph, node):
     """Remove inputs and outputs of Composite Ops that are not used anywhere."""
     if not isinstance(node.op, Elemwise) or not isinstance(
-        node.op.scalar_op, aes.Composite
+        node.op.scalar_op, ps.Composite
     ):
         return
     comp = node.op.scalar_op
@@ -1116,7 +1117,7 @@ def local_useless_composite_outputs(fgraph, node):
         node.outputs
     ):
         used_inputs = [node.inputs[i] for i in used_inputs_idxs]
-        c = aes.Composite(inputs=used_inner_inputs, outputs=used_inner_outputs)
+        c = ps.Composite(inputs=used_inner_inputs, outputs=used_inner_outputs)
         e = Elemwise(scalar_op=c)(*used_inputs, return_list=True)
         return dict(zip([node.outputs[i] for i in used_outputs_idxs], e))
 
@@ -1130,7 +1131,7 @@ def local_careduce_fusion(fgraph, node):
 
     # FIXME: This check is needed because of the faulty logic in the FIXME below!
     # Right now, rewrite only works for `Sum`/`Prod`
-    if not isinstance(car_scalar_op, (aes.Add, aes.Mul)):
+    if not isinstance(car_scalar_op, (ps.Add, ps.Mul)):
         return None
 
     elm_node = car_input.owner
@@ -1174,19 +1175,19 @@ def local_careduce_fusion(fgraph, node):
     car_acc_dtype = node.op.acc_dtype
 
     scalar_elm_inputs = [
-        aes.get_scalar_type(inp.type.dtype).make_variable() for inp in elm_inputs
+        ps.get_scalar_type(inp.type.dtype).make_variable() for inp in elm_inputs
     ]
 
     elm_output = elm_scalar_op(*scalar_elm_inputs)
 
     # This input represents the previous value in the `CAReduce` binary reduction
-    carried_car_input = aes.get_scalar_type(car_acc_dtype).make_variable()
+    carried_car_input = ps.get_scalar_type(car_acc_dtype).make_variable()
 
     scalar_fused_output = car_scalar_op(carried_car_input, elm_output)
     if scalar_fused_output.type.dtype != car_acc_dtype:
-        scalar_fused_output = aes.cast(scalar_fused_output, car_acc_dtype)
+        scalar_fused_output = ps.cast(scalar_fused_output, car_acc_dtype)
 
-    fused_scalar_op = aes.Composite(
+    fused_scalar_op = ps.Composite(
         inputs=[carried_car_input] + scalar_elm_inputs, outputs=[scalar_fused_output]
     )
 
@@ -1212,7 +1213,7 @@ def local_inline_composite_constants(fgraph, node):
     """Inline scalar constants in Composite graphs."""
     composite_op = node.op.scalar_op
 
-    if not isinstance(composite_op, aes.Composite):
+    if not isinstance(composite_op, ps.Composite):
         return None
 
     new_outer_inputs = []
@@ -1223,7 +1224,7 @@ def local_inline_composite_constants(fgraph, node):
         if "complex" not in outer_inp.type.dtype:
             unique_value = get_unique_constant_value(outer_inp)
             if unique_value is not None:
-                inner_replacements[inner_inp] = aes.constant(
+                inner_replacements[inner_inp] = ps.constant(
                     unique_value, dtype=inner_inp.dtype
                 )
                 continue
@@ -1236,7 +1237,7 @@ def local_inline_composite_constants(fgraph, node):
     new_inner_outs = clone_replace(
         composite_op.fgraph.outputs, replace=inner_replacements
     )
-    new_composite_op = aes.Composite(new_inner_inputs, new_inner_outs)
+    new_composite_op = ps.Composite(new_inner_inputs, new_inner_outs)
     new_outputs = Elemwise(new_composite_op).make_node(*new_outer_inputs).outputs
 
     # Some of the inlined constants were broadcasting the output shape

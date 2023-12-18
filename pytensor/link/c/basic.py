@@ -7,7 +7,7 @@ import sys
 from collections import defaultdict
 from copy import copy
 from io import StringIO
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import numpy as np
 
@@ -20,6 +20,7 @@ from pytensor.graph.basic import (
     io_toposort,
     vars_between,
 )
+from pytensor.graph.utils import MethodNotDefined
 from pytensor.link.basic import Container, Linker, LocalLinker, PerformLinker
 from pytensor.link.c.cmodule import (
     METH_VARARGS,
@@ -41,7 +42,7 @@ if TYPE_CHECKING:
 _logger = logging.getLogger("pytensor.link.c.basic")
 
 
-def get_module_cache(init_args: Optional[Dict[str, Any]] = None) -> "ModuleCache":
+def get_module_cache(init_args: Optional[dict[str, Any]] = None) -> "ModuleCache":
     """
 
     Parameters
@@ -617,7 +618,12 @@ class CLinker(Linker):
         # that needs it
         self.node_params = dict()
         for node in self.node_order:
-            params = node.run_params()
+            if not isinstance(node.op, CLinkerOp):
+                continue
+            try:
+                params = node.op.get_params(node)
+            except MethodNotDefined:
+                params = NoParams
             if params is not NoParams:
                 # try to avoid creating more than one variable for the
                 # same params.
@@ -803,7 +809,10 @@ class CLinker(Linker):
 
             sub = dict(failure_var=failure_var)
 
-            params = node.run_params()
+            try:
+                params = op.get_params(node)
+            except MethodNotDefined:
+                params = NoParams
             if params is not NoParams:
                 params_var = symbol[self.node_params[params]]
 
@@ -1810,7 +1819,7 @@ class OpWiseCLinker(LocalLinker):
 
     """
 
-    __cache__: Dict = {}
+    __cache__: dict = {}
 
     def __init__(
         self, fallback_on_perform=True, allow_gc=None, nice_errors=True, schedule=None

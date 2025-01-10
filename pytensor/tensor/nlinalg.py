@@ -1,17 +1,22 @@
 import warnings
+from collections.abc import Callable, Sequence
 from functools import partial
+from typing import Literal, cast
 
 import numpy as np
+from numpy.core.numeric import normalize_axis_tuple  # type: ignore
 
 from pytensor import scalar as ps
+from pytensor.compile.builders import OpFromGraph
 from pytensor.gradient import DisconnectedType
 from pytensor.graph.basic import Apply
 from pytensor.graph.op import Op
+from pytensor.tensor import TensorLike
 from pytensor.tensor import basic as ptb
 from pytensor.tensor import math as ptm
 from pytensor.tensor.basic import as_tensor_variable, diagonal
 from pytensor.tensor.blockwise import Blockwise
-from pytensor.tensor.type import dvector, lscalar, matrix, scalar, vector
+from pytensor.tensor.type import Variable, dvector, lscalar, matrix, scalar, vector
 
 
 class MatrixPinv(Op):
@@ -194,7 +199,15 @@ class Det(Op):
 
     def make_node(self, x):
         x = as_tensor_variable(x)
-        assert x.ndim == 2
+        if x.ndim != 2:
+            raise ValueError(
+                f"Input passed is not a valid 2D matrix. Current ndim {x.ndim} != 2"
+            )
+        # Check for known shapes and square matrix
+        if None not in x.type.shape and (x.type.shape[0] != x.type.shape[1]):
+            raise ValueError(
+                f"Determinant not defined for non-square matrix inputs. Shape received is {x.type.shape}"
+            )
         o = scalar(dtype=x.dtype)
         return Apply(self, [x], [o])
 
@@ -228,7 +241,7 @@ class SLogDet(Op):
     """
 
     __props__ = ()
-    gufunc_signature = "(m, m)->(),()"
+    gufunc_signature = "(m,m)->(),()"
     gufunc_spec = ("numpy.linalg.slogdet", 1, 2)
 
     def make_node(self, x):
@@ -242,7 +255,7 @@ class SLogDet(Op):
         (x,) = inputs
         (sign, det) = outputs
         try:
-            sign[0], det[0] = (z.astype(x.dtype) for z in np.linalg.slogdet(x))
+            sign[0], det[0] = (np.array(z, dtype=x.dtype) for z in np.linalg.slogdet(x))
         except Exception:
             print("Failed to compute determinant", x)
             raise
@@ -254,7 +267,33 @@ class SLogDet(Op):
         return "SLogDet"
 
 
-slogdet = Blockwise(SLogDet())
+def slogdet(x: TensorLike) -> tuple[ptb.TensorVariable, ptb.TensorVariable]:
+    """
+    Compute the sign and (natural) logarithm of the determinant of an array.
+
+    Returns a naive graph which is optimized later using rewrites with the det operation.
+
+    Parameters
+    ----------
+    x : (..., M, M) tensor or tensor_like
+        Input tensor, has to be square.
+
+    Returns
+    -------
+    A tuple with the following attributes:
+
+    sign : (...) tensor_like
+        A number representing the sign of the determinant. For a real matrix,
+        this is 1, 0, or -1.
+    logabsdet : (...) tensor_like
+        The natural log of the absolute value of the determinant.
+
+    If the determinant is zero, then `sign` will be 0 and `logabsdet`
+    will be -inf. In all cases, the determinant is equal to
+    ``sign * exp(logabsdet)``.
+    """
+    det_val = det(x)
+    return ptm.sign(det_val), ptm.log(ptm.abs(det_val))
 
 
 class Eig(Op):
@@ -350,7 +389,7 @@ class Eigh(Eig):
 
 def _zero_disconnected(outputs, grads):
     l = []
-    for o, g in zip(outputs, grads):
+    for o, g in zip(outputs, grads, strict=True):
         if isinstance(g.type, DisconnectedType):
             l.append(o.zeros_like())
         else:
@@ -523,6 +562,7 @@ def qr(a, mode="reduced"):
 
 class SVD(Op):
     """
+    Computes singular value decomposition of matrix A, into U, S, V such that A = U @ S @ V
 
     Parameters
     ----------
@@ -543,13 +583,23 @@ class SVD(Op):
     def __init__(self, full_matrices: bool = True, compute_uv: bool = True):
         self.full_matrices = bool(full_matrices)
         self.compute_uv = bool(compute_uv)
+        if self.compute_uv:
+            if self.full_matrices:
+                self.gufunc_signature = "(m,n)->(m,m),(k),(n,n)"
+            else:
+                self.gufunc_signature = "(m,n)->(m,k),(k),(k,n)"
+        else:
+            self.gufunc_signature = "(m,n)->(k)"
 
     def make_node(self, x):
         x = as_tensor_variable(x)
         assert x.ndim == 2, "The input of svd function should be a matrix."
 
         in_dtype = x.type.numpy_dtype
-        out_dtype = np.dtype(f"f{in_dtype.itemsize}")
+        if in_dtype.name.startswith("int"):
+            out_dtype = np.dtype(f"f{in_dtype.itemsize}")
+        else:
+            out_dtype = in_dtype
 
         s = vector(dtype=out_dtype)
 
@@ -582,6 +632,121 @@ class SVD(Op):
         else:
             return [s_shape]
 
+    def L_op(
+        self,
+        inputs: Sequence[Variable],
+        outputs: Sequence[Variable],
+        output_grads: Sequence[Variable],
+    ) -> list[Variable]:
+        """
+        Reverse-mode gradient of the SVD function. Adapted from the autograd implementation here:
+        https://github.com/HIPS/autograd/blob/01eacff7a4f12e6f7aebde7c4cb4c1c2633f217d/autograd/numpy/linalg.py#L194
+
+        And the mxnet implementation described in ..[1]
+
+        References
+        ----------
+        .. [1] Seeger, Matthias, et al. "Auto-differentiating linear algebra." arXiv preprint arXiv:1710.08717 (2017).
+        """
+
+        def s_grad_only(
+            U: ptb.TensorVariable, VT: ptb.TensorVariable, ds: ptb.TensorVariable
+        ) -> list[Variable]:
+            A_bar = (U.conj() * ds[..., None, :]) @ VT
+            return [A_bar]
+
+        (A,) = (cast(ptb.TensorVariable, x) for x in inputs)
+
+        if not self.compute_uv:
+            # We need all the components of the SVD to compute the gradient of A even if we only use the singular values
+            # in the cost function.
+            U, _, VT = svd(A, full_matrices=False, compute_uv=True)
+            ds = cast(ptb.TensorVariable, output_grads[0])
+            return s_grad_only(U, VT, ds)
+
+        elif self.full_matrices:
+            raise NotImplementedError(
+                "Gradient of svd not implemented for full_matrices=True"
+            )
+
+        else:
+            U, s, VT = (cast(ptb.TensorVariable, x) for x in outputs)
+
+            # Handle disconnected inputs
+            # If a user asked for all the matrices but then only used a subset in the cost function, the unused outputs
+            # will be DisconnectedType. We replace DisconnectedTypes with zero matrices of the correct shapes.
+            new_output_grads = []
+            is_disconnected = [
+                isinstance(x.type, DisconnectedType) for x in output_grads
+            ]
+            if all(is_disconnected):
+                # This should never actually be reached by Pytensor -- the SVD Op should be pruned from the gradient
+                # graph if its fully disconnected. It is included for completeness.
+                return [DisconnectedType()()]  # pragma: no cover
+
+            elif is_disconnected == [True, False, True]:
+                # This is the same as the compute_uv = False, so we can drop back to that simpler computation, without
+                # needing to re-compoute U and VT
+                ds = cast(ptb.TensorVariable, output_grads[1])
+                return s_grad_only(U, VT, ds)
+
+            for disconnected, output_grad, output in zip(
+                is_disconnected, output_grads, [U, s, VT], strict=True
+            ):
+                if disconnected:
+                    new_output_grads.append(output.zeros_like())
+                else:
+                    new_output_grads.append(output_grad)
+
+            (dU, ds, dVT) = (cast(ptb.TensorVariable, x) for x in new_output_grads)
+
+            V = VT.T
+            dV = dVT.T
+
+            m, n = A.shape[-2:]
+
+            k = ptm.min((m, n))
+            eye = ptb.eye(k)
+
+            def h(t):
+                """
+                Approximation of s_i ** 2 - s_j ** 2, from .. [1].
+                Robust to identical singular values (singular matrix input), although
+                gradients are still wrong in this case.
+                """
+                eps = 1e-8
+
+                # sign(0) = 0 in pytensor, which defeats the whole purpose of this function
+                sign_t = ptb.where(ptm.eq(t, 0), 1, ptm.sign(t))
+                return ptm.maximum(ptm.abs(t), eps) * sign_t
+
+            numer = ptb.ones((k, k)) - eye
+            denom = h(s[None] - s[:, None]) * h(s[None] + s[:, None])
+            E = numer / denom
+
+            utgu = U.T @ dU
+            vtgv = VT @ dV
+
+            A_bar = (E * (utgu - utgu.conj().T)) * s[..., None, :]
+            A_bar = A_bar + eye * ds[..., :, None]
+            A_bar = A_bar + s[..., :, None] * (E * (vtgv - vtgv.conj().T))
+            A_bar = U.conj() @ A_bar @ VT
+
+            A_bar = ptb.switch(
+                ptm.eq(m, n),
+                A_bar,
+                ptb.switch(
+                    ptm.lt(m, n),
+                    A_bar
+                    + (
+                        U / s[..., None, :] @ dVT @ (ptb.eye(n) - V @ V.conj().T)
+                    ).conj(),
+                    A_bar
+                    + (V / s[..., None, :] @ dU.T @ (ptb.eye(m) - U @ U.conj().T)).T,
+                ),
+            )
+            return [A_bar]
+
 
 def svd(a, full_matrices: bool = True, compute_uv: bool = True):
     """
@@ -600,10 +765,10 @@ def svd(a, full_matrices: bool = True, compute_uv: bool = True):
 
     Returns
     -------
-    U, V,  D : matrices
+    U, V, D : matrices
 
     """
-    return SVD(full_matrices, compute_uv)(a)
+    return Blockwise(SVD(full_matrices, compute_uv))(a)
 
 
 class Lstsq(Op):
@@ -677,41 +842,204 @@ def matrix_power(M, n):
     return result
 
 
-def norm(x, ord):
-    x = as_tensor_variable(x)
+def _multi_svd_norm(
+    x: ptb.TensorVariable, row_axis: int, col_axis: int, reduce_op: Callable
+):
+    """Compute a function of the singular values of the 2-D matrices in `x`.
+
+    This is a private utility function used by `pytensor.tensor.nlinalg.norm()`.
+
+    Copied from `np.linalg._multi_svd_norm`.
+
+    Parameters
+    ----------
+    x : TensorVariable
+        Input tensor.
+    row_axis, col_axis : int
+        The axes of `x` that hold the 2-D matrices.
+    reduce_op : callable
+        Reduction op. Should be one of `pt.min`, `pt.max`, or `pt.sum`
+
+    Returns
+    -------
+    result : float or ndarray
+        If `x` is 2-D, the return values is a float.
+        Otherwise, it is an array with ``x.ndim - 2`` dimensions.
+        The return values are either the minimum or maximum or sum of the
+        singular values of the matrices, depending on whether `op`
+        is `pt.amin` or `pt.amax` or `pt.sum`.
+
+    """
+    y = ptb.moveaxis(x, (row_axis, col_axis), (-2, -1))
+    result = reduce_op(svd(y, compute_uv=False), axis=-1)
+    return result
+
+
+VALID_ORD = Literal["fro", "f", "nuc", "inf", "-inf", 0, 1, -1, 2, -2]
+
+
+def norm(
+    x: ptb.TensorVariable,
+    ord: float | VALID_ORD | None = None,
+    axis: int | tuple[int, ...] | None = None,
+    keepdims: bool = False,
+):
+    """
+    Matrix or vector norm.
+
+    Parameters
+    ----------
+    x: TensorVariable
+        Tensor to take norm of.
+
+    ord: float, str or int, optional
+        Order of norm. If `ord` is a str, it must be one of the following:
+            - 'fro' or 'f' : Frobenius norm
+            - 'nuc' : nuclear norm
+            - 'inf' : Infinity norm
+            - '-inf' : Negative infinity norm
+        If an integer, order can be one of -2, -1, 0, 1, or 2.
+        Otherwise `ord` must be a float.
+
+        Default is the Frobenius (L2) norm.
+
+    axis: tuple of int, optional
+        Axes over which to compute the norm. If None, norm of entire matrix (or vector) is computed. Row or column
+        norms can be computed by passing a single integer; this will treat a matrix like a batch of vectors.
+
+    keepdims: bool
+        If True, dummy axes will be inserted into the output so that norm.dnim == x.dnim. Default is False.
+
+    Returns
+    -------
+    TensorVariable
+        Norm of `x` along axes specified by `axis`.
+
+    Notes
+    -----
+    Batched dimensions are supported to the left of the core dimensions. For example, if `x` is a 3D tensor with
+    shape (2, 3, 4), then `norm(x)` will compute the norm of each 3x4 matrix in the batch.
+
+    If the input is a 2D tensor and should be treated as a batch of vectors, the `axis` argument must be specified.
+    """
+    x = ptb.as_tensor_variable(x)
+
     ndim = x.ndim
-    if ndim == 0:
-        raise ValueError("'axis' entry is out of bounds.")
-    elif ndim == 1:
-        if ord is None:
-            return ptm.sum(x**2) ** 0.5
-        elif ord == "inf":
-            return ptm.max(abs(x))
-        elif ord == "-inf":
-            return ptm.min(abs(x))
+    core_ndim = min(2, ndim)
+    batch_ndim = ndim - core_ndim
+
+    if axis is None:
+        # Handle some common cases first. These can be computed more quickly than the default SVD way, so we always
+        # want to check for them.
+        if (
+            (ord is None)
+            or (ord in ("f", "fro") and core_ndim == 2)
+            or (ord == 2 and core_ndim == 1)
+        ):
+            x = x.reshape(tuple(x.shape[:-2]) + (-1,) + (1,) * (core_ndim - 1))
+            batch_T_dim_order = tuple(range(batch_ndim)) + tuple(
+                range(batch_ndim + core_ndim - 1, batch_ndim - 1, -1)
+            )
+
+            if x.dtype.startswith("complex"):
+                x_real = x.real  # type: ignore
+                x_imag = x.imag  # type: ignore
+                sqnorm = (
+                    ptb.transpose(x_real, batch_T_dim_order) @ x_real
+                    + ptb.transpose(x_imag, batch_T_dim_order) @ x_imag
+                )
+            else:
+                sqnorm = ptb.transpose(x, batch_T_dim_order) @ x
+            ret = ptm.sqrt(sqnorm).squeeze()
+            if keepdims:
+                ret = ptb.shape_padright(ret, core_ndim)
+            return ret
+
+        # No special computation to exploit -- set default axis before continuing
+        axis = tuple(range(core_ndim))
+
+    elif not isinstance(axis, tuple):
+        try:
+            axis = int(axis)
+        except Exception as e:
+            raise TypeError(
+                "'axis' must be None, an integer, or a tuple of integers"
+            ) from e
+
+        axis = (axis,)
+
+    if len(axis) == 1:
+        # Vector norms
+        if ord in [None, "fro", "f"] and (core_ndim == 2):
+            # This is here to catch the case where X is a 2D tensor but the user wants to treat it as a batch of
+            # vectors. Other vector norms will work fine in this case.
+            ret = ptm.sqrt(ptm.sum((x.conj() * x).real, axis=axis, keepdims=keepdims))
+        elif (ord == "inf") or (ord == np.inf):
+            ret = ptm.max(ptm.abs(x), axis=axis, keepdims=keepdims)
+        elif (ord == "-inf") or (ord == -np.inf):
+            ret = ptm.min(ptm.abs(x), axis=axis, keepdims=keepdims)
         elif ord == 0:
-            return x[x.nonzero()].shape[0]
-        else:
-            try:
-                z = ptm.sum(abs(x**ord)) ** (1.0 / ord)
-            except TypeError:
-                raise ValueError("Invalid norm order for vectors.")
-            return z
-    elif ndim == 2:
-        if ord is None or ord == "fro":
-            return ptm.sum(abs(x**2)) ** (0.5)
-        elif ord == "inf":
-            return ptm.max(ptm.sum(abs(x), 1))
-        elif ord == "-inf":
-            return ptm.min(ptm.sum(abs(x), 1))
+            ret = ptm.neq(x, 0).sum(axis=axis, keepdims=keepdims)
         elif ord == 1:
-            return ptm.max(ptm.sum(abs(x), 0))
-        elif ord == -1:
-            return ptm.min(ptm.sum(abs(x), 0))
+            ret = ptm.sum(ptm.abs(x), axis=axis, keepdims=keepdims)
+        elif isinstance(ord, str):
+            raise ValueError(f"Invalid norm order '{ord}' for vectors")
         else:
-            raise ValueError(0)
-    elif ndim > 2:
-        raise NotImplementedError("We don't support norm with ndim > 2")
+            ret = ptm.sum(ptm.abs(x) ** ord, axis=axis, keepdims=keepdims)
+            ret **= ptm.reciprocal(ord)
+
+        return ret
+
+    elif len(axis) == 2:
+        # Matrix norms
+        row_axis, col_axis = (
+            batch_ndim + x for x in normalize_axis_tuple(axis, core_ndim)
+        )
+        axis = (row_axis, col_axis)
+
+        if ord in [None, "fro", "f"]:
+            ret = ptm.sqrt(ptm.sum((x.conj() * x).real, axis=axis))
+
+        elif (ord == "inf") or (ord == np.inf):
+            if row_axis > col_axis:
+                row_axis -= 1
+            ret = ptm.max(ptm.sum(ptm.abs(x), axis=col_axis), axis=row_axis)
+
+        elif (ord == "-inf") or (ord == -np.inf):
+            if row_axis > col_axis:
+                row_axis -= 1
+            ret = ptm.min(ptm.sum(ptm.abs(x), axis=col_axis), axis=row_axis)
+
+        elif ord == 1:
+            if col_axis > row_axis:
+                col_axis -= 1
+            ret = ptm.max(ptm.sum(ptm.abs(x), axis=row_axis), axis=col_axis)
+
+        elif ord == -1:
+            if col_axis > row_axis:
+                col_axis -= 1
+            ret = ptm.min(ptm.sum(ptm.abs(x), axis=row_axis), axis=col_axis)
+
+        elif ord == 2:
+            ret = _multi_svd_norm(x, row_axis, col_axis, ptm.max)
+
+        elif ord == -2:
+            ret = _multi_svd_norm(x, row_axis, col_axis, ptm.min)
+
+        elif ord == "nuc":
+            ret = _multi_svd_norm(x, row_axis, col_axis, ptm.sum)
+
+        else:
+            raise ValueError(f"Invalid norm order for matrices: {ord}")
+
+        if keepdims:
+            ret = ptb.expand_dims(ret, axis)
+
+        return ret
+    else:
+        raise ValueError(
+            f"Cannot compute norm when core_dims < 1 or core_dims > 3, found: core_dims = {core_ndim}"
+        )
 
 
 class TensorInv(Op):
@@ -834,6 +1162,52 @@ def tensorsolve(a, b, axes=None):
     return TensorSolve(axes)(a, b)
 
 
+class KroneckerProduct(OpFromGraph):
+    """
+    Wrapper Op for Kronecker graphs
+    """
+
+
+def kron(a, b):
+    """Kronecker product.
+
+    Same as np.kron(a, b)
+
+    Parameters
+    ----------
+    a: array_like
+    b: array_like
+
+    Returns
+    -------
+    array_like with a.ndim + b.ndim - 2 dimensions
+    """
+    a = as_tensor_variable(a)
+    b = as_tensor_variable(b)
+
+    if a is b:
+        # In case a is the same as b, we need a different variable to build the OFG
+        b = a.copy()
+
+    if a.ndim + b.ndim <= 2:
+        raise TypeError(
+            "kron: inputs dimensions must sum to 3 or more. "
+            f"You passed {int(a.ndim)} and {int(b.ndim)}."
+        )
+
+    if a.ndim < b.ndim:
+        a = ptb.expand_dims(a, tuple(range(b.ndim - a.ndim)))
+    elif b.ndim < a.ndim:
+        b = ptb.expand_dims(b, tuple(range(a.ndim - b.ndim)))
+    a_reshaped = ptb.expand_dims(a, tuple(range(1, 2 * a.ndim, 2)))
+    b_reshaped = ptb.expand_dims(b, tuple(range(0, 2 * b.ndim, 2)))
+    out_shape = tuple(a.shape * b.shape)
+    output_out_of_shape = a_reshaped * b_reshaped
+    output_reshaped = output_out_of_shape.reshape(out_shape)
+
+    return KroneckerProduct(inputs=[a, b], outputs=[output_reshaped])(a, b)
+
+
 __all__ = [
     "pinv",
     "inv",
@@ -847,6 +1221,8 @@ __all__ = [
     "lstsq",
     "matrix_power",
     "norm",
+    "slogdet",
     "tensorinv",
     "tensorsolve",
+    "kron",
 ]

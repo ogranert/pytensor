@@ -1,29 +1,48 @@
 """A container for specifying and manipulating a graph with distinct inputs and outputs."""
+
 import time
-from collections import OrderedDict
+from collections import defaultdict
 from collections.abc import Iterable, Sequence
-from typing import TYPE_CHECKING, Any, Literal, Optional, Union, cast
+from typing import Any, Union, cast
 
 import pytensor
 from pytensor.configdefaults import config
-from pytensor.graph.basic import Apply, AtomicVariable, Variable, applys_between
-from pytensor.graph.basic import as_string as graph_as_string
 from pytensor.graph.basic import (
+    Apply,
+    AtomicVariable,
+    Variable,
+    applys_between,
     clone_get_equiv,
     graph_inputs,
     io_toposort,
     vars_between,
 )
+from pytensor.graph.basic import as_string as graph_as_string
 from pytensor.graph.features import AlreadyThere, Feature, ReplaceValidate
+from pytensor.graph.op import Op
 from pytensor.graph.utils import MetaObject, MissingInputError, TestValueError
 from pytensor.misc.ordered_set import OrderedSet
 
 
-if TYPE_CHECKING:
-    from pytensor.graph.op import Op
+ClientType = tuple[Apply, int]
 
-ApplyOrOutput = Union[Apply, Literal["output"]]
-ClientType = tuple[ApplyOrOutput, int]
+
+class Output(Op):
+    """A dummy `Op` that represents an output variable in a `FunctionGraph`."""
+
+    __props__ = ("idx",)
+
+    def __init__(self, idx):
+        self.idx = idx
+
+    def make_node(self, inp):
+        return Apply(self, [inp], [])
+
+    def perform(self, node, inputs, outputs):
+        raise RuntimeError("Output Ops should never be evaluated")
+
+    def __str__(self):
+        return f"output[{self.idx}]"
 
 
 class FunctionGraph(MetaObject):
@@ -60,11 +79,11 @@ class FunctionGraph(MetaObject):
 
     def __init__(
         self,
-        inputs: Optional[Sequence[Variable]] = None,
-        outputs: Optional[Sequence[Variable]] = None,
-        features: Optional[Sequence[Feature]] = None,
+        inputs: Sequence[Variable] | None = None,
+        outputs: Sequence[Variable] | None = None,
+        features: Sequence[Feature] | None = None,
         clone: bool = True,
-        update_mapping: Optional[dict[Variable, Variable]] = None,
+        update_mapping: dict[Variable, Variable] | None = None,
         **clone_kwds,
     ):
         """
@@ -105,7 +124,7 @@ class FunctionGraph(MetaObject):
             inputs = [cast(Variable, _memo[i]) for i in inputs]
 
         self.execute_callbacks_time: float = 0.0
-        self.execute_callbacks_times: dict[Feature, float] = {}
+        self.execute_callbacks_times: dict[Feature, float] = defaultdict(float)
 
         if features is None:
             features = []
@@ -148,12 +167,12 @@ class FunctionGraph(MetaObject):
         self.update_mapping = update_mapping
 
     def add_output(
-        self, var: Variable, reason: Optional[str] = None, import_missing: bool = False
+        self, var: Variable, reason: str | None = None, import_missing: bool = False
     ):
         """Add a new variable as an output to this `FunctionGraph`."""
         self.outputs.append(var)
         self.import_var(var, reason=reason, import_missing=import_missing)
-        self.clients[var].append(("output", len(self.outputs) - 1))
+        self.clients[var].append((Output(len(self.outputs) - 1).make_node(var), 0))
 
     def add_input(self, var: Variable, check: bool = True) -> None:
         """Add a new variable as an input to this `FunctionGraph`.
@@ -194,17 +213,15 @@ class FunctionGraph(MetaObject):
             A ``(node, i)`` pair such that ``node.inputs[i]`` is `var`.
 
         """
-        if not isinstance(new_client[0], Apply) and new_client[0] != "output":
-            raise TypeError(
-                'The first entry of `new_client` must be an `Apply` node or the string `"output"`'
-            )
+        if not isinstance(new_client[0], Apply):
+            raise TypeError("The first entry of `new_client` must be an `Apply` node")
         self.clients[var].append(new_client)
 
     def remove_client(
         self,
         var: Variable,
         client_to_remove: ClientType,
-        reason: Optional[str] = None,
+        reason: str | None = None,
         remove_if_empty: bool = False,
     ) -> None:
         """Recursively remove clients of a variable.
@@ -228,13 +245,13 @@ class FunctionGraph(MetaObject):
             entry for `var` in `self.clients`.
 
         """
-
+        clients = self.clients
         removal_stack = [(var, client_to_remove)]
         while removal_stack:
             var, client_to_remove = removal_stack.pop()
 
             try:
-                var_clients = self.clients[var]
+                var_clients = clients[var]
                 var_clients.remove(client_to_remove)
             except ValueError:
                 # In this case, the original `var` could've been removed from
@@ -248,13 +265,11 @@ class FunctionGraph(MetaObject):
 
             # Now, `var` has no more clients, so check if we need to remove it
             # and its `Apply` node
-            if not var.owner:
+            if var.owner is None:
                 self.variables.remove(var)
             else:
                 apply_node = var.owner
-                if not any(
-                    output for output in apply_node.outputs if self.clients[output]
-                ):
+                if not any(clients[output] for output in apply_node.outputs):
                     # The `Apply` node is not used and is not an output, so we
                     # remove it and its outputs
                     if not hasattr(apply_node.tag, "removed_by"):
@@ -268,14 +283,26 @@ class FunctionGraph(MetaObject):
 
                     self.execute_callbacks("on_prune", apply_node, reason)
 
-                    for i, in_var in enumerate(apply_node.inputs):
-                        removal_stack.append((in_var, (apply_node, i)))
+                    removal_stack.extend(
+                        (in_var, (apply_node, i))
+                        for i, in_var in enumerate(apply_node.inputs)
+                    )
 
                     if remove_if_empty:
-                        del self.clients[var]
+                        del clients[var]
+
+    def get_output_client(self, i: int) -> ClientType:
+        """Get the dummy Output Op client to output i.
+
+        Raises lookup error if not found
+        """
+        for client in self.clients[self.outputs[i]]:
+            if isinstance(client[0].op, Output) and client[0].op.idx == i:
+                return client
+        raise LookupError
 
     def import_var(
-        self, var: Variable, reason: Optional[str] = None, import_missing: bool = False
+        self, var: Variable, reason: str | None = None, import_missing: bool = False
     ) -> None:
         """Import a `Variable` into this `FunctionGraph`.
 
@@ -316,7 +343,7 @@ class FunctionGraph(MetaObject):
         self,
         apply_node: Apply,
         check: bool = True,
-        reason: Optional[str] = None,
+        reason: str | None = None,
         import_missing: bool = False,
     ) -> None:
         """Recursively import everything between an ``Apply`` node and the ``FunctionGraph``'s outputs.
@@ -378,10 +405,10 @@ class FunctionGraph(MetaObject):
 
     def change_node_input(
         self,
-        node: ApplyOrOutput,
+        node: Apply,
         i: int,
         new_var: Variable,
-        reason: Optional[str] = None,
+        reason: str | None = None,
         import_missing: bool = False,
         check: bool = True,
     ) -> None:
@@ -397,9 +424,7 @@ class FunctionGraph(MetaObject):
         Parameters
         ----------
         node
-            The node for which an input is to be changed.  If the value is
-            the string ``"output"`` then the ``self.outputs`` will be used
-            instead of ``node.inputs``.
+            The node for which an input is to be changed.
         i
             The index in `node.inputs` that we want to change.
         new_var
@@ -413,26 +438,20 @@ class FunctionGraph(MetaObject):
             narrowed and would otherwise fail this check.
         """
         # TODO: ERROR HANDLING FOR LISTENERS (should it complete the change or revert it?)
-        if node == "output":
-            r = self.outputs[i]
-            if check and not r.type.is_super(new_var.type):
-                raise TypeError(
-                    f"The type of the replacement ({new_var.type}) must be "
-                    f"compatible with the type of the original Variable ({r.type})."
-                )
-            self.outputs[i] = new_var
-        else:
-            assert isinstance(node, Apply)
-            r = node.inputs[i]
-            if check and not r.type.is_super(new_var.type):
-                raise TypeError(
-                    f"The type of the replacement ({new_var.type}) must be "
-                    f"compatible with the type of the original Variable ({r.type})."
-                )
-            node.inputs[i] = new_var
+        r = node.inputs[i]
 
         if r is new_var:
             return
+
+        if check and not r.type.is_super(new_var.type):
+            raise TypeError(
+                f"The type of the replacement ({new_var.type}) must be "
+                f"compatible with the type of the original Variable ({r.type})."
+            )
+        node.inputs[i] = new_var
+
+        if isinstance(node.op, Output):
+            self.outputs[node.op.idx] = new_var
 
         self.import_var(new_var, reason=reason, import_missing=import_missing)
         self.add_client(new_var, (node, i))
@@ -446,8 +465,8 @@ class FunctionGraph(MetaObject):
         self,
         var: Variable,
         new_var: Variable,
-        reason: Optional[str] = None,
-        verbose: Optional[bool] = None,
+        reason: str | None = None,
+        verbose: bool | None = None,
         import_missing: bool = False,
     ) -> None:
         """Replace a variable in the `FunctionGraph`.
@@ -514,34 +533,7 @@ class FunctionGraph(MetaObject):
         for var, new_var in pairs:
             self.replace(var, new_var, **kwargs)
 
-    def _remove_output(self, idx: int):
-        """Remove the output at index `idx` and update the indices in the clients entries.
-
-        `FunctionGraph.clients` contains entries like ``("output", i)`` under
-        each output variable in `FunctionGraph.outputs`.  The ``i`` values
-        correspond to each output's location within the `FunctionGraph.outputs`
-        list, so, when an output is removed from the graph, all these entries
-        need to be updated.  This method performs those updates.
-
-        TODO: We could track these entries in a new instance attribute and make
-        them lists, then each could be updated in-place very easily.  This
-        seems fine, because the `FunctionGraph.clients` ``dict`` and list in
-        which they're contained are already being updated in-place.
-        """
-        old_idx_mappings = tuple((out, i) for i, out in enumerate(self.outputs))
-        self.outputs.pop(idx)
-
-        new_idx = 0
-        for out, old_idx in old_idx_mappings:
-            if old_idx == idx:
-                continue
-            out_clients = self.clients[out]
-            arrow: ClientType = ("output", old_idx)
-            arrow_idx = out_clients.index(arrow)
-            out_clients[arrow_idx] = ("output", new_idx)
-            new_idx += 1
-
-    def remove_node(self, node: Apply, reason: Optional[str] = None):
+    def remove_node(self, node: Apply, reason: str | None = None):
         """Remove an `Apply` node from the `FunctionGraph`.
 
         This will remove everything that depends on the outputs of `node`, as
@@ -559,15 +551,16 @@ class FunctionGraph(MetaObject):
         node.tag.removed_by.append(str(reason))
 
         # Remove the outputs of the node (i.e. everything "below" it)
+        clients = self.clients
         for out in node.outputs:
             self.variables.remove(out)
 
-            out_clients = self.clients.get(out, ())
+            out_clients = clients.get(out, ())
             while out_clients:
                 out_client, out_idx = out_clients.pop()
 
-                if out_client == "output":
-                    self._remove_output(out_idx)
+                if isinstance(out_client.op, Output):
+                    self.remove_output(out_client.op.idx, remove_client=False)
 
                     # TODO: We could short-circuit all of the graph walking and
                     # clear everything at once when all the outputs are gone.
@@ -583,16 +576,14 @@ class FunctionGraph(MetaObject):
                     #
                     #         self.execute_callbacks("on_prune", node, reason)
                 else:
-                    assert isinstance(out_client, Apply)
                     self.remove_node(out_client, reason=reason)
 
-            if out in self.clients:
-                del self.clients[out]
+            clients.pop(out, None)
 
         # Remove all the arrows pointing to this `node`, and any orphaned
         # variables created by removing those arrows
         for inp_idx, inp in enumerate(node.inputs):
-            inp_clients: list[ClientType] = self.clients.get(inp, [])
+            inp_clients: list[ClientType] = clients.get(inp, [])
 
             arrow = (node, inp_idx)
 
@@ -625,33 +616,47 @@ class FunctionGraph(MetaObject):
         # the `FunctionGraph` state subscribers see is valid.
         self.execute_callbacks("on_prune", node, reason)
 
-    def remove_input(self, input_idx: int, reason: Optional[str] = None):
-        """Remove the input at index `input_idx`."""
+    def remove_input(self, input_idx: int, reason: str | None = None):
+        """Remove the input at index `input_idx`.
+
+        Any node that depended on such input will also be removed.
+        """
         var = self.inputs.pop(input_idx)
 
         for client, idx in list(self.clients[var]):
-            if client == "output":
-                out_var = self.outputs[idx]
-                out_node = out_var.owner
-                if out_node is None:
-                    assert out_var in self.inputs
-                    self.outputs.pop(idx)
-                    continue
-                client_node = out_node
-            else:
-                assert isinstance(client, Apply)
-                client_node = client
+            self.remove_node(client, reason=reason)
 
-            self.remove_node(client_node, reason=reason)
+    def remove_output(
+        self, output_idx: int, reason: str | None = None, remove_client: bool = True
+    ):
+        """Remove the output at index `output_idx` and update the indices in the clients entries.
 
-    def remove_output(self, output_idx: int, reason: Optional[str] = None):
-        """Remove the output at index `input_idx`."""
+        `FunctionGraph.clients` contains entries like ``(output(i)(var), 0)`` under
+        each output variable in `FunctionGraph.outputs`.  The ``i`` values
+        correspond to each output's location within the `FunctionGraph.outputs`
+        list, so, when an output is removed from the graph, all these entries
+        need to be updated.  This method performs those updates.
 
-        var = self.outputs[output_idx]
-        self._remove_output(output_idx)
-        self.remove_client(
-            var, ("output", output_idx), reason=reason, remove_if_empty=True
-        )
+        """
+        outputs = self.outputs
+
+        # We have to update all the output indexes to the right of the removed index
+        for old_idx, out in enumerate(outputs[output_idx + 1 :], output_idx + 1):
+            old_client = self.get_output_client(old_idx)
+            out_clients = self.clients[out]
+            out_clients[out_clients.index(old_client, 0)] = (
+                Output(old_idx - 1).make_node(out),
+                0,
+            )
+
+        # Remove the Output Op client from the clients list
+        # This is false when called from `remove_node` which removes the clients ahead of time
+        if remove_client:
+            output_client = self.get_output_client(output_idx)
+            self.remove_client(
+                outputs[output_idx], output_client, reason=reason, remove_if_empty=True
+            )
+        outputs.pop(output_idx)
 
     def attach_feature(self, feature: Feature) -> None:
         """Add a ``graph.features.Feature`` to this function graph and trigger its ``on_attach`` callback."""
@@ -669,7 +674,6 @@ class FunctionGraph(MetaObject):
                 attach(self)
             except AlreadyThere:
                 return
-        self.execute_callbacks_times.setdefault(feature, 0.0)
         # It would be nice if we could require a specific class instead of
         # a "workalike" so we could do actual error checking
         # if not isinstance(feature, Feature):
@@ -765,12 +769,12 @@ class FunctionGraph(MetaObject):
 
         """
         assert isinstance(self._features, list)
-        all_orderings: list[OrderedDict] = []
+        all_orderings: list[dict] = []
 
         for feature in self._features:
             if hasattr(feature, "orderings"):
                 orderings = feature.orderings(self)
-                if not isinstance(orderings, OrderedDict):
+                if not isinstance(orderings, dict):
                     raise TypeError(
                         "Non-deterministic return value from "
                         + str(feature.orderings)
@@ -780,7 +784,7 @@ class FunctionGraph(MetaObject):
                 if len(orderings) > 0:
                     all_orderings.append(orderings)
                     for node, prereqs in orderings.items():
-                        if not isinstance(prereqs, (list, OrderedSet)):
+                        if not isinstance(prereqs, list | OrderedSet):
                             raise TypeError(
                                 "prereqs must be a type with a "
                                 "deterministic iteration order, or toposort "
@@ -791,7 +795,7 @@ class FunctionGraph(MetaObject):
             return all_orderings[0].copy()
         else:
             # If there is more than 1 ordering, combine them.
-            ords: dict[Apply, list[Apply]] = OrderedDict()
+            ords: dict[Apply, list[Apply]] = {}
             for orderings in all_orderings:
                 for node, prereqs in orderings.items():
                     ords.setdefault(node, []).extend(prereqs)
@@ -806,12 +810,13 @@ class FunctionGraph(MetaObject):
             raise Exception(
                 f"The following nodes are inappropriately cached:\nmissing: {nodes_missing}\nin excess: {nodes_excess}"
             )
+        clients = self.clients
         for node in nodes:
             for i, variable in enumerate(node.inputs):
-                clients = self.clients[variable]
-                if (node, i) not in clients:
+                var_clients = clients[variable]
+                if (node, i) not in var_clients:
                     raise Exception(
-                        f"Inconsistent clients list {(node, i)} in {clients}"
+                        f"Inconsistent clients list {(node, i)} in {var_clients}"
                     )
         variables = set(vars_between(self.inputs, self.outputs))
         if set(self.variables) != variables:
@@ -827,20 +832,18 @@ class FunctionGraph(MetaObject):
                 and not isinstance(variable, AtomicVariable)
             ):
                 raise Exception(f"Undeclared input: {variable}")
-            for cl_node, i in self.clients[variable]:
-                if cl_node == "output":
-                    if self.outputs[i] is not variable:
+            for cl_node, i in clients[variable]:
+                if isinstance(cl_node.op, Output):
+                    out_idx = cl_node.op.idx
+                    if self.outputs[out_idx] is not variable:
                         raise Exception(
-                            f"Inconsistent clients list: {variable}, {self.outputs[i]}"
+                            f"Inconsistent clients list: {variable}, {self.outputs[out_idx]}"
                         )
-                    continue
-
-                assert isinstance(cl_node, Apply)
-
-                if cl_node not in nodes:
+                elif cl_node not in nodes:
                     raise Exception(
                         f"Client not in FunctionGraph: {variable}, {(cl_node, i)}"
                     )
+
                 if cl_node.inputs[i] is not variable:
                     raise Exception(
                         f"Inconsistent clients list: {variable}, {cl_node.inputs[i]}"
@@ -916,10 +919,22 @@ class FunctionGraph(MetaObject):
             if hasattr(feature, "unpickle"):
                 feature.unpickle(self)
 
-    def __contains__(self, item: Union[Variable, Apply]) -> bool:
+    def __contains__(self, item: Variable | Apply) -> bool:
         if isinstance(item, Variable):
             return item in self.variables
         elif isinstance(item, Apply):
             return item in self.apply_nodes
         else:
             raise TypeError()
+
+    def dprint(self, **kwargs):
+        """Debug print itself
+
+        Parameters
+        ----------
+        kwargs:
+            Optional keyword arguments to pass to debugprint function.
+        """
+        from pytensor.printing import debugprint
+
+        return debugprint(self, **kwargs)

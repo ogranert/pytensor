@@ -1,8 +1,10 @@
 """Core graph classes."""
+
 import abc
 import warnings
 from collections import deque
 from collections.abc import (
+    Callable,
     Collection,
     Generator,
     Hashable,
@@ -16,13 +18,12 @@ from itertools import count
 from typing import (
     TYPE_CHECKING,
     Any,
-    Callable,
-    Deque,
     Generic,
     Optional,
     TypeVar,
     Union,
     cast,
+    overload,
 )
 
 import numpy as np
@@ -51,7 +52,7 @@ _IdType = TypeVar("_IdType", bound=Hashable)
 
 T = TypeVar("T", bound="Node")
 NoParams = object()
-NodeAndChildren = tuple[T, Optional[Iterable[T]]]
+NodeAndChildren = tuple[T, Iterable[T] | None]
 
 
 class Node(MetaObject):
@@ -62,7 +63,8 @@ class Node(MetaObject):
     keeps track of its parents via `Variable.owner` / `Apply.inputs`.
 
     """
-    name: Optional[str]
+
+    name: str | None
 
     def get_parents(self):
         """
@@ -72,6 +74,18 @@ class Node(MetaObject):
 
         """
         raise NotImplementedError()
+
+    def dprint(self, **kwargs):
+        """Debug print itself
+
+        Parameters
+        ----------
+        kwargs:
+            Optional keyword arguments to pass to debugprint function.
+        """
+        from pytensor.printing import debugprint
+
+        return debugprint(self, **kwargs)
 
 
 class Apply(Node, Generic[OpType]):
@@ -250,15 +264,15 @@ class Apply(Node, Generic[OpType]):
         """
         from pytensor.graph.op import HasInnerGraph
 
-        assert isinstance(inputs, (list, tuple))
+        assert isinstance(inputs, list | tuple)
         remake_node = False
-        new_inputs: list["Variable"] = list(inputs)
+        new_inputs: list[Variable] = list(inputs)
 
         # Some Ops like Alloc require the node to always be rebuilt in non-strict mode
         # as the output type depends on the input values and not just their types
         output_type_depends_on_input_value = self.op._output_type_depends_on_input_value
 
-        for i, (curr, new) in enumerate(zip(self.inputs, new_inputs)):
+        for i, (curr, new) in enumerate(zip(self.inputs, new_inputs, strict=True)):
             # Check if the input type changed or if the Op has output types that depend on input values
             if (curr.type != new.type) or output_type_depends_on_input_value:
                 # In strict mode, the cloned graph is assumed to be mathematically equivalent to the original one.
@@ -385,18 +399,24 @@ class Variable(Node, Generic[_TypeType, OptionalApplyType]):
         import pytensor
         import pytensor.tensor as pt
 
-        a = pt.constant(1.5)            # declare a symbolic constant
-        b = pt.fscalar()                # declare a symbolic floating-point scalar
+        a = pt.constant(1.5)  # declare a symbolic constant
+        b = pt.fscalar()  # declare a symbolic floating-point scalar
 
-        c = a + b                       # create a simple expression
+        c = a + b  # create a simple expression
 
-        f = pytensor.function([b], [c])   # this works because a has a value associated with it already
+        f = pytensor.function(
+            [b], [c]
+        )  # this works because a has a value associated with it already
 
-        assert 4.0 == f(2.5)            # bind 2.5 to an internal copy of b and evaluate an internal c
+        assert 4.0 == f(2.5)  # bind 2.5 to an internal copy of b and evaluate an internal c
 
-        pytensor.function([a], [c])       # compilation error because b (required by c) is undefined
+        pytensor.function(
+            [a], [c]
+        )  # compilation error because b (required by c) is undefined
 
-        pytensor.function([a,b], [c])     # compilation error because a is constant, it can't be an input
+        pytensor.function(
+            [a, b], [c]
+        )  # compilation error because a is constant, it can't be an input
 
 
     The python variables ``a, b, c`` all refer to instances of type
@@ -430,8 +450,8 @@ class Variable(Node, Generic[_TypeType, OptionalApplyType]):
         self,
         type: _TypeType,
         owner: OptionalApplyType,
-        index: Optional[int] = None,
-        name: Optional[str] = None,
+        index: int | None = None,
+        name: str | None = None,
     ) -> None:
         super().__init__()
 
@@ -553,23 +573,30 @@ class Variable(Node, Generic[_TypeType, OptionalApplyType]):
             return [self.owner]
         return []
 
-    def eval(self, inputs_to_values=None):
-        r"""Evaluate the `Variable`.
+    def eval(
+        self,
+        inputs_to_values: dict[Union["Variable", str], Any] | None = None,
+        **kwargs,
+    ):
+        r"""Evaluate the `Variable` given a set of values for its inputs.
 
         Parameters
         ----------
         inputs_to_values :
-            A dictionary mapping PyTensor `Variable`\s to values.
+            A dictionary mapping PyTensor `Variable`\s or names to values.
+            Not needed if variable has no required inputs.
+        kwargs :
+            Optional keyword arguments to pass to the underlying `pytensor.function`
 
         Examples
         --------
 
         >>> import numpy as np
         >>> import pytensor.tensor as pt
-        >>> x = pt.dscalar('x')
-        >>> y = pt.dscalar('y')
+        >>> x = pt.dscalar("x")
+        >>> y = pt.dscalar("y")
         >>> z = x + y
-        >>> np.allclose(z.eval({x : 16.3, y : 12.1}), 28.4)
+        >>> np.allclose(z.eval({x: 16.3, y: 12.1}), 28.4)
         True
 
         We passed :meth:`eval` a dictionary mapping symbolic PyTensor
@@ -589,36 +616,50 @@ class Variable(Node, Generic[_TypeType, OptionalApplyType]):
         """
         from pytensor.compile.function import function
 
-        if inputs_to_values is None:
-            inputs_to_values = {}
+        ignore_unused_input = kwargs.get("on_unused_input", None) in ("ignore", "warn")
 
-        def convert_string_keys_to_variables(input_to_values):
+        def convert_string_keys_to_variables(inputs_to_values) -> dict["Variable", Any]:
             new_input_to_values = {}
             for key, value in inputs_to_values.items():
                 if isinstance(key, str):
                     matching_vars = get_var_by_name([self], key)
                     if not matching_vars:
-                        raise Exception(f"{key} not found in graph")
+                        if not ignore_unused_input:
+                            raise ValueError(f"{key} not found in graph")
                     elif len(matching_vars) > 1:
-                        raise Exception(f"Found multiple variables with name {key}")
-                    new_input_to_values[matching_vars[0]] = value
+                        raise ValueError(f"Found multiple variables with name {key}")
+                    else:
+                        new_input_to_values[matching_vars[0]] = value
                 else:
                     new_input_to_values[key] = value
             return new_input_to_values
 
-        inputs_to_values = convert_string_keys_to_variables(inputs_to_values)
+        parsed_inputs_to_values: dict[Variable, Any] = {}
+        if inputs_to_values is not None:
+            parsed_inputs_to_values = convert_string_keys_to_variables(inputs_to_values)
 
         if not hasattr(self, "_fn_cache"):
-            self._fn_cache = dict()
+            self._fn_cache: dict = dict()
 
-        inputs = tuple(sorted(inputs_to_values.keys(), key=id))
-        if inputs not in self._fn_cache:
-            self._fn_cache[inputs] = function(inputs, self)
-        args = [inputs_to_values[param] for param in inputs]
+        inputs = tuple(sorted(parsed_inputs_to_values, key=id))
+        cache_key = (inputs, tuple(kwargs.items()))
+        try:
+            fn = self._fn_cache[cache_key]
+        except (KeyError, TypeError):
+            fn = None
 
-        rval = self._fn_cache[inputs](*args)
+        if fn is None:
+            fn = function(inputs, self, **kwargs)
+            try:
+                self._fn_cache[cache_key] = fn
+            except TypeError as exc:
+                warnings.warn(
+                    "Keyword arguments could not be used to create a cache key for the underlying variable. "
+                    f"A function will be recompiled on every call with such keyword arguments.\n{exc}"
+                )
 
-        return rval
+        args = [parsed_inputs_to_values[param] for param in inputs]
+        return fn(*args)
 
     def __getstate__(self):
         d = self.__dict__.copy()
@@ -638,12 +679,11 @@ class Variable(Node, Generic[_TypeType, OptionalApplyType]):
 class AtomicVariable(Variable[_TypeType, None]):
     """A node type that has no ancestors and should never be considered an input to a graph."""
 
-    def __init__(self, type: _TypeType, name: Optional[str] = None, **kwargs):
+    def __init__(self, type: _TypeType, name: str | None = None, **kwargs):
         super().__init__(type=type, owner=None, index=None, name=name, **kwargs)
 
     @abc.abstractmethod
-    def signature(self):
-        ...
+    def signature(self): ...
 
     def merge_signature(self):
         return self.signature()
@@ -680,7 +720,7 @@ class AtomicVariable(Variable[_TypeType, None]):
         return cp
 
 
-class NominalVariable(AtomicVariable[_TypeType]):
+class NominalVariable(Generic[_TypeType, _IdType], AtomicVariable[_TypeType]):
     """A variable that enables alpha-equivalent comparisons."""
 
     __instances__: dict[tuple["Type", Hashable], "NominalVariable"] = {}
@@ -705,7 +745,7 @@ class NominalVariable(AtomicVariable[_TypeType]):
 
         return cls.__instances__[(typ, id)]
 
-    def __init__(self, id: _IdType, typ: _TypeType, name: Optional[str] = None):
+    def __init__(self, id: _IdType, typ: _TypeType, name: str | None = None):
         self.id = id
         super().__init__(type=typ, name=name)
 
@@ -718,7 +758,7 @@ class NominalVariable(AtomicVariable[_TypeType]):
             return True
 
         return (
-            type(self) == type(other)
+            type(self) is type(other)
             and self.id == other.id
             and self.type == other.type
         )
@@ -727,7 +767,7 @@ class NominalVariable(AtomicVariable[_TypeType]):
         return hash((type(self), self.id, self.type))
 
     def __repr__(self):
-        return f"{type(self).__name__}({repr(self.id)}, {repr(self.type)})"
+        return f"{type(self).__name__}({self.id!r}, {self.type!r})"
 
     def signature(self) -> tuple[_TypeType, _IdType]:
         return (self.type, self.id)
@@ -748,7 +788,7 @@ class Constant(AtomicVariable[_TypeType]):
 
     # __slots__ = ['data']
 
-    def __init__(self, type: _TypeType, data: Any, name: Optional[str] = None):
+    def __init__(self, type: _TypeType, data: Any, name: str | None = None):
         super().__init__(type, name=name)
         self.data = type.filter(data)
         add_tag_trace(self)
@@ -773,7 +813,7 @@ class Constant(AtomicVariable[_TypeType]):
         data_str = repr(self.data)
         if len(data_str) > 20:
             data_str = data_str[:10].strip() + " ... " + data_str[-10:].strip()
-        return f"{type(self).__name__}({repr(self.type)}, data={data_str})"
+        return f"{type(self).__name__}({self.type!r}, data={data_str})"
 
     def clone(self, **kwargs):
         return self
@@ -794,11 +834,11 @@ class Constant(AtomicVariable[_TypeType]):
 
 def walk(
     nodes: Iterable[T],
-    expand: Callable[[T], Optional[Iterable[T]]],
+    expand: Callable[[T], Iterable[T] | None],
     bfs: bool = True,
     return_children: bool = False,
     hash_fn: Callable[[T], int] = id,
-) -> Generator[Union[T, NodeAndChildren], None, None]:
+) -> Generator[T | NodeAndChildren, None, None]:
     r"""Walk through a graph, either breadth- or depth-first.
 
     Parameters
@@ -843,7 +883,7 @@ def walk(
         if node_hash not in rval_set:
             rval_set.add(node_hash)
 
-            new_nodes: Optional[Iterable[T]] = expand(node)
+            new_nodes: Iterable[T] | None = expand(node)
 
             if return_children:
                 yield node, new_nodes
@@ -855,7 +895,7 @@ def walk(
 
 
 def ancestors(
-    graphs: Iterable[Variable], blockers: Optional[Collection[Variable]] = None
+    graphs: Iterable[Variable], blockers: Collection[Variable] | None = None
 ) -> Generator[Variable, None, None]:
     r"""Return the variables that contribute to those in given graphs (inclusive).
 
@@ -876,15 +916,16 @@ def ancestors(
 
     """
 
-    def expand(r: Variable) -> Optional[Iterator[Variable]]:
+    def expand(r: Variable) -> Iterator[Variable] | None:
         if r.owner and (not blockers or r not in blockers):
             return reversed(r.owner.inputs)
+        return None
 
     yield from cast(Generator[Variable, None, None], walk(graphs, expand, False))
 
 
 def graph_inputs(
-    graphs: Iterable[Variable], blockers: Optional[Collection[Variable]] = None
+    graphs: Iterable[Variable], blockers: Collection[Variable] | None = None
 ) -> Generator[Variable, None, None]:
     r"""Return the inputs required to compute the given Variables.
 
@@ -906,8 +947,57 @@ def graph_inputs(
     yield from (r for r in ancestors(graphs, blockers) if r.owner is None)
 
 
+def explicit_graph_inputs(
+    graph: Variable | Iterable[Variable],
+) -> Generator[Variable, None, None]:
+    """
+    Get the root variables needed as inputs to a function that computes `graph`
+
+    Parameters
+    ----------
+    graph : TensorVariable
+        Output `Variable` instances for which to search backward through
+        owners.
+
+    Returns
+    -------
+    iterable
+        Generator of root Variables (without owner) needed to compile a function that evaluates `graphs`.
+
+    Examples
+    --------
+
+    .. code-block:: python
+
+        import pytensor
+        import pytensor.tensor as pt
+        from pytensor.graph.basic import explicit_graph_inputs
+
+        x = pt.vector("x")
+        y = pt.constant(2)
+        z = pt.mul(x * y)
+
+        inputs = list(explicit_graph_inputs(z))
+        f = pytensor.function(inputs, z)
+        eval = f([1, 2, 3])
+
+        print(eval)
+        # [2. 4. 6.]
+    """
+    from pytensor.compile.sharedvalue import SharedVariable
+
+    if isinstance(graph, Variable):
+        graph = [graph]
+
+    return (
+        v
+        for v in graph_inputs(graph)
+        if isinstance(v, Variable) and not isinstance(v, Constant | SharedVariable)
+    )
+
+
 def vars_between(
-    ins: Collection[Variable], outs: Iterable[Variable]
+    ins: Iterable[Variable], outs: Iterable[Variable]
 ) -> Generator[Variable, None, None]:
     r"""Extract the `Variable`\s within the sub-graph between input and output nodes.
 
@@ -927,9 +1017,12 @@ def vars_between(
 
     """
 
-    def expand(r: Variable) -> Optional[Iterable[Variable]]:
+    ins = set(ins)
+
+    def expand(r: Variable) -> Iterable[Variable] | None:
         if r.owner and r not in ins:
             return reversed(r.owner.inputs + r.owner.outputs)
+        return None
 
     yield from cast(Generator[Variable, None, None], walk(outs, expand))
 
@@ -955,7 +1048,10 @@ def orphans_between(
 
     Examples
     --------
-    >>> orphans_between([x], [(x+y).out])
+    >>> from pytensor.graph.basic import orphans_between
+    >>> from pytensor.tensor import scalars
+    >>> x, y = scalars("xy")
+    >>> list(orphans_between([x], [(x + y)]))
     [y]
 
     """
@@ -989,7 +1085,7 @@ def applys_between(
 
 def truncated_graph_inputs(
     outputs: Sequence[Variable],
-    ancestors_to_include: Optional[Collection[Variable]] = None,
+    ancestors_to_include: Collection[Variable] | None = None,
 ) -> list[Variable]:
     """Get the truncate graph inputs.
 
@@ -1124,7 +1220,7 @@ def clone(
     inputs: Sequence[Variable],
     outputs: Sequence[Variable],
     copy_inputs: bool = True,
-    copy_orphans: Optional[bool] = None,
+    copy_orphans: bool | None = None,
     clone_inner_graphs: bool = False,
 ) -> tuple[list[Variable], list[Variable]]:
     r"""Copies the sub-graph contained between inputs and outputs.
@@ -1175,7 +1271,7 @@ def clone_node_and_cache(
     clone_d: dict[Union[Apply, Variable, "Op"], Union[Apply, Variable, "Op"]],
     clone_inner_graphs=False,
     **kwargs,
-) -> Optional[Apply]:
+) -> Apply | None:
     """Clone an `Apply` node and cache the results in `clone_d`.
 
     This function handles `Op` clones that are generated by inner-graph
@@ -1193,7 +1289,7 @@ def clone_node_and_cache(
         return None
 
     # Use a cached `Op` clone when available
-    new_op: Optional["Op"] = cast(Optional["Op"], clone_d.get(node.op))
+    new_op: Op | None = cast(Optional["Op"], clone_d.get(node.op))
 
     cloned_inputs: list[Variable] = [cast(Variable, clone_d[i]) for i in node.inputs]
 
@@ -1216,20 +1312,20 @@ def clone_node_and_cache(
     if new_node.op is not node.op:
         clone_d.setdefault(node.op, new_node.op)
 
-    for old_o, new_o in zip(node.outputs, new_node.outputs):
+    for old_o, new_o in zip(node.outputs, new_node.outputs, strict=True):
         clone_d.setdefault(old_o, new_o)
 
     return new_node
 
 
 def clone_get_equiv(
-    inputs: Sequence[Variable],
-    outputs: Sequence[Variable],
+    inputs: Iterable[Variable],
+    outputs: Reversible[Variable],
     copy_inputs: bool = True,
     copy_orphans: bool = True,
-    memo: Optional[
-        dict[Union[Apply, Variable, "Op"], Union[Apply, Variable, "Op"]]
-    ] = None,
+    memo: (
+        dict[Union[Apply, Variable, "Op"], Union[Apply, Variable, "Op"]] | None
+    ) = None,
     clone_inner_graphs: bool = False,
     **kwargs,
 ) -> dict[Union[Apply, Variable, "Op"], Union[Apply, Variable, "Op"]]:
@@ -1301,14 +1397,32 @@ def clone_get_equiv(
     return memo
 
 
+@overload
 def general_toposort(
     outputs: Iterable[T],
-    deps: Callable[[T], Union[OrderedSet, list[T]]],
-    compute_deps_cache: Optional[
-        Callable[[T], Optional[Union[OrderedSet, list[T]]]]
-    ] = None,
-    deps_cache: Optional[dict[T, list[T]]] = None,
-    clients: Optional[dict[T, list[T]]] = None,
+    deps: None,
+    compute_deps_cache: Callable[[T], OrderedSet | list[T] | None],
+    deps_cache: dict[T, list[T]] | None,
+    clients: dict[T, list[T]] | None,
+) -> list[T]: ...
+
+
+@overload
+def general_toposort(
+    outputs: Iterable[T],
+    deps: Callable[[T], OrderedSet | list[T]],
+    compute_deps_cache: None,
+    deps_cache: None,
+    clients: dict[T, list[T]] | None,
+) -> list[T]: ...
+
+
+def general_toposort(
+    outputs: Iterable[T],
+    deps: Callable[[T], OrderedSet | list[T]] | None,
+    compute_deps_cache: Callable[[T], OrderedSet | list[T] | None] | None = None,
+    deps_cache: dict[T, list[T]] | None = None,
+    clients: dict[T, list[T]] | None = None,
 ) -> list[T]:
     """Perform a topological sort of all nodes starting from a given node.
 
@@ -1345,12 +1459,12 @@ def general_toposort(
         if deps_cache is None:
             deps_cache = {}
 
-        def _compute_deps_cache(io):
+        def _compute_deps_cache_(io):
             if io not in deps_cache:
                 d = deps(io)
 
                 if d:
-                    if not isinstance(d, (list, OrderedSet)):
+                    if not isinstance(d, list | OrderedSet):
                         raise TypeError(
                             "Non-deterministic collections found; make"
                             " toposort non-deterministic."
@@ -1362,6 +1476,8 @@ def general_toposort(
                 return d
             else:
                 return deps_cache[io]
+
+        _compute_deps_cache = _compute_deps_cache_
 
     else:
         _compute_deps_cache = compute_deps_cache
@@ -1375,10 +1491,9 @@ def general_toposort(
     )
 
     _clients: dict[T, list[T]] = {}
-    sources: Deque[T] = deque()
-    search_res_len: int = 0
+    sources: deque[T] = deque()
+    search_res_len = len(search_res)
     for snode, children in search_res:
-        search_res_len += 1
         if children:
             for child in children:
                 _clients.setdefault(child, []).append(snode)
@@ -1410,8 +1525,8 @@ def general_toposort(
 def io_toposort(
     inputs: Iterable[Variable],
     outputs: Reversible[Variable],
-    orderings: Optional[dict[Apply, list[Apply]]] = None,
-    clients: Optional[dict[Variable, list[Variable]]] = None,
+    orderings: dict[Apply, list[Apply]] | None = None,
+    clients: dict[Variable, list[Variable]] | None = None,
 ) -> list[Apply]:
     """Perform topological sort from input and output nodes.
 
@@ -1439,25 +1554,25 @@ def io_toposort(
         order = []
         while todo:
             cur = todo.pop()
-            # We suppose that all outputs are always computed
-            if cur.outputs[0] in computed:
+            if all(out in computed for out in cur.outputs):
                 continue
             if all(i in computed or i.owner is None for i in cur.inputs):
                 computed.update(cur.outputs)
                 order.append(cur)
             else:
                 todo.append(cur)
-                todo.extend(i.owner for i in cur.inputs if i.owner)
+                todo.extend(
+                    i.owner for i in cur.inputs if (i.owner and i not in computed)
+                )
         return order
 
-    compute_deps = None
-    compute_deps_cache = None
     iset = set(inputs)
-    deps_cache: dict = {}
 
     if not orderings:  # ordering can be None or empty dict
         # Specialized function that is faster when no ordering.
         # Also include the cache in the function itself for speed up.
+
+        deps_cache: dict = {}
 
         def compute_deps_cache(obj):
             if obj in deps_cache:
@@ -1477,6 +1592,14 @@ def io_toposort(
                 deps_cache[obj] = rval
             return rval
 
+        topo = general_toposort(
+            outputs,
+            deps=None,
+            compute_deps_cache=compute_deps_cache,
+            deps_cache=deps_cache,
+            clients=clients,
+        )
+
     else:
         # the inputs are used only here in the function that decides what
         # 'predecessors' to explore
@@ -1493,13 +1616,13 @@ def io_toposort(
                 assert not orderings.get(obj, None)
             return rval
 
-    topo = general_toposort(
-        outputs,
-        deps=compute_deps,
-        compute_deps_cache=compute_deps_cache,
-        deps_cache=deps_cache,
-        clients=clients,
-    )
+        topo = general_toposort(
+            outputs,
+            deps=compute_deps,
+            compute_deps_cache=None,
+            deps_cache=None,
+            clients=clients,
+        )
     return [o for o in topo if isinstance(o, Apply)]
 
 
@@ -1683,39 +1806,7 @@ def view_roots(node: Variable) -> list[Variable]:
         return [node]
 
 
-def list_of_nodes(
-    inputs: Collection[Variable], outputs: Iterable[Variable]
-) -> list[Apply]:
-    r"""Return the `Apply` nodes of the graph between `inputs` and `outputs`.
-
-    Parameters
-    ----------
-    inputs : list of Variable
-        Input `Variable`\s.
-    outputs : list of Variable
-        Output `Variable`\s.
-
-    """
-
-    def expand(o: Apply) -> list[Apply]:
-        return [
-            inp.owner
-            for inp in o.inputs
-            if inp.owner and not any(i in inp.owner.outputs for i in inputs)
-        ]
-
-    return list(
-        cast(
-            Iterable[Apply],
-            walk(
-                [o.owner for o in outputs if o.owner],
-                expand,
-            ),
-        )
-    )
-
-
-def apply_depends_on(apply: Apply, depends_on: Union[Apply, Collection[Apply]]) -> bool:
+def apply_depends_on(apply: Apply, depends_on: Apply | Collection[Apply]) -> bool:
     """Determine if any `depends_on` is in the graph given by ``apply``.
 
     Parameters
@@ -1751,7 +1842,7 @@ def apply_depends_on(apply: Apply, depends_on: Union[Apply, Collection[Apply]]) 
 
 
 def variable_depends_on(
-    variable: Variable, depends_on: Union[Variable, Collection[Variable]]
+    variable: Variable, depends_on: Variable | Collection[Variable]
 ) -> bool:
     """Determine if any `depends_on` is in the graph given by ``variable``.
     Parameters
@@ -1773,10 +1864,10 @@ def variable_depends_on(
 
 
 def equal_computations(
-    xs: list[Union[np.ndarray, Variable]],
-    ys: list[Union[np.ndarray, Variable]],
-    in_xs: Optional[list[Variable]] = None,
-    in_ys: Optional[list[Variable]] = None,
+    xs: list[np.ndarray | Variable],
+    ys: list[np.ndarray | Variable],
+    in_xs: list[Variable] | None = None,
+    in_ys: list[Variable] | None = None,
     strict_dtype=True,
 ) -> bool:
     """Checks if PyTensor graphs represent the same computations.
@@ -1811,7 +1902,7 @@ def equal_computations(
     if in_ys is None:
         in_ys = []
 
-    for x, y in zip(xs, ys):
+    for x, y in zip(xs, ys, strict=True):
         if not isinstance(x, Variable) and not isinstance(y, Variable):
             return np.array_equal(x, y)
         if not isinstance(x, Variable):
@@ -1822,11 +1913,10 @@ def equal_computations(
             if isinstance(x, Constant):
                 return np.array_equal(x.data, y)
             return False
-        if x.owner and not y.owner:
+        x_is_owned, y_is_owned = (x.owner is not None, y.owner is not None)
+        if x_is_owned != y_is_owned:
             return False
-        if y.owner and not x.owner:
-            return False
-        if x.owner and y.owner:
+        if x_is_owned and y_is_owned:
             if x.owner.outputs.index(x) != y.owner.outputs.index(y):
                 return False
         if x not in in_xs and not (y.type.in_same_class(x.type)):
@@ -1835,16 +1925,16 @@ def equal_computations(
     if len(in_xs) != len(in_ys):
         return False
 
-    for _x, _y in zip(in_xs, in_ys):
+    for _x, _y in zip(in_xs, in_ys, strict=True):
         if not (_y.type.in_same_class(_x.type)):
             return False
 
-    common = set(zip(in_xs, in_ys))
+    common = set(zip(in_xs, in_ys, strict=True))
     different: set[tuple[Variable, Variable]] = set()
-    for dx, dy in zip(xs, ys):
+    for dx, dy in zip(xs, ys, strict=True):
         assert isinstance(dx, Variable)
         # We checked above that both dx and dy have an owner or not
-        if not dx.owner:
+        if dx.owner is None:
             if isinstance(dx, Constant) and isinstance(dy, Constant):
                 if not dx.equals(dy):
                     return False
@@ -1877,7 +1967,7 @@ def equal_computations(
             return False
         else:
             all_in_common = True
-            for dx, dy in zip(nd_x.outputs, nd_y.outputs):
+            for dx, dy in zip(nd_x.outputs, nd_y.outputs, strict=True):
                 if (dx, dy) in different:
                     return False
                 if (dx, dy) not in common:
@@ -1887,7 +1977,7 @@ def equal_computations(
                 return True
 
             # Compare the individual inputs for equality
-            for dx, dy in zip(nd_x.inputs, nd_y.inputs):
+            for dx, dy in zip(nd_x.inputs, nd_y.inputs, strict=True):
                 if (dx, dy) not in common:
                     # Equality between the variables is unknown, compare
                     # their respective owners, if they have some
@@ -1922,7 +2012,7 @@ def equal_computations(
             # If the code reaches this statement then the inputs are pair-wise
             # equivalent so the outputs of the current nodes are also
             # pair-wise equivalents
-            for dx, dy in zip(nd_x.outputs, nd_y.outputs):
+            for dx, dy in zip(nd_x.outputs, nd_y.outputs, strict=True):
                 common.add((dx, dy))
 
             return True
@@ -1961,14 +2051,16 @@ def get_var_by_name(
     """
     from pytensor.graph.op import HasInnerGraph
 
-    def expand(r) -> Optional[list[Variable]]:
-        if r.owner:
-            res = list(r.owner.inputs)
+    def expand(r) -> list[Variable] | None:
+        if not r.owner:
+            return None
 
-            if isinstance(r.owner.op, HasInnerGraph):
-                res.extend(r.owner.op.inner_outputs)
+        res = list(r.owner.inputs)
 
-            return res
+        if isinstance(r.owner.op, HasInnerGraph):
+            res.extend(r.owner.op.inner_outputs)
+
+        return res
 
     results: tuple[Variable, ...] = ()
     for var in walk(graphs, expand, False):

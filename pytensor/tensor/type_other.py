@@ -18,7 +18,7 @@ def as_int_none_variable(x):
         return NoneConst
     elif NoneConst.equals(x):
         return x
-    x = pytensor.tensor.as_tensor_variable(x, ndim=0)
+    x = pytensor.scalar.as_scalar(x)
     if x.type.dtype not in integer_dtypes:
         raise TypeError("index must be integers")
     return x
@@ -64,7 +64,7 @@ class SliceType(Type[slice]):
         return "slice"
 
     def __eq__(self, other):
-        return type(self) == type(other)
+        return type(self) is type(other)
 
     def __hash__(self):
         return hash(type(self))
@@ -100,12 +100,7 @@ class SliceConstant(Constant):
         return (SliceConstant, self.data.start, self.data.stop, self.data.step)
 
     def __str__(self):
-        return "{}{{{}, {}, {}}}".format(
-            self.__class__.__name__,
-            self.data.start,
-            self.data.stop,
-            self.data.step,
-        )
+        return f"{self.__class__.__name__}{{{self.data.start}, {self.data.stop}, {self.data.step}}}"
 
 
 SliceType.constant_type = SliceConstant
@@ -130,12 +125,6 @@ class NoneTypeT(Generic):
             return x
         else:
             raise TypeError("Expected None!")
-
-    @staticmethod
-    def may_share_memory(a, b):
-        # None never share memory between object, in the sense of DebugMode.
-        # Python None are singleton
-        return False
 
 
 none_type_t = NoneTypeT()

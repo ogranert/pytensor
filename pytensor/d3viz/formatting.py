@@ -2,8 +2,9 @@
 
 Author: Christof Angermueller <cangermueller@gmail.com>
 """
-import os
+
 from functools import reduce
+from pathlib import Path
 
 import numpy as np
 
@@ -131,7 +132,7 @@ class PyDotFormatter:
                 fct = [fct]
             elif isinstance(fct, Apply):
                 fct = fct.outputs
-            assert isinstance(fct, (list, tuple))
+            assert isinstance(fct, list | tuple)
             assert all(isinstance(v, Variable) for v in fct)
             fgraph = FunctionGraph(inputs=graph_inputs(fct), outputs=fct)
 
@@ -243,14 +244,14 @@ class PyDotFormatter:
                 ext_inputs = [self.__node_id(x) for x in node.inputs]
                 int_inputs = [gf.__node_id(x) for x in node.op.inner_inputs]
                 assert len(ext_inputs) == len(int_inputs)
-                h = format_map(zip(ext_inputs, int_inputs))
+                h = format_map(zip(ext_inputs, int_inputs, strict=True))
                 pd_node.get_attributes()["subg_map_inputs"] = h
 
                 # Outputs mapping
                 ext_outputs = [self.__node_id(x) for x in node.outputs]
                 int_outputs = [gf.__node_id(x) for x in node.op.inner_outputs]
                 assert len(ext_outputs) == len(int_outputs)
-                h = format_map(zip(int_outputs, ext_outputs))
+                h = format_map(zip(int_outputs, ext_outputs, strict=True))
                 pd_node.get_attributes()["subg_map_outputs"] = h
 
         return graph
@@ -280,11 +281,11 @@ def var_tag(var):
     """Parse tag attribute of variable node."""
     tag = var.tag
     if hasattr(tag, "trace") and len(tag.trace) and len(tag.trace[0]) == 4:
-        if isinstance(tag.trace[0][0], (tuple, list)):
+        if isinstance(tag.trace[0][0], tuple | list):
             path, line, _, src = tag.trace[0][-1]
         else:
             path, line, _, src = tag.trace[0]
-        path = os.path.basename(path)
+        path = Path(path).name
         path = path.replace("<", "")
         path = path.replace(">", "")
         src = src.encode()
@@ -359,7 +360,7 @@ def dict_to_pdnode(d):
     for k, v in d.items():
         if v is not None:
             if isinstance(v, list):
-                v = "\t".join([str(x) for x in v])
+                v = "\t".join(str(x) for x in v)
             else:
                 v = str(v)
             v = str(v)

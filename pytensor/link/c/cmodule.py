@@ -2,11 +2,11 @@
 Generate and compile C modules for Python.
 
 """
+
 import atexit
 import importlib
 import logging
 import os
-import pathlib
 import pickle
 import platform
 import re
@@ -19,8 +19,11 @@ import tempfile
 import textwrap
 import time
 import warnings
+from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext
 from io import BytesIO, StringIO
-from typing import TYPE_CHECKING, Callable, Optional, Protocol, cast
+from pathlib import Path
+from typing import TYPE_CHECKING, Protocol, cast
 
 import numpy as np
 from setuptools._distutils.sysconfig import (
@@ -51,22 +54,22 @@ if TYPE_CHECKING:
 
 
 class StdLibDirsAndLibsType(Protocol):
-    data: Optional[tuple[list[str], ...]]
-    __call__: Callable[[], Optional[tuple[list[str], ...]]]
+    data: tuple[list[str], ...] | None
+    __call__: Callable[[], tuple[list[str], ...] | None]
 
 
 def is_StdLibDirsAndLibsType(
-    fn: Callable[[], Optional[tuple[list[str], ...]]]
+    fn: Callable[[], tuple[list[str], ...] | None],
 ) -> StdLibDirsAndLibsType:
     return cast(StdLibDirsAndLibsType, fn)
 
 
 class GCCLLVMType(Protocol):
-    is_llvm: Optional[bool]
-    __call__: Callable[[], Optional[bool]]
+    is_llvm: bool | None
+    __call__: Callable[[], bool | None]
 
 
-def is_GCCLLVMType(fn: Callable[[], Optional[bool]]) -> GCCLLVMType:
+def is_GCCLLVMType(fn: Callable[[], bool | None]) -> GCCLLVMType:
     return cast(GCCLLVMType, fn)
 
 
@@ -269,6 +272,26 @@ def _get_ext_suffix():
     return dist_suffix
 
 
+def add_gcc_dll_directory() -> AbstractContextManager[None]:
+    """On Windows, detect and add the location of gcc to the DLL search directory.
+
+    On non-Windows platforms this is a noop.
+
+    Returns a context manager to be used with `with`. The entry is removed when the
+    context manager is closed. See <https://github.com/pymc-devs/pytensor/pull/678>.
+    """
+    cm: AbstractContextManager[None] = nullcontext()
+    if (sys.platform == "win32") & (hasattr(os, "add_dll_directory")):
+        gcc_path = shutil.which("gcc")
+        if gcc_path is not None:
+            # Since add_dll_directory is only defined on windows, we need
+            # the ignore[attr-defined] on non-Windows platforms.
+            # For Windows we need ignore[unused-ignore] since the ignore
+            # is unnecessary with that platform.
+            cm = os.add_dll_directory(os.path.dirname(gcc_path))  # type: ignore[attr-defined,unused-ignore]
+    return cm
+
+
 def dlimport(fullpath, suffix=None):
     """
     Dynamically load a .so, .pyd, .dll, or .py file.
@@ -318,24 +341,20 @@ def dlimport(fullpath, suffix=None):
     _logger.debug(f"module_name {module_name}")
 
     sys.path[0:0] = [workdir]  # insert workdir at beginning (temporarily)
-    # Explicitly add gcc dll directory on Python 3.8+ on Windows
-    if (sys.platform == "win32") & (hasattr(os, "add_dll_directory")):
-        gcc_path = shutil.which("gcc")
-        if gcc_path is not None:
-            os.add_dll_directory(os.path.dirname(gcc_path))
-    global import_time
-    try:
-        importlib.invalidate_caches()
-        t0 = time.perf_counter()
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", message="numpy.ndarray size changed")
-            rval = __import__(module_name, {}, {}, [module_name])
-        t1 = time.perf_counter()
-        import_time += t1 - t0
-        if not rval:
-            raise Exception("__import__ failed", fullpath)
-    finally:
-        del sys.path[0]
+    with add_gcc_dll_directory():
+        global import_time
+        try:
+            importlib.invalidate_caches()
+            t0 = time.perf_counter()
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message="numpy.ndarray size changed")
+                rval = __import__(module_name, {}, {}, [module_name])
+            t1 = time.perf_counter()
+            import_time += t1 - t0
+            if not rval:
+                raise Exception("__import__ failed", fullpath)
+        finally:
+            del sys.path[0]
 
     assert fullpath.startswith(rval.__file__)
     return rval
@@ -407,7 +426,7 @@ def is_same_entry(entry_1, entry_2):
     return False
 
 
-def get_module_hash(src_code, key):
+def get_module_hash(src_code: str, key) -> str:
     """
     Return a SHA256 hash that uniquely identifies a module.
 
@@ -447,13 +466,13 @@ def get_module_hash(src_code, key):
         if isinstance(key_element, tuple):
             # This should be the C++ compilation command line parameters or the
             # libraries to link against.
-            to_hash += list(key_element)
+            to_hash += [str(e) for e in key_element]
         elif isinstance(key_element, str):
             if key_element.startswith("md5:") or key_element.startswith("hash:"):
                 # This is actually a sha256 hash of the config options.
                 # Currently, we still keep md5 to don't break old PyTensor.
                 # We add 'hash:' so that when we change it in
-                # the futur, it won't break this version of PyTensor.
+                # the future, it won't break this version of PyTensor.
                 break
             elif key_element.startswith("NPY_ABI_VERSION=0x") or key_element.startswith(
                 "c_compiler_str="
@@ -622,7 +641,7 @@ class ModuleCache:
     The cache contains one directory for each module, containing:
     - the dynamic library file itself (e.g. ``.so/.pyd``),
     - an empty ``__init__.py`` file, so Python can import it,
-    - a file containing the source code for the module (e.g. ``mod.cpp/mod.cu``),
+    - a file containing the source code for the module (e.g. ``mod.cpp``),
     - a ``key.pkl`` file, containing a KeyData object with all the keys
     associated with that module,
     - possibly a ``delete.me`` file, meaning this directory has been marked
@@ -669,7 +688,7 @@ class ModuleCache:
 
     """
 
-    dirname: str = ""
+    dirname: Path
     """
     The working directory that is managed by this interface.
 
@@ -706,8 +725,13 @@ class ModuleCache:
 
     """
 
-    def __init__(self, dirname, check_for_broken_eq=True, do_refresh=True):
-        self.dirname = dirname
+    def __init__(
+        self,
+        dirname: Path | str,
+        check_for_broken_eq: bool = True,
+        do_refresh: bool = True,
+    ):
+        self.dirname = Path(dirname)
         self.module_from_name = dict(self.module_from_name)
         self.entry_from_key = dict(self.entry_from_key)
         self.module_hash_to_key_data = dict(self.module_hash_to_key_data)
@@ -1038,7 +1062,7 @@ class ModuleCache:
                     _logger.info(f"deleting ModuleCache entry {entry}")
                     key_data.delete_keys_from(self.entry_from_key)
                     del self.module_hash_to_key_data[module_hash]
-                    if key_data.keys and list(key_data.keys)[0][0]:
+                    if key_data.keys and next(iter(key_data.keys))[0]:
                         # this is a versioned entry, so should have been on
                         # disk. Something weird happened to cause this, so we
                         # are responding by printing a warning, removing
@@ -1615,15 +1639,15 @@ def _rmtree(
                 )
 
 
-_module_cache: Optional[ModuleCache] = None
+_module_cache: ModuleCache | None = None
 
 
-def get_module_cache(dirname: str, init_args=None) -> ModuleCache:
+def get_module_cache(dirname: Path | str, init_args=None) -> ModuleCache:
     """Create a new module_cache.
 
     Parameters
     ----------
-    dirname
+    dirname : Path | str
         The name of the directory used by the cache.
     init_args
         Keyword arguments passed to the `ModuleCache` constructor.
@@ -1684,7 +1708,7 @@ def std_include_dirs():
 
 
 @is_StdLibDirsAndLibsType
-def std_lib_dirs_and_libs() -> Optional[tuple[list[str], ...]]:
+def std_lib_dirs_and_libs() -> tuple[list[str], ...] | None:
     # We cache the results as on Windows, this trigger file access and
     # this method is called many times.
     if std_lib_dirs_and_libs.data is not None:
@@ -1720,9 +1744,7 @@ def std_lib_dirs_and_libs() -> Optional[tuple[list[str], ...]]:
                 if not os.path.exists(os.path.join(libdir, f)):
                     print(
                         "Your Python version is from Canopy. "
-                        + "You need to install the package '"
-                        + lib
-                        + "' from Canopy package manager."
+                        f"You need to install the package '{lib}' from Canopy package manager."
                     )
             libdirs = [
                 # Used in older Canopy
@@ -1739,9 +1761,7 @@ def std_lib_dirs_and_libs() -> Optional[tuple[list[str], ...]]:
                 ):
                     print(
                         "Your Python version is from Canopy. "
-                        + "You need to install the package '"
-                        + lib
-                        + "' from Canopy package manager."
+                        f"You need to install the package '{lib}' from Canopy package manager."
                     )
             python_lib_dirs.insert(0, libdir)
         std_lib_dirs_and_libs.data = [libname], python_lib_dirs
@@ -1751,30 +1771,23 @@ def std_lib_dirs_and_libs() -> Optional[tuple[list[str], ...]]:
     elif sys.platform == "darwin":
         std_lib_dirs_and_libs.data = [], []
     else:
-        if platform.python_implementation() == "PyPy":
-            # Assume Linux (note: Ubuntu doesn't ship this .so)
-            libname = "pypy3-c"
-            # Unfortunately the only convention of this .so is that it appears
-            # next to the location of the interpreter binary.
-            libdir = os.path.dirname(os.path.realpath(sys.executable))
-        else:
-            # Assume Linux
-            # Typical include directory: /usr/include/python2.6
+        # Assume Linux
+        # Typical include directory: /usr/include/python2.6
 
-            # get the name of the python library (shared object)
+        # get the name of the python library (shared object)
 
-            libname = str(get_config_var("LDLIBRARY"))
+        libname = str(get_config_var("LDLIBRARY"))
 
-            if libname.startswith("lib"):
-                libname = libname[3:]
+        if libname.startswith("lib"):
+            libname = libname[3:]
 
-            # remove extension if present
-            if libname.endswith(".so"):
-                libname = libname[:-3]
-            elif libname.endswith(".a"):
-                libname = libname[:-2]
+        # remove extension if present
+        if libname.endswith(".so"):
+            libname = libname[:-3]
+        elif libname.endswith(".a"):
+            libname = libname[:-2]
 
-            libdir = str(get_config_var("LIBDIR"))
+        libdir = str(get_config_var("LIBDIR"))
 
         std_lib_dirs_and_libs.data = [libname], [libdir]
 
@@ -1805,7 +1818,7 @@ def gcc_version():
 
 
 @is_GCCLLVMType
-def gcc_llvm() -> Optional[bool]:
+def gcc_llvm() -> bool | None:
     """
     Detect if the g++ version used is the llvm one or not.
 
@@ -1890,7 +1903,7 @@ class Compiler:
                 os.close(fd)
                 fd = None
                 out, err, p_ret = output_subprocess_Popen(
-                    [compiler] + args + [path, "-o", exe_path] + flags
+                    [compiler, *args, path, "-o", exe_path, *flags]
                 )
                 if p_ret != 0:
                     compilation_ok = False
@@ -1949,15 +1962,14 @@ class Compiler:
             return False
 
         code = (
-            """
-        %(preamble)s
+            f"""
+        {preamble}
         int main(int argc, char** argv)
-        {
-            %(body)s
+        {{
+            {body}
             return 0;
-        }
+        }}
         """
-            % locals()
         ).encode()
         return cls._try_compile_tmp(
             code,
@@ -1992,16 +2004,21 @@ def try_blas_flag(flags):
     cflags = list(flags)
     # to support path that includes spaces, we need to wrap it with double quotes on Windows
     path_wrapper = '"' if os.name == "nt" else ""
-    cflags.extend([f"-L{path_wrapper}{d}{path_wrapper}" for d in std_lib_dirs()])
+    cflags.extend(f"-L{path_wrapper}{d}{path_wrapper}" for d in std_lib_dirs())
 
     res = GCC_compiler.try_compile_tmp(
-        test_code, tmp_prefix="try_blas_", flags=cflags, try_run=True
+        test_code, tmp_prefix="try_blas_", flags=cflags, try_run=True, output=True
     )
     # res[0]: shows successful compilation
     # res[1]: shows successful execution
+    # res[2]: shows execution results
+    # res[3]: shows execution or compilation error message
     if res and res[0] and res[1]:
         return " ".join(flags)
     else:
+        _logger.debug(
+            "try_blas_flags of flags: %r\nfailed with error message %s", flags, res[3]
+        )
         return ""
 
 
@@ -2115,9 +2132,11 @@ class GCC_compiler(Compiler):
                             or "-march=native" in line
                         ):
                             continue
-                        for reg in ("-march=", "-mtune=", "-target-cpu", "-mabi="):
-                            if reg in line:
-                                selected_lines.append(line.strip())
+                        selected_lines.extend(
+                            line.strip()
+                            for reg in ("-march=", "-mtune=", "-target-cpu", "-mabi=")
+                            if reg in line
+                        )
                     lines = list(set(selected_lines))  # to remove duplicate
 
                 return lines
@@ -2277,7 +2296,7 @@ class GCC_compiler(Compiler):
             default_compilation_result, default_execution_result = try_march_flag(
                 GCC_compiler.march_flags
             )
-            if not default_compilation_result or not default_execution_result:
+            if not (default_compilation_result and default_execution_result):
                 march_success = False
                 march_ind = None
                 mtune_ind = None
@@ -2360,6 +2379,14 @@ class GCC_compiler(Compiler):
         if sys.platform == "darwin":
             # Use the already-loaded python symbols.
             cxxflags.extend(["-undefined", "dynamic_lookup"])
+            # XCode15 introduced ld_prime linker. At the time of writing, this linker
+            # leads to multiple issues, so we supply a flag to use the older dynamic
+            # linker: ld64
+            if int(platform.mac_ver()[0].split(".")[0]) >= 15:
+                # This might be incorrect. We know that ld_prime was introduced in
+                # XCode15, but we don't know if the platform version is aligned with
+                # xcode's version.
+                cxxflags.append("-ld64")
 
         if sys.platform == "win32":
             # Workaround for https://github.com/Theano/Theano/issues/4926.
@@ -2432,14 +2459,30 @@ class GCC_compiler(Compiler):
         if not libs:
             return flag_list
         libs = GCC_compiler.linking_patch(lib_dirs, libs)
-        for flag_idx, lib in zip(flag_idxs, libs):
+        for flag_idx, lib in zip(flag_idxs, libs, strict=True):
             flag_list[flag_idx] = lib
         return flag_list
 
     @staticmethod
     def linking_patch(lib_dirs: list[str], libs: list[str]) -> list[str]:
         if sys.platform != "win32":
-            return [f"-l{l}" for l in libs]
+            patched_libs = []
+            framework = False
+            for lib in libs:
+                # The clang framework flag is handled differently.
+                # The flag will have the format -framework framework_name
+                # If we find a lib that is called -framework, we keep it and the following
+                # entry in the lib list unchanged. Anything else, we add the standard
+                # -l library prefix.
+                if lib == "-framework":
+                    framework = True
+                    patched_libs.append(lib)
+                elif framework:
+                    framework = False
+                    patched_libs.append(lib)
+                else:
+                    patched_libs.append(f"-l{lib}")
+            return patched_libs
         else:
             # In explicit else because of https://github.com/python/mypy/issues/10773
             def sort_key(lib):
@@ -2447,6 +2490,8 @@ class GCC_compiler(Compiler):
                 return (extension == "dll", tuple(map(int, numbers)))
 
             patched_lib_ldflags = []
+            # Should we also add a framework possibility on windows? I didn't do so because
+            # clang is not intended to be used there at the moment.
             for lib in libs:
                 ldflag = f"-l{lib}"
                 for lib_dir in lib_dirs:
@@ -2562,8 +2607,8 @@ class GCC_compiler(Compiler):
             cmd.extend(preargs)
         # to support path that includes spaces, we need to wrap it with double quotes on Windows
         path_wrapper = '"' if os.name == "nt" else ""
-        cmd.extend([f"-I{path_wrapper}{idir}{path_wrapper}" for idir in include_dirs])
-        cmd.extend([f"-L{path_wrapper}{ldir}{path_wrapper}" for ldir in lib_dirs])
+        cmd.extend(f"-I{path_wrapper}{idir}{path_wrapper}" for idir in include_dirs)
+        cmd.extend(f"-L{path_wrapper}{ldir}{path_wrapper}" for ldir in lib_dirs)
         if hide_symbols and sys.platform != "win32":
             # This has been available since gcc 4.0 so we suppose it
             # is always available. We pass it here since it
@@ -2742,8 +2787,8 @@ def default_blas_ldflags():
             return []
 
         maybe_lib_dirs = [
-            [pathlib.Path(p).resolve() for p in line[len("libraries: =") :].split(":")]
-            for line in stdout.decode(sys.stdout.encoding).splitlines()
+            [Path(p).resolve() for p in line[len("libraries: =") :].split(":")]
+            for line in stdout.decode(sys.getdefaultencoding()).splitlines()
             if line.startswith("libraries: =")
         ]
         if len(maybe_lib_dirs) > 0:
@@ -2787,7 +2832,6 @@ def default_blas_ldflags():
             _logger.debug("The following blas flags will be used: '%s'", res)
             return res
         else:
-            _logger.debug(f"Supplied flags {res} failed to compile")
             _logger.debug("Supplied flags '%s' failed to compile", res)
             raise RuntimeError(f"Supplied flags {flags} failed to compile")
 
@@ -2817,9 +2861,9 @@ def default_blas_ldflags():
     all_libs = [
         l
         for path in [
-            pathlib.Path(library_dir)
+            Path(library_dir)
             for library_dir in searched_library_dirs
-            if pathlib.Path(library_dir).exists()
+            if Path(library_dir).exists()
         ]
         for l in path.iterdir()
         if l.suffix in {".so", ".dll", ".dylib"}
@@ -2856,8 +2900,20 @@ def default_blas_ldflags():
     except Exception as e:
         _logger.debug(e)
     try:
+        # 3. Mac Accelerate framework
+        _logger.debug("Checking Accelerate framework")
+        flags = ["-framework", "Accelerate"]
+        if rpath:
+            flags = [*flags, f"-Wl,-rpath,{rpath}"]
+        validated_flags = try_blas_flag(flags)
+        if validated_flags == "":
+            raise Exception("Accelerate framework flag failed ")
+        return validated_flags
+    except Exception as e:
+        _logger.debug(e)
+    try:
         _logger.debug("Checking Lapack + blas")
-        # 3. Try to use LAPACK + BLAS
+        # 4. Try to use LAPACK + BLAS
         return check_libs(
             all_libs,
             required_libs=["lapack", "blas", "cblas", "m"],
@@ -2867,7 +2923,7 @@ def default_blas_ldflags():
     except Exception as e:
         _logger.debug(e)
     try:
-        # 4. Try to use BLAS alone
+        # 5. Try to use BLAS alone
         _logger.debug("Checking blas alone")
         return check_libs(
             all_libs,
@@ -2878,7 +2934,7 @@ def default_blas_ldflags():
     except Exception as e:
         _logger.debug(e)
     try:
-        # 5. Try to use openblas
+        # 6. Try to use openblas
         _logger.debug("Checking openblas")
         return check_libs(
             all_libs,

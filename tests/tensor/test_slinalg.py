@@ -1,5 +1,6 @@
 import functools
 import itertools
+from typing import Literal
 
 import numpy as np
 import pytest
@@ -15,11 +16,11 @@ from pytensor.tensor.slinalg import (
     Solve,
     SolveBase,
     SolveTriangular,
+    block_diag,
     cho_solve,
     cholesky,
     eigvalsh,
     expm,
-    kron,
     solve,
     solve_continuous_lyapunov,
     solve_discrete_are,
@@ -197,7 +198,10 @@ class TestSolveBase(utt.InferShapeTester):
         A = matrix()
         b = matrix()
         y = SolveBase(b_ndim=2)(A, b)
-        assert y.__repr__() == "SolveBase{lower=False, check_finite=True, b_ndim=2}.0"
+        assert (
+            y.__repr__()
+            == "SolveBase{lower=False, check_finite=True, b_ndim=2, overwrite_a=False, overwrite_b=False}.0"
+        )
 
 
 class TestSolve(utt.InferShapeTester):
@@ -361,7 +365,7 @@ class TestCholeskySolve(utt.InferShapeTester):
     def test_repr(self):
         assert (
             repr(CholeskySolve(lower=True, b_ndim=1))
-            == "CholeskySolve(lower=True,check_finite=True,b_ndim=1)"
+            == "CholeskySolve(lower=True,check_finite=True,b_ndim=1,overwrite_b=False)"
         )
 
     def test_infer_shape(self):
@@ -511,115 +515,133 @@ def test_expm_grad_3():
     utt.verify_grad(expm, [A], rng=rng)
 
 
-class TestKron(utt.InferShapeTester):
-    rng = np.random.default_rng(43)
-
-    def setup_method(self):
-        self.op = kron
-        super().setup_method()
-
-    def test_perform(self):
-        for shp0 in [(2,), (2, 3), (2, 3, 4), (2, 3, 4, 5)]:
-            x = tensor(dtype="floatX", shape=(None,) * len(shp0))
-            a = np.asarray(self.rng.random(shp0)).astype(config.floatX)
-            for shp1 in [(6,), (6, 7), (6, 7, 8), (6, 7, 8, 9)]:
-                if len(shp0) + len(shp1) == 2:
-                    continue
-                y = tensor(dtype="floatX", shape=(None,) * len(shp1))
-                f = function([x, y], kron(x, y))
-                b = self.rng.random(shp1).astype(config.floatX)
-                out = f(a, b)
-                # Newer versions of scipy want 4 dimensions at least,
-                # so we have to add a dimension to a and flatten the result.
-                if len(shp0) + len(shp1) == 3:
-                    scipy_val = scipy.linalg.kron(a[np.newaxis, :], b).flatten()
-                else:
-                    scipy_val = scipy.linalg.kron(a, b)
-                np.testing.assert_allclose(out, scipy_val)
-
-    def test_numpy_2d(self):
-        for shp0 in [(2, 3)]:
-            x = tensor(dtype="floatX", shape=(None,) * len(shp0))
-            a = np.asarray(self.rng.random(shp0)).astype(config.floatX)
-            for shp1 in [(6, 7)]:
-                if len(shp0) + len(shp1) == 2:
-                    continue
-                y = tensor(dtype="floatX", shape=(None,) * len(shp1))
-                f = function([x, y], kron(x, y))
-                b = self.rng.random(shp1).astype(config.floatX)
-                out = f(a, b)
-                assert np.allclose(out, np.kron(a, b))
+def recover_Q(A, X, continuous=True):
+    if continuous:
+        return A @ X + X @ A.conj().T
+    else:
+        return X - A @ X @ A.conj().T
 
 
-def test_solve_discrete_lyapunov_via_direct_real():
-    N = 5
+vec_recover_Q = np.vectorize(recover_Q, signature="(m,m),(m,m),()->(m,m)")
+
+
+@pytest.mark.parametrize("use_complex", [False, True], ids=["float", "complex"])
+@pytest.mark.parametrize("shape", [(5, 5), (5, 5, 5)], ids=["matrix", "batch"])
+@pytest.mark.parametrize("method", ["direct", "bilinear"])
+def test_solve_discrete_lyapunov(
+    use_complex, shape: tuple[int], method: Literal["direct", "bilinear"]
+):
     rng = np.random.default_rng(utt.fetch_seed())
-    a = pt.dmatrix()
-    q = pt.dmatrix()
-    f = function([a, q], [solve_discrete_lyapunov(a, q, method="direct")])
+    dtype = config.floatX
+    if use_complex:
+        precision = int(dtype[-2:])  # 64 or 32
+        dtype = f"complex{int(2 * precision)}"
 
-    A = rng.normal(size=(N, N))
-    Q = rng.normal(size=(N, N))
+    A1, A2 = rng.normal(size=(2, *shape))
+    Q1, Q2 = rng.normal(size=(2, *shape))
+
+    if use_complex:
+        A = A1 + 1j * A2
+        Q = Q1 + 1j * Q2
+    else:
+        A = A1
+        Q = Q1
+
+    A, Q = A.astype(dtype), Q.astype(dtype)
+
+    a = pt.tensor(name="a", shape=shape, dtype=dtype)
+    q = pt.tensor(name="q", shape=shape, dtype=dtype)
+
+    x = solve_discrete_lyapunov(a, q, method=method)
+    f = function([a, q], x)
 
     X = f(A, Q)
-    assert np.allclose(A @ X @ A.T - X + Q, 0.0)
+    Q_recovered = vec_recover_Q(A, X, continuous=False)
 
-    utt.verify_grad(solve_discrete_lyapunov, pt=[A, Q], rng=rng)
+    atol = rtol = 1e-4 if config.floatX == "float32" else 1e-8
+    np.testing.assert_allclose(Q_recovered, Q, atol=atol, rtol=rtol)
 
 
-@pytest.mark.filterwarnings("ignore::UserWarning")
-def test_solve_discrete_lyapunov_via_direct_complex():
-    # Conj doesn't have C-op; filter the warning.
+@pytest.mark.parametrize("use_complex", [False, True], ids=["float", "complex"])
+@pytest.mark.parametrize("shape", [(5, 5), (5, 5, 5)], ids=["matrix", "batch"])
+@pytest.mark.parametrize("method", ["direct", "bilinear"])
+def test_solve_discrete_lyapunov_gradient(
+    use_complex, shape: tuple[int], method: Literal["direct", "bilinear"]
+):
+    if config.floatX == "float32":
+        pytest.skip(reason="Not enough precision in float32 to get a good gradient")
+    if use_complex:
+        pytest.skip(reason="Complex numbers are not supported in the gradient test")
 
-    N = 5
     rng = np.random.default_rng(utt.fetch_seed())
-    a = pt.zmatrix()
-    q = pt.zmatrix()
-    f = function([a, q], [solve_discrete_lyapunov(a, q, method="direct")])
+    A = rng.normal(size=shape).astype(config.floatX)
+    Q = rng.normal(size=shape).astype(config.floatX)
 
-    A = rng.normal(size=(N, N)) + rng.normal(size=(N, N)) * 1j
-    Q = rng.normal(size=(N, N))
-    X = f(A, Q)
-    np.testing.assert_array_less(A @ X @ A.conj().T - X + Q, 1e-12)
-
-    # TODO: the .conj() method currently does not have a gradient; add this test when gradients are implemented.
-    # utt.verify_grad(solve_discrete_lyapunov, pt=[A, Q], rng=rng)
+    utt.verify_grad(
+        functools.partial(solve_discrete_lyapunov, method=method),
+        pt=[A, Q],
+        rng=rng,
+    )
 
 
-def test_solve_discrete_lyapunov_via_bilinear():
-    N = 5
+@pytest.mark.parametrize("shape", [(5, 5), (5, 5, 5)], ids=["matrix", "batched"])
+@pytest.mark.parametrize("use_complex", [False, True], ids=["float", "complex"])
+def test_solve_continuous_lyapunov(shape: tuple[int], use_complex: bool):
+    dtype = config.floatX
+    if use_complex and dtype == "float32":
+        pytest.skip(
+            "Not enough precision in complex64 to do schur decomposition "
+            "(ill-conditioned matrix errors arise)"
+        )
     rng = np.random.default_rng(utt.fetch_seed())
-    a = pt.dmatrix()
-    q = pt.dmatrix()
-    f = function([a, q], [solve_discrete_lyapunov(a, q, method="bilinear")])
 
-    A = rng.normal(size=(N, N))
-    Q = rng.normal(size=(N, N))
+    if use_complex:
+        precision = int(dtype[-2:])  # 64 or 32
+        dtype = f"complex{int(2 * precision)}"
+
+    A1, A2 = rng.normal(size=(2, *shape))
+    Q1, Q2 = rng.normal(size=(2, *shape))
+
+    if use_complex:
+        A = A1 + 1j * A2
+        Q = Q1 + 1j * Q2
+    else:
+        A = A1
+        Q = Q1
+
+    A, Q = A.astype(dtype), Q.astype(dtype)
+
+    a = pt.tensor(name="a", shape=shape, dtype=dtype)
+    q = pt.tensor(name="q", shape=shape, dtype=dtype)
+    x = solve_continuous_lyapunov(a, q)
+
+    f = function([a, q], x)
 
     X = f(A, Q)
 
-    np.testing.assert_array_less(A @ X @ A.conj().T - X + Q, 1e-12)
-    utt.verify_grad(solve_discrete_lyapunov, pt=[A, Q], rng=rng)
+    Q_recovered = vec_recover_Q(A, X, continuous=True)
+
+    atol = rtol = 1e-2 if config.floatX == "float32" else 1e-8
+    np.testing.assert_allclose(Q_recovered.squeeze(), Q, atol=atol, rtol=rtol)
 
 
-def test_solve_continuous_lyapunov():
-    N = 5
+@pytest.mark.parametrize("shape", [(5, 5), (5, 5, 5)], ids=["matrix", "batched"])
+@pytest.mark.parametrize("use_complex", [False, True], ids=["float", "complex"])
+def test_solve_continuous_lyapunov_grad(shape: tuple[int], use_complex):
+    if config.floatX == "float32":
+        pytest.skip(reason="Not enough precision in float32 to get a good gradient")
+    if use_complex:
+        pytest.skip(reason="Complex numbers are not supported in the gradient test")
+
     rng = np.random.default_rng(utt.fetch_seed())
-    a = pt.dmatrix()
-    q = pt.dmatrix()
-    f = function([a, q], [solve_continuous_lyapunov(a, q)])
+    A = rng.normal(size=shape).astype(config.floatX)
+    Q = rng.normal(size=shape).astype(config.floatX)
 
-    A = rng.normal(size=(N, N))
-    Q = rng.normal(size=(N, N))
-    X = f(A, Q)
-
-    Q_recovered = A @ X + X @ A.conj().T
-
-    np.testing.assert_allclose(Q_recovered.squeeze(), Q)
     utt.verify_grad(solve_continuous_lyapunov, pt=[A, Q], rng=rng)
 
 
-def test_solve_discrete_are_forward():
+@pytest.mark.parametrize("add_batch_dim", [False, True])
+def test_solve_discrete_are_forward(add_batch_dim):
     # TEST CASE 4 : darex #1 -- taken from Scipy tests
     a, b, q, r = (
         np.array([[4, 3], [-4.5, -3.5]]),
@@ -627,29 +649,39 @@ def test_solve_discrete_are_forward():
         np.array([[9, 6], [6, 4]]),
         np.array([[1]]),
     )
-    a, b, q, r = (x.astype(config.floatX) for x in [a, b, q, r])
+    if add_batch_dim:
+        a, b, q, r = (np.stack([x] * 5) for x in [a, b, q, r])
 
-    x = solve_discrete_are(a, b, q, r).eval()
-    res = a.T.dot(x.dot(a)) - x + q
-    res -= (
-        a.conj()
-        .T.dot(x.dot(b))
-        .dot(np.linalg.solve(r + b.conj().T.dot(x.dot(b)), b.T).dot(x.dot(a)))
-    )
+    a, b, q, r = (pt.as_tensor_variable(x).astype(config.floatX) for x in [a, b, q, r])
+
+    x = solve_discrete_are(a, b, q, r)
+
+    def eval_fun(a, b, q, r, x):
+        term_1 = a.T @ x @ a
+        term_2 = a.T @ x @ b
+        term_3 = pt.linalg.solve(r + b.T @ x @ b, b.T) @ x @ a
+
+        return term_1 - x - term_2 @ term_3 + q
+
+    res = pt.vectorize(eval_fun, "(m,m),(m,n),(m,m),(n,n),(m,m)->(m,m)")(a, b, q, r, x)
+    res_np = res.eval()
 
     atol = 1e-4 if config.floatX == "float32" else 1e-12
-    np.testing.assert_allclose(res, np.zeros_like(res), atol=atol)
+    np.testing.assert_allclose(res_np, np.zeros_like(res_np), atol=atol)
 
 
-def test_solve_discrete_are_grad():
+@pytest.mark.parametrize("add_batch_dim", [False, True])
+def test_solve_discrete_are_grad(add_batch_dim):
     a, b, q, r = (
         np.array([[4, 3], [-4.5, -3.5]]),
         np.array([[1], [-1]]),
         np.array([[9, 6], [6, 4]]),
         np.array([[1]]),
     )
-    a, b, q, r = (x.astype(config.floatX) for x in [a, b, q, r])
+    if add_batch_dim:
+        a, b, q, r = (np.stack([x] * 5) for x in [a, b, q, r])
 
+    a, b, q, r = (x.astype(config.floatX) for x in [a, b, q, r])
     rng = np.random.default_rng(utt.fetch_seed())
 
     # TODO: Is there a "theoretically motivated" value to use here? I pulled 1e-4 out of a hat
@@ -661,3 +693,40 @@ def test_solve_discrete_are_grad():
         rng=rng,
         abs_tol=atol,
     )
+
+
+def test_block_diagonal():
+    A = np.array([[1.0, 2.0], [3.0, 4.0]])
+    B = np.array([[5.0, 6.0], [7.0, 8.0]])
+    result = block_diag(A, B)
+    assert result.owner.op.core_op._props_dict() == {"n_inputs": 2}
+
+    np.testing.assert_allclose(result.eval(), scipy.linalg.block_diag(A, B))
+
+
+def test_block_diagonal_grad():
+    A = np.array([[1.0, 2.0], [3.0, 4.0]])
+    B = np.array([[5.0, 6.0], [7.0, 8.0]])
+
+    utt.verify_grad(block_diag, pt=[A, B], rng=np.random.default_rng())
+
+
+def test_block_diagonal_blockwise():
+    batch_size = 5
+    A = np.random.normal(size=(batch_size, 2, 2)).astype(config.floatX)
+    B = np.random.normal(size=(batch_size, 4, 4)).astype(config.floatX)
+    result = block_diag(A, B).eval()
+    assert result.shape == (batch_size, 6, 6)
+    for i in range(batch_size):
+        np.testing.assert_allclose(
+            result[i],
+            scipy.linalg.block_diag(A[i], B[i]),
+            atol=1e-4 if config.floatX == "float32" else 1e-8,
+            rtol=1e-4 if config.floatX == "float32" else 1e-8,
+        )
+
+    # Test broadcasting
+    A = np.random.normal(size=(10, batch_size, 2, 2)).astype(config.floatX)
+    B = np.random.normal(size=(1, batch_size, 4, 4)).astype(config.floatX)
+    result = block_diag(A, B).eval()
+    assert result.shape == (10, batch_size, 6, 6)

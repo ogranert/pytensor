@@ -2,6 +2,7 @@
 Defines Linkers that deal with C implementations.
 
 """
+
 import logging
 import sys
 from collections import defaultdict
@@ -42,7 +43,7 @@ if TYPE_CHECKING:
 _logger = logging.getLogger("pytensor.link.c.basic")
 
 
-def get_module_cache(init_args: Optional[dict[str, Any]] = None) -> "ModuleCache":
+def get_module_cache(init_args: dict[str, Any] | None = None) -> "ModuleCache":
     """
 
     Parameters
@@ -86,9 +87,8 @@ class CodeBlock:
         # for that...)
         # we need the label even if cleanup is empty because the
         # behavior block jumps there on failure
-        self.cleanup = (
-            "__label_%(id)i:\n" % sub + cleanup + "\ndouble __DUMMY_%(id)i;\n" % sub
-        )  # % sub
+        id = sub["id"]
+        self.cleanup = f"__label_{id}:\n{cleanup}\ndouble __DUMMY_{id};\n"
 
 
 def failure_code(sub, use_goto=True):
@@ -113,16 +113,16 @@ def failure_code(sub, use_goto=True):
         goto_statement = "goto __label_%(id)i;" % sub
     else:
         goto_statement = ""
-    return """{
-        %(failure_var)s = %(id)i;
-        if (!PyErr_Occurred()) {
+    id = sub["id"]
+    failure_var = sub["failure_var"]
+    return f"""{{
+        {failure_var} = {id};
+        if (!PyErr_Occurred()) {{
             PyErr_SetString(PyExc_RuntimeError,
                 "Unexpected error in an Op's C code. "
                 "No Python exception was set.");
-        }
-        %(goto_statement)s}""" % dict(
-        sub, goto_statement=goto_statement
-    )
+        }}
+        {goto_statement}}}"""
 
 
 def failure_code_init(sub):
@@ -136,17 +136,15 @@ def failure_code_init(sub):
       * failure_var -> must contain a variable name to use for
       the failure code.
     """
-    return (
-        """{
-        if (!PyErr_Occurred()) {
+    id = sub["id"]
+    return f"""{{
+        if (!PyErr_Occurred()) {{
             PyErr_SetString(PyExc_RuntimeError,
                 "Unexpected error in an Op's C code. "
                 "No Python exception was set.");
-            }
-        return %(id)d;
-}"""
-        % sub
-    )
+            }}
+        return {id};
+}}"""
 
 
 def code_gen(blocks):
@@ -220,7 +218,6 @@ def struct_gen(args, struct_builders, blocks, sub):
     """
     struct_decl = ""
     struct_init_head = ""
-    struct_init_tail = ""
     struct_cleanup = ""
 
     for block in struct_builders:
@@ -236,66 +233,60 @@ def struct_gen(args, struct_builders, blocks, sub):
     behavior = code_gen(blocks)
 
     # declares the storage
-    storage_decl = "\n".join([f"PyObject* {arg};" for arg in args])
+    storage_decl = "\n".join(f"PyObject* {arg};" for arg in args)
     # in the constructor, sets the storage to the arguments
-    storage_set = "\n".join([f"this->{arg} = {arg};" for arg in args])
+    storage_set = "\n".join(f"this->{arg} = {arg};" for arg in args)
     # increments the storage's refcount in the constructor
-    storage_incref = "\n".join([f"Py_XINCREF({arg});" for arg in args])
+    storage_incref = "\n".join(f"Py_XINCREF({arg});" for arg in args)
     # decrements the storage's refcount in the destructor
-    storage_decref = "\n".join([f"Py_XDECREF(this->{arg});" for arg in args])
+    storage_decref = "\n".join(f"Py_XDECREF(this->{arg});" for arg in args)
 
-    args_names = ", ".join(args)
-    args_decl = ", ".join([f"PyObject* {arg}" for arg in args])
+    args_decl = ", ".join(f"PyObject* {arg}" for arg in args)
 
     # The following code stores the exception data in __ERROR, which
     # is a special field of the struct. __ERROR is a list of length 3
     # that holds the type, the value and the traceback. After storing
     # the error, we return the failure code so we know which code
     # block failed.
-    do_return = (
-        """
-        if (%(failure_var)s) {
+    failure_var = sub["failure_var"]
+    do_return = f"""
+        if ({failure_var}) {{
             // When there is a failure, this code puts the exception
             // in __ERROR.
             PyObject* err_type = NULL;
             PyObject* err_msg = NULL;
             PyObject* err_traceback = NULL;
             PyErr_Fetch(&err_type, &err_msg, &err_traceback);
-            if (!err_type) {err_type = Py_None;Py_INCREF(Py_None);}
-            if (!err_msg) {err_msg = Py_None; Py_INCREF(Py_None);}
-            if (!err_traceback) {err_traceback = Py_None; Py_INCREF(Py_None);}
+            if (!err_type) {{err_type = Py_None;Py_INCREF(Py_None);}}
+            if (!err_msg) {{err_msg = Py_None; Py_INCREF(Py_None);}}
+            if (!err_traceback) {{err_traceback = Py_None; Py_INCREF(Py_None);}}
             PyObject* old_err_type = PyList_GET_ITEM(__ERROR, 0);
             PyObject* old_err_msg = PyList_GET_ITEM(__ERROR, 1);
             PyObject* old_err_traceback = PyList_GET_ITEM(__ERROR, 2);
             PyList_SET_ITEM(__ERROR, 0, err_type);
             PyList_SET_ITEM(__ERROR, 1, err_msg);
             PyList_SET_ITEM(__ERROR, 2, err_traceback);
-            {Py_XDECREF(old_err_type);}
-            {Py_XDECREF(old_err_msg);}
-            {Py_XDECREF(old_err_traceback);}
-        }
+            {{Py_XDECREF(old_err_type);}}
+            {{Py_XDECREF(old_err_msg);}}
+            {{Py_XDECREF(old_err_traceback);}}
+        }}
         // The failure code is returned to index what code block failed.
-        return %(failure_var)s;
+        return {failure_var};
         """
-        % sub
-    )
-
-    sub = dict(sub)
-    sub.update(locals())
 
     # TODO: add some error checking to make sure storage_<x> are
     # 1-element lists and __ERROR is a 3-elements list.
 
-    struct_code = (
-        """
-    namespace {
-    struct %(name)s {
+    name = sub["name"]
+    struct_code = f"""
+    namespace {{
+    struct {name} {{
         PyObject* __ERROR;
 
-        %(storage_decl)s
-        %(struct_decl)s
+        {storage_decl}
+        {struct_decl}
 
-        %(name)s() {
+        {name}() {{
             // This is only somewhat safe because we:
             //  1) Are not a virtual class
             //  2) Do not use any virtual classes in the members
@@ -308,32 +299,30 @@ def struct_gen(args, struct_builders, blocks, sub):
             #ifndef PYTENSOR_DONT_MEMSET_STRUCT
             memset(this, 0, sizeof(*this));
             #endif
-        }
-        ~%(name)s(void) {
+        }}
+        ~{name}(void) {{
             cleanup();
-        }
+        }}
 
-        int init(PyObject* __ERROR, %(args_decl)s) {
-            %(storage_incref)s
-            %(storage_set)s
-            %(struct_init_head)s
+        int init(PyObject* __ERROR, {args_decl}) {{
+            {storage_incref}
+            {storage_set}
+            {struct_init_head}
             this->__ERROR = __ERROR;
             return 0;
-        }
-        void cleanup(void) {
-            %(struct_cleanup)s
-            %(storage_decref)s
-        }
-        int run(void) {
-            int %(failure_var)s = 0;
-            %(behavior)s
-            %(do_return)s
-        }
-    };
-    }
+        }}
+        void cleanup(void) {{
+            {struct_cleanup}
+            {storage_decref}
+        }}
+        int run(void) {{
+            int {failure_var} = 0;
+            {behavior}
+            {do_return}
+        }}
+    }};
+    }}
     """
-        % sub
-    )
 
     return struct_code
 
@@ -361,9 +350,7 @@ def get_c_declare(fgraph, r, name, sub):
     # it means they need `r`'s dtype to be declared, so
     # we have to pass `check_input=True` to `c_declare`.
     if any(
-        getattr(c.op, "check_input", config.check_input)
-        for (c, _) in fgraph.clients[r]
-        if not isinstance(c, str)
+        getattr(c.op, "check_input", config.check_input) for (c, _) in fgraph.clients[r]
     ) or (r.owner and getattr(r.owner.op, "check_input", config.check_input)):
         c_declare = r.type.c_declare(name, sub, True)
     else:
@@ -379,14 +366,10 @@ def get_c_init(fgraph, r, name, sub):
     Wrapper around c_init that initializes py_name to Py_None.
 
     """
-    pre = (
-        ""
-        """
-    py_%(name)s = Py_None;
-    {Py_XINCREF(py_%(name)s);}
+    pre = f"""
+    py_{name} = Py_None;
+    {{Py_XINCREF(py_{name});}}
     """
-        % locals()
-    )
     return pre + r.type.c_init(name, sub)
 
 
@@ -420,13 +403,10 @@ def get_c_extract(fgraph, r, name, sub):
     else:
         c_extract = r.type.c_extract(name, sub, False)
 
-    pre = (
-        """
-    py_%(name)s = PyList_GET_ITEM(storage_%(name)s, 0);
-    {Py_XINCREF(py_%(name)s);}
+    pre = f"""
+    py_{name} = PyList_GET_ITEM(storage_{name}, 0);
+    {{Py_XINCREF(py_{name});}}
     """
-        % locals()
-    )
     return pre + c_extract
 
 
@@ -452,13 +432,10 @@ def get_c_extract_out(fgraph, r, name, sub):
     else:
         c_extract = r.type.c_extract_out(name, sub, check_input, check_broadcast=False)
 
-    pre = (
-        """
-    py_%(name)s = PyList_GET_ITEM(storage_%(name)s, 0);
-    {Py_XINCREF(py_%(name)s);}
+    pre = f"""
+    py_{name} = PyList_GET_ITEM(storage_{name}, 0);
+    {{Py_XINCREF(py_{name});}}
     """
-        % locals()
-    )
     return pre + c_extract
 
 
@@ -467,12 +444,9 @@ def get_c_cleanup(fgraph, r, name, sub):
     Wrapper around c_cleanup that decrefs py_name.
 
     """
-    post = (
-        """
-    {Py_XDECREF(py_%(name)s);}
+    post = f"""
+    {{Py_XDECREF(py_{name});}}
     """
-        % locals()
-    )
     return r.type.c_cleanup(name, sub) + post
 
 
@@ -481,17 +455,17 @@ def get_c_sync(fgraph, r, name, sub):
     Wrapper around c_sync that syncs py_name with storage.
 
     """
-    return """
-    if (!%(failure_var)s) {
-      %(sync)s
-      PyObject* old = PyList_GET_ITEM(storage_%(name)s, 0);
-      {Py_XINCREF(py_%(name)s);}
-      PyList_SET_ITEM(storage_%(name)s, 0, py_%(name)s);
-      {Py_XDECREF(old);}
-    }
-    """ % dict(
-        sync=r.type.c_sync(name, sub), name=name, **sub
-    )
+    failure_var = sub["failure_var"]
+    sync = r.type.c_sync(name, sub)
+    return f"""
+    if (!{failure_var}) {{
+      {sync}
+      PyObject* old = PyList_GET_ITEM(storage_{name}, 0);
+      {{Py_XINCREF(py_{name});}}
+      PyList_SET_ITEM(storage_{name}, 0, py_{name});
+      {{Py_XDECREF(old);}}
+    }}
+    """
 
 
 def apply_policy(fgraph, policy, r, name, sub):
@@ -511,7 +485,7 @@ def apply_policy(fgraph, policy, r, name, sub):
         C{policy[0](r) + policy[1](r) + ...}.
 
     """
-    if isinstance(policy, (list, tuple)):
+    if isinstance(policy, list | tuple):
         ret = ""
         for sub_policy in policy:
             ret += sub_policy(fgraph, r, name, sub)
@@ -1138,29 +1112,32 @@ class CLinker(Linker):
             module,
             [
                 Container(input, storage)
-                for input, storage in zip(self.fgraph.inputs, input_storage)
+                for input, storage in zip(
+                    self.fgraph.inputs, input_storage, strict=True
+                )
             ],
             [
                 Container(output, storage, readonly=True)
-                for output, storage in zip(self.fgraph.outputs, output_storage)
+                for output, storage in zip(
+                    self.fgraph.outputs, output_storage, strict=True
+                )
             ],
             error_storage,
         )
 
     def get_init_tasks(self):
-        init_tasks = []
-        tasks = []
+        vars = [v for v in self.variables if v not in self.consts]
         id = 1
-        for v in self.variables:
-            if v in self.consts:
-                continue
-            init_tasks.append((v, "init", id))
-            tasks.append((v, "get", id + 1))
-            id += 2
-        for node in self.node_order:
-            tasks.append((node, "code", id))
-            init_tasks.append((node, "init", id + 1))
-            id += 2
+        init_tasks = [(v, "init", id + 2 * i) for i, v in enumerate(vars)]
+        tasks = [(v, "get", id + 2 * i + 1) for i, v in enumerate(vars)]
+
+        id += 2 * len(vars)
+        tasks.extend(
+            (node, "code", id + 2 * i) for i, node in enumerate(self.node_order)
+        )
+        init_tasks.extend(
+            (node, "init", id + 2 * i + 1) for i, node in enumerate(self.node_order)
+        )
         return init_tasks, tasks
 
     def make_thunk(
@@ -1472,12 +1449,16 @@ class CLinker(Linker):
             if props:
                 version.append(props)
 
-            for i in node.inputs:
-                if isinstance(i.type, CLinkerObject):
-                    version.append(i.type.c_code_cache_version())
-            for o in node.outputs:
-                if isinstance(o.type, CLinkerObject):
-                    version.append(o.type.c_code_cache_version())
+            version.extend(
+                i.type.c_code_cache_version()
+                for i in node.inputs
+                if isinstance(i.type, CLinkerObject)
+            )
+            version.extend(
+                o.type.c_code_cache_version()
+                for o in node.outputs
+                if isinstance(o.type, CLinkerObject)
+            )
 
             # add the signature for this node
             sig.append(
@@ -1511,12 +1492,11 @@ class CLinker(Linker):
         # graph's information used to compute the key. If we mistakenly
         # pretend that inputs with clients don't have any, were are only using
         # those inputs more than once to compute the key.
-        for ipos, var in [
-            (i, var)
-            for i, var in enumerate(fgraph.inputs)
+        sig.extend(
+            (var.type, in_sig(var, -1, ipos))
+            for ipos, var in enumerate(fgraph.inputs)
             if not len(fgraph.clients[var])
-        ]:
-            sig.append((var.type, in_sig(var, -1, ipos)))
+        )
 
         # crystalize the signature and version
         sig = tuple(sig)
@@ -1586,18 +1566,16 @@ class CLinker(Linker):
 
             # Static methods that can run and destroy the struct built by
             # instantiate.
-            static = """
-        static int {struct_name}_executor({struct_name} *self) {{
+            static = f"""
+        static int {self.struct_name}_executor({self.struct_name} *self) {{
             return self->run();
         }}
 
-        static void {struct_name}_destructor(PyObject *capsule) {{
-            {struct_name} *self = ({struct_name} *)PyCapsule_GetContext(capsule);
+        static void {self.struct_name}_destructor(PyObject *capsule) {{
+            {self.struct_name} *self = ({self.struct_name} *)PyCapsule_GetContext(capsule);
             delete self;
         }}
-    """.format(
-                struct_name=self.struct_name
-            )
+    """
 
             # We add all the support code, compile args, headers and libs we need.
             for support_code in self.support_code() + self.c_support_code_apply:
@@ -1682,10 +1660,9 @@ class CLinker(Linker):
             file=code,
         )
         print("  assert(PyTuple_Check(argtuple));", file=code)
-        print("  if (%(n_args)i != PyTuple_Size(argtuple)){ " % locals(), file=code)
+        print(f"  if ({n_args} != PyTuple_Size(argtuple)){{ ", file=code)
         print(
-            '     PyErr_Format(PyExc_TypeError, "Wrong number of arguments, expected %(n_args)i, got %%i", (int)PyTuple_Size(argtuple));'
-            % locals(),
+            f'     PyErr_Format(PyExc_TypeError, "Wrong number of arguments, expected {n_args}, got %%i", (int)PyTuple_Size(argtuple));',
             file=code,
         )
         print("     return NULL;", file=code)
@@ -1740,7 +1717,7 @@ class _CThunk:
 
     def __init__(self, cthunk, init_tasks, tasks, error_storage, module):
         # Lazy import to avoid compilation when importing pytensor.
-        from pytensor.link.c.cutils import run_cthunk  # noqa
+        from pytensor.link.c.cutils import run_cthunk
 
         self.run_cthunk = run_cthunk
         self.cthunk = cthunk
@@ -1914,11 +1891,11 @@ class OpWiseCLinker(LocalLinker):
             f,
             [
                 Container(input, storage)
-                for input, storage in zip(fgraph.inputs, input_storage)
+                for input, storage in zip(fgraph.inputs, input_storage, strict=True)
             ],
             [
                 Container(output, storage, readonly=True)
-                for output, storage in zip(fgraph.outputs, output_storage)
+                for output, storage in zip(fgraph.outputs, output_storage, strict=True)
             ],
             thunks,
             order,
@@ -2016,22 +1993,27 @@ class DualLinker(Linker):
         )
 
         def f():
-            for input1, input2 in zip(i1, i2):
+            # strict=False because we are in a hot loop
+            for input1, input2 in zip(i1, i2, strict=False):
                 # Set the inputs to be the same in both branches.
                 # The copy is necessary in order for inplace ops not to
                 # interfere.
                 input2.storage[0] = copy(input1.storage[0])
-            for thunk1, thunk2, node1, node2 in zip(thunks1, thunks2, order1, order2):
-                for output, storage in zip(node1.outputs, thunk1.outputs):
+            for thunk1, thunk2, node1, node2 in zip(
+                thunks1, thunks2, order1, order2, strict=False
+            ):
+                for output, storage in zip(node1.outputs, thunk1.outputs, strict=False):
                     if output in no_recycling:
                         storage[0] = None
-                for output, storage in zip(node2.outputs, thunk2.outputs):
+                for output, storage in zip(node2.outputs, thunk2.outputs, strict=False):
                     if output in no_recycling:
                         storage[0] = None
                 try:
                     thunk1()
                     thunk2()
-                    for output1, output2 in zip(thunk1.outputs, thunk2.outputs):
+                    for output1, output2 in zip(
+                        thunk1.outputs, thunk2.outputs, strict=False
+                    ):
                         self.checker(output1, output2)
                 except Exception:
                     raise_with_op(fgraph, node1)

@@ -2,15 +2,12 @@ import copy
 import sys
 import warnings
 from abc import ABC, abstractmethod
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import (
     TYPE_CHECKING,
     Any,
-    Callable,
-    Optional,
     Protocol,
     TypeVar,
-    Union,
     cast,
 )
 
@@ -30,7 +27,7 @@ if TYPE_CHECKING:
     from pytensor.graph.fg import FunctionGraph
     from pytensor.graph.type import Type
 
-StorageCellType = list[Optional[Any]]
+StorageCellType = list[Any | None]
 StorageMapType = dict[Variable, StorageCellType]
 ComputeMapType = dict[Variable, list[bool]]
 InputStorageType = list[StorageCellType]
@@ -45,8 +42,8 @@ C = TypeVar("C", bound=Callable)
 
 
 class ThunkType(Protocol[C]):
-    inputs: list[list[Optional[list[Any]]]]
-    outputs: list[list[Optional[list[Any]]]]
+    inputs: list[list[list[Any] | None]]
+    outputs: list[list[list[Any] | None]]
     lazy: bool
     __call__: C
     perform: PerformMethodType
@@ -155,7 +152,7 @@ class Op(MetaObject):
 
     """
 
-    default_output: Optional[int] = None
+    default_output: int | None = None
     """
     An ``int`` that specifies which output :meth:`Op.__call__` should return.  If
     ``None``, then all outputs are returned.
@@ -195,8 +192,8 @@ class Op(MetaObject):
 
     """
 
-    itypes: Optional[Sequence["Type"]] = None
-    otypes: Optional[Sequence["Type"]] = None
+    itypes: Sequence["Type"] | None = None
+    otypes: Sequence["Type"] | None = None
 
     _output_type_depends_on_input_value = False
     """
@@ -234,14 +231,14 @@ class Op(MetaObject):
             )
         if not all(
             expected_type.is_super(var.type)
-            for var, expected_type in zip(inputs, self.itypes)
+            for var, expected_type in zip(inputs, self.itypes, strict=True)
         ):
             raise TypeError(
                 f"Invalid input types for Op {self}:\n"
                 + "\n".join(
                     f"Input {i}/{len(inputs)}: Expected {inp}, got {out}"
                     for i, (inp, out) in enumerate(
-                        zip(self.itypes, (inp.type for inp in inputs)),
+                        zip(self.itypes, (inp.type for inp in inputs), strict=True),
                         start=1,
                     )
                     if inp != out
@@ -249,7 +246,9 @@ class Op(MetaObject):
             )
         return Apply(self, inputs, [o() for o in self.otypes])
 
-    def __call__(self, *inputs: Any, **kwargs) -> Union[Variable, list[Variable]]:
+    def __call__(
+        self, *inputs: Any, name=None, return_list=False, **kwargs
+    ) -> Variable | list[Variable]:
         r"""Construct an `Apply` node using :meth:`Op.make_node` and return its outputs.
 
         This method is just a wrapper around :meth:`Op.make_node`.
@@ -291,8 +290,15 @@ class Op(MetaObject):
             the :attr:`Op.default_output` property.
 
         """
-        return_list = kwargs.pop("return_list", False)
         node = self.make_node(*inputs, **kwargs)
+        if name is not None:
+            if len(node.outputs) == 1:
+                node.outputs[0].name = name
+            elif self.default_output is not None:
+                node.outputs[self.default_output].name = name
+            else:
+                for i, n in enumerate(node.outputs):
+                    n.name = f"{name}_{i}"
 
         if config.compute_test_value != "off":
             compute_test_value(node)
@@ -392,7 +398,7 @@ class Op(MetaObject):
         return self.grad(inputs, output_grads)
 
     def R_op(
-        self, inputs: list[Variable], eval_points: Union[Variable, list[Variable]]
+        self, inputs: list[Variable], eval_points: Variable | list[Variable]
     ) -> list[Variable]:
         r"""Construct a graph for the R-operator.
 
@@ -475,9 +481,9 @@ class Op(MetaObject):
     def prepare_node(
         self,
         node: Apply,
-        storage_map: Optional[StorageMapType],
-        compute_map: Optional[ComputeMapType],
-        impl: Optional[str],
+        storage_map: StorageMapType | None,
+        compute_map: ComputeMapType | None,
+        impl: str | None,
     ) -> None:
         """Make any special modifications that the `Op` needs before doing :meth:`Op.make_thunk`.
 
@@ -507,6 +513,7 @@ class Op(MetaObject):
         """
         node_input_storage = [storage_map[r] for r in node.inputs]
         node_output_storage = [storage_map[r] for r in node.outputs]
+        node_compute_map = [compute_map[r] for r in node.outputs]
 
         if debug and hasattr(self, "debug_perform"):
             p = node.op.debug_perform
@@ -514,10 +521,16 @@ class Op(MetaObject):
             p = node.op.perform
 
         @is_thunk_type
-        def rval(p=p, i=node_input_storage, o=node_output_storage, n=node):
+        def rval(
+            p=p,
+            i=node_input_storage,
+            o=node_output_storage,
+            n=node,
+            cm=node_compute_map,
+        ):
             r = p(n, [x[0] for x in i], o)
-            for o in node.outputs:
-                compute_map[o][0] = True
+            for entry in cm:
+                entry[0] = True
             return r
 
         rval.inputs = node_input_storage
@@ -532,7 +545,7 @@ class Op(MetaObject):
         storage_map: StorageMapType,
         compute_map: ComputeMapType,
         no_recycling: list[Variable],
-        impl: Optional[str] = None,
+        impl: str | None = None,
     ) -> ThunkType:
         r"""Create a thunk.
 
@@ -576,6 +589,12 @@ class Op(MetaObject):
             node, storage_map=storage_map, compute_map=compute_map, impl="py"
         )
         return self.make_py_thunk(node, storage_map, compute_map, no_recycling)
+
+    def inplace_on_inputs(self, allowed_inplace_inputs: list[int]) -> "Op":
+        """Try to return a version of self that tries to inplace in as many as `allowed_inplace_inputs`."""
+        # TODO: Document this in the Create your own Op docs
+        # By default, do nothing
+        return self
 
     def __str__(self):
         return getattr(type(self), "__name__", super().__str__())
@@ -671,7 +690,7 @@ def missing_test_message(msg: str) -> None:
         assert action in ("ignore", "off")
 
 
-def get_test_values(*args: Variable) -> Union[Any, list[Any]]:
+def get_test_values(*args: Variable) -> Any | list[Any]:
     r"""Get test values for multiple `Variable`\s.
 
     Intended use:

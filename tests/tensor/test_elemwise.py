@@ -8,7 +8,9 @@ import pytest
 
 import pytensor
 import pytensor.scalar as ps
+import pytensor.tensor as pt
 import tests.unittest_tools as utt
+from pytensor.compile.function import function
 from pytensor.compile.mode import Mode
 from pytensor.configdefaults import config
 from pytensor.graph.basic import Apply, Variable
@@ -19,10 +21,9 @@ from pytensor.link.c.basic import CLinker, OpWiseCLinker
 from pytensor.tensor import as_tensor_variable
 from pytensor.tensor.basic import second
 from pytensor.tensor.elemwise import CAReduce, DimShuffle, Elemwise
-from pytensor.tensor.math import Any, Sum
+from pytensor.tensor.math import Any, Sum, exp
 from pytensor.tensor.math import all as pt_all
 from pytensor.tensor.math import any as pt_any
-from pytensor.tensor.math import exp
 from pytensor.tensor.math import sum as pt_sum
 from pytensor.tensor.type import (
     TensorType,
@@ -59,46 +60,40 @@ class TestDimShuffle(unittest_tools.InferShapeTester):
             ((1,), ("x", "x"), (1, 1)),
         ]:
             i_shape = [entry if entry == 1 else None for entry in xsh]
-            ib = [entry == 1 for entry in i_shape]
             x = self.type(self.dtype, shape=i_shape)("x")
-            e = self.op(ib, shuffle)(x)
+            e = self.op(input_ndim=len(i_shape), new_order=shuffle)(x)
             f = pytensor.function([x], e, mode=Mode(linker=linker))
             assert f(np.ones(xsh, dtype=self.dtype)).shape == zsh
             # test that DimShuffle.infer_shape work correctly
             x = self.type(self.dtype, shape=i_shape)("x")
-            e = self.op(ib, shuffle)(x)
+            e = self.op(input_ndim=len(i_shape), new_order=shuffle)(x)
             f = pytensor.function(
                 [x], e.shape, mode=Mode(linker=linker), on_unused_input="ignore"
             )
             assert all(f(np.ones(xsh, dtype=self.dtype))) == all(zsh)
 
         # Test when we drop a axis that is not broadcastable
-        ib = [False, True, False]
-        x = self.type(self.dtype, shape=(None, 1, None))("x")
-        with pytest.raises(ValueError):
-            self.op(ib, shuffle)
+        x = self.type(self.dtype, shape=(2, 1, None))("x")
+        with pytest.raises(TypeError):
+            self.op(input_ndim=3, new_order=shuffle)(x)
 
         # Test when we drop a axis that don't have shape 1
-        ib = [True, True, False]
-        x = self.type(self.dtype, shape=(1, 1, None))("x")
-        e = self.op(ib, (1, 2))(x)
-        f = pytensor.function([x], e.shape, mode=Mode(linker=linker))
-        with pytest.raises(TypeError):
-            f(np.ones((2, 1, 4)))
+        x = self.type(self.dtype, shape=(None, 1, None))("x")
+        e = self.op(input_ndim=3, new_order=(1, 2))(x)
+        f = pytensor.function([x], e, mode=Mode(linker=linker))
+        with pytest.raises(ValueError):
+            f(np.ones((2, 1, 4), dtype=self.dtype))
 
         # Test that we can't take a dimensions multiple time
         xsh, shuffle, zsh = ((1, 1, 4), (0, 1, 2, 0), (1, 4))
-        ib = [False, True, False]
         x = self.type(self.dtype, shape=(None, 1, None))("x")
         with pytest.raises(ValueError):
-            DimShuffle(ib, shuffle)
+            DimShuffle(input_ndim=3, new_order=shuffle)
 
     def test_perform(self):
         self.with_linker(PerformLinker())
 
     def test_c_or_py(self):
-        # Shape op don't have C code.
-        # But This will test DimShuffle c code
         self.with_linker(OpWiseCLinker())
 
     def test_infer_shape(self):
@@ -114,12 +109,11 @@ class TestDimShuffle(unittest_tools.InferShapeTester):
             ((1,), ("x", "x")),
         ]:
             i_shape = [entry if entry == 1 else None for entry in xsh]
-            ib = [(entry == 1) for entry in xsh]
             adtens = self.type(self.dtype, shape=i_shape)("x")
             adtens_val = np.ones(xsh, dtype=self.dtype)
             self._compile_and_check(
                 [adtens],
-                [self.op(ib, shuffle)(adtens)],
+                [self.op(input_ndim=len(xsh), new_order=shuffle)(adtens)],
                 [adtens_val],
                 self.op,
                 warn=False,
@@ -190,11 +184,11 @@ class TestDimShuffle(unittest_tools.InferShapeTester):
         y = x.dimshuffle([0, 1, "x"])
         assert y.type.shape == (1, 2, 1)
 
-    def test_valid_input_broadcastable(self):
-        assert DimShuffle([True, False], (1, 0)).input_broadcastable == (True, False)
+    def test_valid_input_ndim(self):
+        assert DimShuffle(input_ndim=2, new_order=(1, 0)).input_ndim == 2
 
-        with pytest.raises(ValueError, match="input_broadcastable must be boolean"):
-            DimShuffle([None, None], (1, 0))
+        with pytest.raises(TypeError, match="input_ndim must be an integer"):
+            DimShuffle(input_ndim=(True, False), new_order=(1, 0))
 
 
 class TestBroadcast:
@@ -336,6 +330,7 @@ class TestBroadcast:
             [self.op, self.cop],
             [self.type, self.ctype],
             [self.rand_val, self.rand_cval],
+            strict=True,
         ):
             x = t(pytensor.config.floatX, shape=(None, None))("x")
             y = t(pytensor.config.floatX, shape=(1, 1))("y")
@@ -367,6 +362,7 @@ class TestBroadcast:
             [self.op, self.cop],
             [self.type, self.ctype],
             [self.rand_val, self.rand_cval],
+            strict=True,
         ):
             x = t(pytensor.config.floatX, shape=(None,) * 5)("x")
             y = t(pytensor.config.floatX, shape=(None,) * 5)("y")
@@ -387,6 +383,7 @@ class TestBroadcast:
             [self.op, self.cop],
             [self.type, self.ctype],
             [self.rand_val, self.rand_cval],
+            strict=True,
         ):
             x = t(pytensor.config.floatX, shape=(None,) * 2)("x")
             e = op(ps.add)(x, x)
@@ -894,6 +891,25 @@ class TestElemwise(unittest_tools.InferShapeTester):
         ):
             x + y
 
+    @pytest.mark.parametrize(
+        "shape_x, shape_y, op, np_op",
+        [
+            ((3, 5), (7, 1, 3), pt.add, np.add),
+            ((2, 3), (1, 4), pt.mul, np.multiply),
+        ],
+    )
+    def test_outer(self, shape_x, shape_y, op, np_op):
+        x = tensor(dtype=np.float64, shape=shape_x)
+        y = tensor(dtype=np.float64, shape=shape_y)
+
+        z = op.outer(x, y)
+
+        f = function([x, y], z)
+        x1 = np.ones(shape_x)
+        y1 = np.ones(shape_y)
+
+        np.testing.assert_array_equal(f(x1, y1), np_op.outer(x1, y1))
+
 
 def test_not_implemented_elemwise_grad():
     # Regression test for unimplemented gradient in an Elemwise Op.
@@ -965,3 +981,35 @@ class TestVectorize:
         assert isinstance(vect_node.op, Any)
         assert vect_node.op.axis == (1,)
         assert vect_node.inputs[0] is bool_tns
+
+
+def careduce_benchmark_tester(axis, c_contiguous, mode, benchmark):
+    N = 256
+    x_test = np.random.uniform(size=(N, N, N))
+    transpose_axis = (0, 1, 2) if c_contiguous else (2, 0, 1)
+
+    x = pytensor.shared(x_test, name="x", shape=x_test.shape)
+    out = x.transpose(transpose_axis).sum(axis=axis)
+    fn = pytensor.function([], out, mode=mode)
+
+    np.testing.assert_allclose(
+        fn(),
+        x_test.transpose(transpose_axis).sum(axis=axis),
+    )
+    benchmark(fn)
+
+
+@pytest.mark.parametrize(
+    "axis",
+    (0, 1, 2, (0, 1), (0, 2), (1, 2), None),
+    ids=lambda x: f"axis={x}",
+)
+@pytest.mark.parametrize(
+    "c_contiguous",
+    (True, False),
+    ids=lambda x: f"c_contiguous={x}",
+)
+def test_c_careduce_benchmark(axis, c_contiguous, benchmark):
+    return careduce_benchmark_tester(
+        axis, c_contiguous, mode="FAST_RUN", benchmark=benchmark
+    )

@@ -30,7 +30,7 @@ def get_updates_and_outputs(ls):
     """
 
     def is_outputs(elem):
-        if isinstance(elem, (list, tuple)) and all(
+        if isinstance(elem, list | tuple) and all(
             isinstance(x, Variable) for x in elem
         ):
             return True
@@ -43,8 +43,8 @@ def get_updates_and_outputs(ls):
             # Make sure the updates will be applied in a deterministic order
             return True
         # Dictionaries can be given as lists of tuples
-        if isinstance(elem, (list, tuple)) and all(
-            isinstance(x, (list, tuple)) and len(x) == 2 for x in elem
+        if isinstance(elem, list | tuple) and all(
+            isinstance(x, list | tuple) and len(x) == 2 for x in elem
         ):
             return True
         return False
@@ -53,7 +53,7 @@ def get_updates_and_outputs(ls):
         return isinstance(elem, until)
 
     def _list(x):
-        if isinstance(x, (list, tuple)):
+        if isinstance(x, list | tuple):
             return list(x)
         else:
             return [x]
@@ -68,14 +68,14 @@ def get_updates_and_outputs(ls):
         """
         # Is `x` a container we can iterate on?
         iter_on = None
-        if isinstance(x, list) or isinstance(x, tuple):
+        if isinstance(x, list | tuple):
             iter_on = x
         elif isinstance(x, dict):
             iter_on = x.items()
         if iter_on is not None:
             return all(_filter(y) for y in iter_on)
         else:
-            return isinstance(x, Variable) or isinstance(x, until)
+            return isinstance(x, Variable | until)
 
     if not _filter(ls):
         raise ValueError(
@@ -94,7 +94,7 @@ def get_updates_and_outputs(ls):
     error_msg = (
         f"Scan cannot parse the return value of your lambda expression, which is: {ls}"
     )
-    if not isinstance(ls, (list, tuple)):
+    if not isinstance(ls, list | tuple):
         raise ValueError(error_msg)
     ls = list(ls)
     deprecation_msg = (
@@ -207,13 +207,20 @@ def scan(
 
         .. code-block:: python
 
-            scan(fn, sequences = [ dict(input= Sequence1, taps = [-3,2,-1])
-                                 , Sequence2
-                                 , dict(input =  Sequence3, taps = 3) ]
-                   , outputs_info = [ dict(initial =  Output1, taps = [-3,-5])
-                                    , dict(initial = Output2, taps = None)
-                                    , Output3 ]
-                   , non_sequences = [ Argument1, Argument2])
+            scan(
+                fn,
+                sequences=[
+                    dict(input=Sequence1, taps=[-3, 2, -1]),
+                    Sequence2,
+                    dict(input=Sequence3, taps=3),
+                ],
+                outputs_info=[
+                    dict(initial=Output1, taps=[-3, -5]),
+                    dict(initial=Output2, taps=None),
+                    Output3,
+                ],
+                non_sequences=[Argument1, Argument2],
+            )
 
         `fn` should expect the following arguments in this given order:
 
@@ -240,11 +247,12 @@ def scan(
 
             import pytensor.tensor as pt
 
-            W   = pt.matrix()
+            W = pt.matrix()
             W_2 = W**2
 
+
             def f(x):
-                return pt.dot(x,W_2)
+                return pt.dot(x, W_2)
 
         The function `fn` is expected to return two things. One is a list of
         outputs ordered in the same order as `outputs_info`, with the
@@ -266,7 +274,7 @@ def scan(
         .. code-block:: python
 
             ...
-            return [y1_t, y2_t], {x:x+1}, until(x < 50)
+            return [y1_t, y2_t], {x: x + 1}, until(x < 50)
 
         Note that a number of steps--considered in here as the maximum
         number of steps--is still required even though a condition is
@@ -449,7 +457,7 @@ def scan(
         """
         if x is None:
             return []
-        elif not isinstance(x, (list, tuple)):
+        elif not isinstance(x, list | tuple):
             return [x]
         else:
             return list(x)
@@ -472,7 +480,7 @@ def scan(
     # To do that we check here to see the nature of n_steps
     n_fixed_steps = None
 
-    if isinstance(n_steps, (float, int)):
+    if isinstance(n_steps, float | int):
         n_fixed_steps = int(n_steps)
     else:
         try:
@@ -646,9 +654,7 @@ def scan(
 
     # Since we've added all sequences now we need to level them up based on
     # n_steps or their different shapes
-    lengths_vec = []
-    for seq in scan_seqs:
-        lengths_vec.append(seq.shape[0])
+    lengths_vec = [seq.shape[0] for seq in scan_seqs]
 
     if not isNaN_or_Inf_or_None(n_steps):
         # ^ N_steps should also be considered
@@ -805,8 +811,8 @@ def scan(
         #      a map); in that case we do not have to do anything ..
 
     # Re-order args
-    max_mit_sot = np.max([-1] + mit_sot_rightOrder) + 1
-    max_sit_sot = np.max([-1] + sit_sot_rightOrder) + 1
+    max_mit_sot = np.max([-1, *mit_sot_rightOrder]) + 1
+    max_sit_sot = np.max([-1, *sit_sot_rightOrder]) + 1
     n_elems = np.max([max_mit_sot, max_sit_sot])
     _ordered_args = [[] for x in range(n_elems)]
     offset = 0
@@ -840,11 +846,7 @@ def scan(
     # add only the non-shared variables and non-constants to the arguments of
     # the dummy function [ a function should not get shared variables or
     # constants as input ]
-    dummy_args = [
-        arg
-        for arg in args
-        if (not isinstance(arg, SharedVariable) and not isinstance(arg, Constant))
-    ]
+    dummy_args = [arg for arg in args if not isinstance(arg, SharedVariable | Constant)]
     # when we apply the lambda expression we get a mixture of update rules
     # and outputs that needs to be separated
 
@@ -890,7 +892,9 @@ def scan(
     if condition is not None:
         outputs.append(condition)
     fake_nonseqs = [x.type() for x in non_seqs]
-    fake_outputs = clone_replace(outputs, replace=dict(zip(non_seqs, fake_nonseqs)))
+    fake_outputs = clone_replace(
+        outputs, replace=dict(zip(non_seqs, fake_nonseqs, strict=True))
+    )
     all_inputs = filter(
         lambda x: (
             isinstance(x, Variable)
@@ -1043,19 +1047,17 @@ def scan(
     other_inner_args = []
 
     other_scan_args += [
-        arg
-        for arg in non_seqs
-        if (not isinstance(arg, SharedVariable) and not isinstance(arg, Constant))
+        arg for arg in non_seqs if not isinstance(arg, SharedVariable | Constant)
     ]
 
     # Step 5.6 all shared variables with no update rules
     other_inner_args += [
         safe_new(arg, "_copy")
         for arg in non_seqs
-        if (not isinstance(arg, SharedVariable) and not isinstance(arg, Constant))
+        if not isinstance(arg, SharedVariable | Constant)
     ]
 
-    inner_replacements.update(dict(zip(other_scan_args, other_inner_args)))
+    inner_replacements.update(dict(zip(other_scan_args, other_inner_args, strict=True)))
 
     if strict:
         non_seqs_set = set(non_sequences if non_sequences is not None else [])
@@ -1077,7 +1079,7 @@ def scan(
         ]
 
     inner_replacements.update(
-        dict(zip(other_shared_scan_args, other_shared_inner_args))
+        dict(zip(other_shared_scan_args, other_shared_inner_args, strict=True))
     )
 
     ##
@@ -1152,7 +1154,7 @@ def scan(
     )
 
     scan_inputs = []
-    for arg in [actual_n_steps] + _scan_inputs:
+    for arg in [actual_n_steps, *_scan_inputs]:
         try:
             arg = pt.as_tensor_variable(arg)
         except TypeError:
@@ -1161,7 +1163,7 @@ def scan(
             pass
         scan_inputs += [arg]
     scan_outs = local_op(*scan_inputs)
-    if not isinstance(scan_outs, (list, tuple)):
+    if not isinstance(scan_outs, list | tuple):
         scan_outs = [scan_outs]
     ##
     # Step 9. Figure out which outs are update rules for shared variables

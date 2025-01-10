@@ -4,7 +4,7 @@ import traceback
 from abc import ABCMeta
 from collections.abc import Sequence
 from io import StringIO
-from typing import TYPE_CHECKING, Any, Optional, TypeVar, Union
+from typing import TYPE_CHECKING, Any, TypeVar, Union
 
 
 if TYPE_CHECKING:
@@ -14,8 +14,8 @@ T = TypeVar("T", bound=Union["Apply", "Variable"])
 
 
 def simple_extract_stack(
-    f=None, limit: Optional[int] = None, skips: Optional[Sequence[str]] = None
-) -> list[tuple[Optional[str], int, str, Optional[str]]]:
+    f=None, limit: int | None = None, skips: Sequence[str] | None = None
+) -> list[tuple[str | None, int, str, str | None]]:
     """This is traceback.extract_stack from python 2.7 with this change:
 
     - Comment the update of the cache.
@@ -40,7 +40,7 @@ def simple_extract_stack(
     if limit is None:
         if hasattr(sys, "tracebacklimit"):
             limit = sys.tracebacklimit
-    trace: list[tuple[Optional[str], int, str, Optional[str]]] = []
+    trace: list[tuple[str | None, int, str, str | None]] = []
     n = 0
     while f is not None and (limit is None or n < limit):
         lineno = f.f_lineno
@@ -48,7 +48,7 @@ def simple_extract_stack(
         filename = co.co_filename
         name = co.co_name
         #        linecache.checkcache(filename)
-        line: Optional[str] = linecache.getline(filename, lineno, f.f_globals)
+        line: str | None = linecache.getline(filename, lineno, f.f_globals)
         if line:
             line = line.strip()
         else:
@@ -73,7 +73,7 @@ def simple_extract_stack(
     return trace
 
 
-def add_tag_trace(thing: T, user_line: Optional[int] = None) -> T:
+def add_tag_trace(thing: T, user_line: int | None = None) -> T:
     """Add tag.trace to a node or variable.
 
     The argument is returned after being affected (inplace).
@@ -168,10 +168,10 @@ class MissingInputError(Exception):
     def __init__(self, *args, **kwargs):
         if kwargs:
             # The call to list is needed for Python 3
-            assert list(kwargs.keys()) == ["variable"]
+            assert list(kwargs) == ["variable"]
             error_msg = get_variable_trace_string(kwargs["variable"])
             if error_msg:
-                args = args + (error_msg,)
+                args = (*args, error_msg)
         s = "\n".join(args)  # Needed to have the new line print correctly
         super().__init__(s)
 
@@ -229,7 +229,7 @@ class MetaType(ABCMeta):
             if "__eq__" not in dct:
 
                 def __eq__(self, other):
-                    return type(self) == type(other) and tuple(
+                    return type(self) is type(other) and tuple(
                         getattr(self, a) for a in props
                     ) == tuple(getattr(other, a) for a in props)
 
@@ -245,10 +245,9 @@ class MetaType(ABCMeta):
                 else:
 
                     def __str__(self):
-                        return "{}{{{}}}".format(
-                            self.__class__.__name__,
-                            ", ".join(f"{p}={getattr(self, p)!r}" for p in props),
-                        )
+                        classname = self.__class__.__name__
+                        args = ", ".join(f"{p}={getattr(self, p)!r}" for p in props)
+                        return f"{classname}{{{args}}}"
 
                 dct["__str__"] = __str__
 

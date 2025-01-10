@@ -1,8 +1,8 @@
 """Symbolic tensor types and constructor functions."""
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from functools import singledispatch
-from typing import TYPE_CHECKING, Any, Callable, NoReturn, Optional, Union
+from typing import TYPE_CHECKING, Any, NoReturn, Optional, Union
 
 from pytensor.graph.basic import Constant, Variable
 from pytensor.graph.op import Op
@@ -16,7 +16,7 @@ TensorLike = Union[Variable, Sequence[Variable], "ArrayLike"]
 
 
 def as_tensor_variable(
-    x: TensorLike, name: Optional[str] = None, ndim: Optional[int] = None, **kwargs
+    x: TensorLike, name: str | None = None, ndim: int | None = None, **kwargs
 ) -> "TensorVariable":
     """Convert `x` into an equivalent `TensorVariable`.
 
@@ -52,7 +52,7 @@ def as_tensor_variable(
 
 @singledispatch
 def _as_tensor_variable(
-    x: TensorLike, name: Optional[str], ndim: Optional[int], **kwargs
+    x: TensorLike, name: str | None, ndim: int | None, **kwargs
 ) -> "TensorVariable":
     raise NotImplementedError(f"Cannot convert {x!r} to a tensor variable.")
 
@@ -81,7 +81,7 @@ def get_vector_length(v: TensorLike) -> int:
     if v.type.ndim != 1:
         raise TypeError(f"Argument must be a vector; got {v.type}")
 
-    static_shape: Optional[int] = v.type.shape[0]
+    static_shape: int | None = v.type.shape[0]
     if static_shape is not None:
         return static_shape
 
@@ -89,45 +89,50 @@ def get_vector_length(v: TensorLike) -> int:
 
 
 @singledispatch
-def _get_vector_length(op: Union[Op, Variable], var: Variable) -> int:
+def _get_vector_length(op: Op | Variable, var: Variable) -> int:
     """`Op`-based dispatch for `get_vector_length`."""
     raise ValueError(f"Length of {var} cannot be determined")
 
 
 @_get_vector_length.register(Constant)
-def _get_vector_length_Constant(op: Union[Op, Variable], var: Constant) -> int:
+def _get_vector_length_Constant(op: Op | Variable, var: Constant) -> int:
     return len(var.data)
 
 
-import pytensor.tensor.exceptions  # noqa
-from pytensor.gradient import grad, hessian, jacobian  # noqa
+import pytensor.tensor.exceptions
+import pytensor.tensor.rewriting
+from pytensor.gradient import grad, hessian, jacobian
 
 # adds shared-variable constructors
-from pytensor.tensor import sharedvar  # noqa
-from pytensor.tensor import (  # noqa
+from pytensor.tensor import (
     blas,
     blas_c,
     blas_scipy,
+    sharedvar,
     xlogx,
 )
-import pytensor.tensor.rewriting
 
 
 # isort: off
-from pytensor.tensor import linalg  # noqa
+from pytensor.tensor import linalg
 from pytensor.tensor import special
 
 # For backward compatibility
-from pytensor.tensor import nlinalg  # noqa
-from pytensor.tensor import slinalg  # noqa
+from pytensor.tensor import nlinalg
+from pytensor.tensor import slinalg
 
 # isort: on
-from pytensor.tensor.basic import *  # noqa
-from pytensor.tensor.blas import batched_dot, batched_tensordot  # noqa
+# Allow accessing numpy constants from pytensor.tensor
+from numpy import e, euler_gamma, inf, infty, nan, newaxis, pi
+
+from pytensor.tensor.basic import *
+from pytensor.tensor.blas import batched_dot, batched_tensordot
 from pytensor.tensor.extra_ops import *
-
-
-from pytensor.tensor.shape import (  # noqa
+from pytensor.tensor.interpolate import interp, interpolate1d
+from pytensor.tensor.io import *
+from pytensor.tensor.math import *
+from pytensor.tensor.pad import pad
+from pytensor.tensor.shape import (
     reshape,
     shape,
     shape_padaxis,
@@ -137,21 +142,19 @@ from pytensor.tensor.shape import (  # noqa
     specify_shape,
 )
 
-
-from pytensor.tensor.io import *  # noqa
-from pytensor.tensor.math import *  # noqa
-
 # We import as `_shared` instead of `shared` to avoid confusion between
 # `pytensor.shared` and `tensor._shared`.
-from pytensor.tensor.sort import argsort, argtopk, sort, topk, topk_and_argtopk  # noqa
-from pytensor.tensor.subtensor import *  # noqa
-from pytensor.tensor.type import *  # noqa
-from pytensor.tensor.type_other import *  # noqa
-from pytensor.tensor.variable import TensorConstant, TensorVariable  # noqa
-from pytensor.tensor.functional import vectorize  # noqa
+from pytensor.tensor.sort import argsort, sort
+from pytensor.tensor.subtensor import *
+from pytensor.tensor.type import *
+from pytensor.tensor.type_other import *
+from pytensor.tensor.variable import TensorConstant, TensorVariable
 
-# Allow accessing numpy constants from pytensor.tensor
-from numpy import e, euler_gamma, inf, infty, nan, newaxis, pi  # noqa
+
+# isort: off
+from pytensor.tensor.einsum import einsum
+from pytensor.tensor.functional import vectorize
+# isort: on
 
 
 __all__ = ["random"]  # noqa: F405

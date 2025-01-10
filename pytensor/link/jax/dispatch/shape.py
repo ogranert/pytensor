@@ -51,7 +51,7 @@ def assert_shape_argument_jax_compatible(shape):
 
     """
     shape_op = shape.owner.op
-    if not isinstance(shape_op, (Shape, Shape_i, JAXShapeTuple)):
+    if not isinstance(shape_op, Shape | Shape_i | JAXShapeTuple):
         raise NotImplementedError(SHAPE_NOT_COMPATIBLE)
 
 
@@ -96,7 +96,7 @@ def jax_funcify_Shape_i(op, **kwargs):
 def jax_funcify_SpecifyShape(op, node, **kwargs):
     def specifyshape(x, *shape):
         assert x.ndim == len(shape)
-        for actual, expected in zip(x.shape, shape):
+        for actual, expected in zip(x.shape, shape, strict=True):
             if expected is None:
                 continue
             if actual != expected:

@@ -4,7 +4,6 @@ from typing import cast
 import numba
 import numpy as np
 
-from pytensor import config
 from pytensor.graph import Apply
 from pytensor.link.numba.dispatch import basic as numba_basic
 from pytensor.link.numba.dispatch.basic import get_numba_type, numba_funcify
@@ -44,19 +43,19 @@ def numba_funcify_CumOp(op: CumOp, node: Apply, **kwargs):
         if axis < 0 or axis >= ndim:
             raise ValueError(f"Invalid axis {axis} for array with ndim {ndim}")
 
-        reaxis_first = (axis,) + tuple(i for i in range(ndim) if i != axis)
+        reaxis_first = (axis, *(i for i in range(ndim) if i != axis))
         reaxis_first_inv = tuple(np.argsort(reaxis_first))
 
     if mode == "add":
         if axis is None or ndim == 1:
 
-            @numba_basic.numba_njit(fastmath=config.numba__fastmath)
+            @numba_basic.numba_njit
             def cumop(x):
                 return np.cumsum(x)
 
         else:
 
-            @numba_basic.numba_njit(boundscheck=False, fastmath=config.numba__fastmath)
+            @numba_basic.numba_njit(boundscheck=False)
             def cumop(x):
                 out_dtype = x.dtype
                 if x.shape[axis] < 2:
@@ -74,13 +73,13 @@ def numba_funcify_CumOp(op: CumOp, node: Apply, **kwargs):
     else:
         if axis is None or ndim == 1:
 
-            @numba_basic.numba_njit(fastmath=config.numba__fastmath)
+            @numba_basic.numba_njit
             def cumop(x):
                 return np.cumprod(x)
 
         else:
 
-            @numba_basic.numba_njit(boundscheck=False, fastmath=config.numba__fastmath)
+            @numba_basic.numba_njit(boundscheck=False)
             def cumop(x):
                 out_dtype = x.dtype
                 if x.shape[axis] < 2:
@@ -186,7 +185,8 @@ def numba_funcify_RavelMultiIndex(op, node, **kwargs):
 
             new_arr = arr.T.astype(np.float64).copy()
             for i, b in enumerate(new_arr):
-                for j, (d, v) in enumerate(zip(shape, b)):
+                # no strict argument to this zip because numba doesn't support it
+                for j, (d, v) in enumerate(zip(shape, b)):  # noqa: B905
                     if v < 0 or v >= d:
                         mode_fn(new_arr, i, j, v, d)
 

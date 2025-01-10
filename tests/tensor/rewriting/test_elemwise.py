@@ -4,9 +4,8 @@ import numpy as np
 import pytest
 
 import pytensor
-from pytensor import In
+from pytensor import In, shared
 from pytensor import scalar as ps
-from pytensor import shared
 from pytensor import tensor as pt
 from pytensor.compile.function import function
 from pytensor.compile.mode import Mode, get_default_mode
@@ -17,15 +16,13 @@ from pytensor.graph.fg import FunctionGraph
 from pytensor.graph.rewriting.basic import check_stack_trace, out2in
 from pytensor.graph.rewriting.db import RewriteDatabaseQuery
 from pytensor.graph.rewriting.utils import rewrite_graph
-from pytensor.misc.safe_asarray import _asarray
 from pytensor.raise_op import assert_op
 from pytensor.scalar.basic import Composite, float64
 from pytensor.tensor.basic import MakeVector
 from pytensor.tensor.elemwise import DimShuffle, Elemwise
 from pytensor.tensor.math import abs as pt_abs
-from pytensor.tensor.math import add
-from pytensor.tensor.math import all as pt_all
 from pytensor.tensor.math import (
+    add,
     bitwise_and,
     bitwise_or,
     cos,
@@ -44,13 +41,20 @@ from pytensor.tensor.math import (
     mul,
     neg,
     neq,
+    reciprocal,
+    sin,
+    sinh,
+    sqr,
+    sqrt,
+    tan,
+    tanh,
+    true_div,
+    xor,
 )
+from pytensor.tensor.math import all as pt_all
 from pytensor.tensor.math import pow as pt_pow
-from pytensor.tensor.math import reciprocal
 from pytensor.tensor.math import round as pt_round
-from pytensor.tensor.math import sin, sinh, sqr, sqrt
 from pytensor.tensor.math import sum as pt_sum
-from pytensor.tensor.math import tan, tanh, true_div, xor
 from pytensor.tensor.rewriting.elemwise import FusionOptimizer, local_dimshuffle_lift
 from pytensor.tensor.rewriting.shape import local_useless_dimshuffle_in_reshape
 from pytensor.tensor.shape import reshape
@@ -74,7 +78,7 @@ dimshuffle_lift = out2in(local_dimshuffle_lift)
 
 
 def ds(x, y):
-    return DimShuffle(x.type.broadcastable, y)(x)
+    return x.dimshuffle(y)
 
 
 def inputs(xbc=(0, 0), ybc=(0, 0), zbc=(0, 0)):
@@ -254,12 +258,12 @@ class TestFusion:
     fxv = my_init("float32", 2)
     fyv = my_init("float32", 3)
     fzv = my_init("float32", 4)
-    fvv = _asarray(np.random.random(5), dtype="float32")
+    fvv = np.asarray(np.random.random(5), dtype="float32")
     fsv = np.asarray(np.random.random(), dtype="float32")
     dwv = my_init("float64", 5)
-    ixv = _asarray(my_init(num=60), dtype="int32")
-    iyv = _asarray(my_init(num=70), dtype="int32")
-    izv = _asarray(my_init(num=70), dtype="int32")
+    ixv = np.asarray(my_init(num=60), dtype="int32")
+    iyv = np.asarray(my_init(num=70), dtype="int32")
+    izv = np.asarray(my_init(num=70), dtype="int32")
     fwx = fw + fx
     ftanx = tan(fx)
 
@@ -969,7 +973,7 @@ class TestFusion:
         if isinstance(out_dtype, dict):
             out_dtype = out_dtype[config.cast_policy]
 
-        if not isinstance(g, (tuple, list)):
+        if not isinstance(g, tuple | list):
             g = (g,)
             answer = (answer,)
             out_dtype = (out_dtype,)
@@ -983,10 +987,12 @@ class TestFusion:
         else:
             out = [
                 self._shared(np.zeros((5,) * g_.ndim, dtype=od), "out")
-                for g_, od in zip(g, out_dtype)
+                for g_, od in zip(g, out_dtype, strict=True)
             ]
-            assert all(o.dtype == g_.dtype for o, g_ in zip(out, g))
-            f = function(sym_inputs, [], updates=list(zip(out, g)), mode=self.mode)
+            assert all(o.dtype == g_.dtype for o, g_ in zip(out, g, strict=True))
+            f = function(
+                sym_inputs, [], updates=list(zip(out, g, strict=True)), mode=self.mode
+            )
             for x in range(nb_repeat):
                 f(*val_inputs)
             out = [o.get_value() for o in out]
@@ -996,7 +1002,7 @@ class TestFusion:
             if any(o == "float32" for o in out_dtype):
                 atol = 1e-6
 
-        for o, a in zip(out, answer):
+        for o, a in zip(out, answer, strict=True):
             np.testing.assert_allclose(o, a * nb_repeat, atol=atol)
 
         topo = f.maker.fgraph.toposort()
@@ -1016,7 +1022,7 @@ class TestFusion:
                         )
                         assert expected_len_sym_inputs == len(sym_inputs)
 
-        for od, o in zip(out_dtype, out):
+        for od, o in zip(out_dtype, out, strict=True):
             assert od == o.dtype
 
     def test_fusion_35_inputs(self):
@@ -1052,7 +1058,6 @@ class TestFusion:
             for node in dlogp.maker.fgraph.toposort()
         )
 
-    @pytest.mark.xfail(reason="Fails due to #1244")
     def test_add_mul_fusion_precedence(self):
         """Test that additions and multiplications are "fused together" before
         a `Composite` `Op` is introduced. This fusion is done by canonicalization
@@ -1386,12 +1391,9 @@ class TimesN(ps.basic.UnaryScalarOp):
 
     def c_support_code_apply(self, node, nodename):
         n = str(self.n)
-        return (
-            """
-        float %(nodename)s_timesn(float x) { return x * %(n)s; }
+        return f"""
+        float {nodename}_timesn(float x) {{ return x * {n}; }}
         """
-            % locals()
-        )
 
     def c_code(self, node, name, inputs, outputs, sub):
         (x,) = inputs

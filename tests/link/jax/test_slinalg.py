@@ -1,3 +1,6 @@
+from functools import partial
+from typing import Literal
+
 import numpy as np
 import pytest
 
@@ -128,4 +131,91 @@ def test_jax_SolveTriangular(trans, lower, check_finite):
             np.eye(10).astype(config.floatX),
             np.arange(10).astype(config.floatX),
         ],
+    )
+
+
+def test_jax_block_diag():
+    A = matrix("A")
+    B = matrix("B")
+    C = matrix("C")
+    D = matrix("D")
+
+    out = pt_slinalg.block_diag(A, B, C, D)
+    out_fg = FunctionGraph([A, B, C, D], [out])
+
+    compare_jax_and_py(
+        out_fg,
+        [
+            np.random.normal(size=(5, 5)).astype(config.floatX),
+            np.random.normal(size=(3, 3)).astype(config.floatX),
+            np.random.normal(size=(2, 2)).astype(config.floatX),
+            np.random.normal(size=(4, 4)).astype(config.floatX),
+        ],
+    )
+
+
+def test_jax_block_diag_blockwise():
+    A = pt.tensor3("A")
+    B = pt.tensor3("B")
+    out = pt_slinalg.block_diag(A, B)
+    out_fg = FunctionGraph([A, B], [out])
+    compare_jax_and_py(
+        out_fg,
+        [
+            np.random.normal(size=(5, 5, 5)).astype(config.floatX),
+            np.random.normal(size=(5, 3, 3)).astype(config.floatX),
+        ],
+    )
+
+
+@pytest.mark.parametrize("lower", [False, True])
+def test_jax_eigvalsh(lower):
+    A = matrix("A")
+    B = matrix("B")
+
+    out = pt_slinalg.eigvalsh(A, B, lower=lower)
+    out_fg = FunctionGraph([A, B], [out])
+
+    with pytest.raises(NotImplementedError):
+        compare_jax_and_py(
+            out_fg,
+            [
+                np.array(
+                    [[6, 3, 1, 5], [3, 0, 5, 1], [1, 5, 6, 2], [5, 1, 2, 2]]
+                ).astype(config.floatX),
+                np.array(
+                    [[10, 0, 1, 3], [0, 12, 7, 8], [1, 7, 14, 2], [3, 8, 2, 16]]
+                ).astype(config.floatX),
+            ],
+        )
+    compare_jax_and_py(
+        out_fg,
+        [
+            np.array([[6, 3, 1, 5], [3, 0, 5, 1], [1, 5, 6, 2], [5, 1, 2, 2]]).astype(
+                config.floatX
+            ),
+            None,
+        ],
+    )
+
+
+@pytest.mark.parametrize("method", ["direct", "bilinear"])
+@pytest.mark.parametrize("shape", [(5, 5), (5, 5, 5)], ids=["matrix", "batch"])
+def test_jax_solve_discrete_lyapunov(
+    method: Literal["direct", "bilinear"], shape: tuple[int]
+):
+    A = pt.tensor(name="A", shape=shape)
+    B = pt.tensor(name="B", shape=shape)
+    out = pt_slinalg.solve_discrete_lyapunov(A, B, method=method)
+    out_fg = FunctionGraph([A, B], [out])
+
+    atol = rtol = 1e-8 if config.floatX == "float64" else 1e-3
+    compare_jax_and_py(
+        out_fg,
+        [
+            np.random.normal(size=shape).astype(config.floatX),
+            np.random.normal(size=shape).astype(config.floatX),
+        ],
+        jax_mode="JAX",
+        assert_fn=partial(np.testing.assert_allclose, atol=atol, rtol=rtol),
     )

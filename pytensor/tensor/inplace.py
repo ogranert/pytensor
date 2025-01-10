@@ -1,6 +1,6 @@
 from pytensor import printing
 from pytensor.printing import pprint
-from pytensor.tensor.elemwise import DimShuffle, scalar_elemwise
+from pytensor.tensor.elemwise import scalar_elemwise
 
 
 @scalar_elemwise
@@ -284,6 +284,16 @@ def gammal_inplace(k, x):
 
 
 @scalar_elemwise
+def gammaincinv_inplace(k, x):
+    """Inverse to the regularized lower incomplete gamma function"""
+
+
+@scalar_elemwise
+def gammainccinv_inplace(k, x):
+    """Inverse of the regularized upper incomplete gamma function"""
+
+
+@scalar_elemwise
 def j0_inplace(x):
     """Bessel function of the first kind of order 0."""
 
@@ -336,6 +346,11 @@ def log1mexp_inplace(x):
 @scalar_elemwise
 def betainc_inplace(a, b, x):
     """Regularized incomplete beta function"""
+
+
+@scalar_elemwise
+def betaincinv_inplace(a, b, x):
+    """Inverse of the regularized incomplete beta function"""
 
 
 @scalar_elemwise
@@ -414,4 +429,4 @@ pprint.assign(pow_inplace, printing.OperatorPrinter("**=", 1, "right"))
 def transpose_inplace(x, **kwargs):
     "Perform a transpose on a tensor without copying the underlying storage"
     dims = list(range(x.ndim - 1, -1, -1))
-    return DimShuffle(x.broadcastable, dims)(x)
+    return x.dimshuffle(dims)

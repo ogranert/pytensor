@@ -1,3 +1,4 @@
+import itertools
 import pickle
 
 import numpy as np
@@ -5,8 +6,9 @@ import pytest
 
 from pytensor.configdefaults import config
 from pytensor.graph.basic import NominalVariable
-from pytensor.graph.fg import FunctionGraph
+from pytensor.graph.fg import FunctionGraph, Output
 from pytensor.graph.utils import MissingInputError
+from pytensor.printing import debugprint
 from tests.graph.utils import (
     MyConstant,
     MyOp,
@@ -30,13 +32,22 @@ class TestFunctionGraph:
         s = pickle.dumps(func)
         new_func = pickle.loads(s)
 
-        assert all(type(a) == type(b) for a, b in zip(func.inputs, new_func.inputs))
-        assert all(type(a) == type(b) for a, b in zip(func.outputs, new_func.outputs))
         assert all(
-            type(a.op) is type(b.op)  # noqa: E721
-            for a, b in zip(func.apply_nodes, new_func.apply_nodes)
+            type(a) is type(b)
+            for a, b in zip(func.inputs, new_func.inputs, strict=True)
         )
-        assert all(a.type == b.type for a, b in zip(func.variables, new_func.variables))
+        assert all(
+            type(a) is type(b)
+            for a, b in zip(func.outputs, new_func.outputs, strict=True)
+        )
+        assert all(
+            type(a.op) is type(b.op)
+            for a, b in zip(func.apply_nodes, new_func.apply_nodes, strict=True)
+        )
+        assert all(
+            a.type == b.type
+            for a, b in zip(func.variables, new_func.variables, strict=True)
+        )
 
     def test_validate_inputs(self):
         var1 = op1()
@@ -76,8 +87,13 @@ class TestFunctionGraph:
         assert fg.variables == {var1, var2, var3, var4}
         assert fg.get_clients(var1) == [(var3.owner, 0)]
         assert fg.get_clients(var2) == [(var4.owner, 1)]
-        assert fg.get_clients(var3) == [("output", 0), (var4.owner, 0)]
-        assert fg.get_clients(var4) == [("output", 1)]
+        var3_clients = fg.get_clients(var3)
+        assert len(var3_clients) == 2
+        assert var3_clients[0][0].op == Output(0)
+        assert var3_clients[1] == (var4.owner, 0)
+        var4_clients = fg.get_clients(var4)
+        assert len(var4_clients) == 1
+        assert var4_clients[0][0].op == Output(1)
 
         varC = MyConstant("varC")
         var5 = op1(var1, varC)
@@ -206,8 +222,11 @@ class TestFunctionGraph:
         fg = FunctionGraph([var1, var2], [var3, var5], clone=False)
 
         var6 = MyVariable2("var6")
+        [out_client] = [
+            cl for cl, _ in fg.clients[fg.outputs[0]] if isinstance(cl.op, Output)
+        ]
         with pytest.raises(TypeError):
-            fg.change_node_input("output", 1, var6)
+            fg.change_node_input(out_client, 0, var6)
 
         with pytest.raises(TypeError):
             fg.change_node_input(var5.owner, 1, var6)
@@ -356,12 +375,13 @@ class TestFunctionGraph:
 
         # TODO: What if the index value is greater than 1?  It will throw an
         # `IndexError`, but that doesn't sound like anything we'd want.
+        out_node = Output(idx=1).make_node(var4)
         with pytest.raises(Exception, match="Inconsistent clients list.*"):
-            fg.add_client(var4, ("output", 1))
+            fg.add_client(var4, (out_node, 0))
 
             fg.check_integrity()
 
-        fg.remove_client(var4, ("output", 1))
+        fg.remove_client(var4, (out_node, 0))
 
         with pytest.raises(TypeError, match="The first entry of.*"):
             fg.add_client(var4, (None, 0))
@@ -574,7 +594,8 @@ class TestFunctionGraph:
         assert fg.outputs == [op1_out]
         assert op3_out not in fg.clients
         assert not any(
-            op3_out.owner in clients for clients in sum(fg.clients.values(), [])
+            op3_out.owner in clients
+            for clients in itertools.chain.from_iterable(fg.clients.values())
         )
 
         # Remove an input
@@ -585,7 +606,8 @@ class TestFunctionGraph:
         assert fg.inputs == [var2]
         assert fg.outputs == []
         assert not any(
-            op1_out.owner in clients for clients in sum(fg.clients.values(), [])
+            op1_out.owner in clients
+            for clients in itertools.chain.from_iterable(fg.clients.values())
         )
 
     def test_remove_duplicates(self):
@@ -622,10 +644,12 @@ class TestFunctionGraph:
         assert not fg.apply_nodes
         assert op1_out not in fg.clients
         assert not any(
-            op1_out.owner in clients for clients in sum(fg.clients.values(), [])
+            op1_out.owner in clients
+            for clients in itertools.chain.from_iterable(fg.clients.values())
         )
         assert not any(
-            op3_out.owner in clients for clients in sum(fg.clients.values(), [])
+            op3_out.owner in clients
+            for clients in itertools.chain.from_iterable(fg.clients.values())
         )
 
     def test_remove_node_multi_out(self):
@@ -701,3 +725,9 @@ class TestFunctionGraph:
         assert nm2 not in fg.inputs
         assert nm in fg.variables
         assert nm2 in fg.variables
+
+    def test_dprint(self):
+        r1, r2 = MyVariable("x"), MyVariable("y")
+        o1 = op1(r1, r2)
+        fg = FunctionGraph([r1, r2], [o1], clone=False)
+        assert fg.dprint(file="str") == debugprint(fg, file="str")

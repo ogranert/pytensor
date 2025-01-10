@@ -1,4 +1,4 @@
-import os
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -25,13 +25,12 @@ Py_XDECREF((PyObject *)p);
 """
 
     def c_code(self, node, name, inps, outs, sub):
-        return """
-Py_XDECREF(%(out)s);
-%(out)s = (void *)%(inp)s;
-Py_INCREF(%(inp)s);
-""" % dict(
-            out=outs[0], inp=inps[0]
-        )
+        return f"""
+Py_XDECREF({outs[0]});
+{outs[0]} = (void *){inps[0]};
+Py_INCREF({inps[0]});
+"""
+        # FIXME: should it not be outs[0]?
 
     def c_code_cache_version(self):
         return (0,)
@@ -54,13 +53,11 @@ Py_XDECREF((PyObject *)p);
 """
 
     def c_code(self, node, name, inps, outs, sub):
-        return """
-Py_XDECREF(%(out)s);
-%(out)s = (PyArrayObject *)%(inp)s;
-Py_INCREF(%(out)s);
-""" % dict(
-            out=outs[0], inp=inps[0]
-        )
+        return f"""
+Py_XDECREF({outs[0]});
+{outs[0]} = (PyArrayObject *){inps[0]};
+Py_INCREF({outs[0]});
+"""
 
     def c_code_cache_version(self):
         return (0,)
@@ -140,27 +137,30 @@ class MyOpEnumList(COp):
         return (1,)
 
     def c_code(self, node, name, inputs, outputs, sub):
-        return """
-        switch(%(op)s) {
+        op = sub["params"]
+        o = outputs[0]
+        a = inputs[0]
+        b = inputs[1]
+        fail = sub["fail"]
+        return f"""
+        switch({op}) {{
             case ADD:
-                %(o)s = %(a)s + %(b)s;
+                {o} = {a} + {b};
                 break;
             case SUB:
-                %(o)s = %(a)s - %(b)s;
+                {o} = {a} - {b};
                 break;
             case MULTIPLY:
-                %(o)s = %(a)s * %(b)s;
+                {o} = {a} * {b};
                 break;
             case DIVIDE:
-                %(o)s = %(a)s / %(b)s;
+                {o} = {a} / {b};
                 break;
             default:
-                {%(fail)s}
+                {{{fail}}}
                 break;
-        }
-        """ % dict(
-            op=sub["params"], o=outputs[0], a=inputs[0], b=inputs[1], fail=sub["fail"]
-        )
+        }}
+        """
 
 
 class MyOpCEnumType(COp):
@@ -173,7 +173,7 @@ class MyOpCEnumType(COp):
     )
 
     def c_header_dirs(self, **kwargs):
-        return [os.path.join(os.path.dirname(__file__), "c_code")]
+        return [Path(__file__).parent / "c_code"]
 
     def c_headers(self, **kwargs):
         return ["test_cenum.h"]
@@ -199,13 +199,10 @@ class MyOpCEnumType(COp):
         return (3,)
 
     def c_code(self, node, name, inputs, outputs, sub):
-        return """
-        %(o)s = %(val)s;
-        """ % dict(
-            o=outputs[0],
-            # params in C code will already contains expected C constant value.
-            val=sub["params"],
-        )
+        # params in C code will already contains expected C constant value.
+        return f"""
+        {outputs[0]} = {sub['params']};
+        """
 
 
 class TestEnumTypes:
@@ -290,6 +287,6 @@ class TestEnumTypes:
         assert val_billion == val_million * 1000
         assert val_two_billions == val_billion * 2
 
-    @pytensor.config.change_flags(**{"cmodule__debug": True})
+    @pytensor.config.change_flags(cmodule__debug=True)
     def test_op_with_cenumtype_debug(self):
         self.test_op_with_cenumtype()

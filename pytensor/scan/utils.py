@@ -3,10 +3,10 @@
 import copy
 import dataclasses
 import logging
-from collections import OrderedDict, namedtuple
-from collections.abc import Sequence
+from collections import namedtuple
+from collections.abc import Callable, Sequence
 from itertools import chain
-from typing import TYPE_CHECKING, Callable, Optional, Union
+from typing import TYPE_CHECKING
 from typing import cast as type_cast
 
 import numpy as np
@@ -36,7 +36,7 @@ class InnerFunctionError(Exception):
 
 
 def safe_new(
-    x: Variable, tag: str = "", dtype: Optional[Union[str, np.dtype]] = None
+    x: Variable, tag: str = "", dtype: str | np.dtype | None = None
 ) -> Variable:
     """Clone variables.
 
@@ -258,7 +258,7 @@ class Validator:
         if invalid is None:
             invalid = []
         if valid_equivalent is None:
-            valid_equivalent = OrderedDict()
+            valid_equivalent = {}
 
         # Nodes that are valid to have in the graph computing outputs
         self.valid = set(valid)
@@ -269,7 +269,7 @@ class Validator:
         # Mapping from invalid variables to equivalent valid ones.
         self.valid_equivalent = valid_equivalent.copy()
         self.valid.update(list(valid_equivalent.values()))
-        self.invalid.update(list(valid_equivalent.keys()))
+        self.invalid.update(list(valid_equivalent))
 
     def check(self, out):
         """
@@ -416,7 +416,7 @@ def compress_outs(op, not_required, inputs):
     op_inputs = op.inner_inputs[: op_info.n_seqs]
     op_outputs = []
     node_inputs = inputs[: op_info.n_seqs + 1]
-    map_old_new = OrderedDict()
+    map_old_new = {}
 
     offset = 0
     ni_offset = op_info.n_seqs + 1
@@ -429,10 +429,14 @@ def compress_outs(op, not_required, inputs):
             curr_pos += 1
             info = dataclasses.replace(
                 info,
-                mit_mot_in_slices=info.mit_mot_in_slices
-                + (op_info.mit_mot_in_slices[idx],),
-                mit_mot_out_slices=info.mit_mot_out_slices
-                + (op_info.mit_mot_out_slices[idx],),
+                mit_mot_in_slices=(
+                    *info.mit_mot_in_slices,
+                    op_info.mit_mot_in_slices[idx],
+                ),
+                mit_mot_out_slices=(
+                    *info.mit_mot_out_slices,
+                    op_info.mit_mot_out_slices[idx],
+                ),
             )
             # input taps
             for jdx in op_info.mit_mot_in_slices[idx]:
@@ -457,8 +461,10 @@ def compress_outs(op, not_required, inputs):
             curr_pos += 1
             info = dataclasses.replace(
                 info,
-                mit_sot_in_slices=info.mit_sot_in_slices
-                + (op_info.mit_sot_in_slices[idx],),
+                mit_sot_in_slices=(
+                    *info.mit_sot_in_slices,
+                    op_info.mit_sot_in_slices[idx],
+                ),
             )
             # input taps
             for jdx in op_info.mit_sot_in_slices[idx]:
@@ -481,8 +487,10 @@ def compress_outs(op, not_required, inputs):
             curr_pos += 1
             info = dataclasses.replace(
                 info,
-                sit_sot_in_slices=info.sit_sot_in_slices
-                + (op_info.sit_sot_in_slices[idx],),
+                sit_sot_in_slices=(
+                    *info.sit_sot_in_slices,
+                    op_info.sit_sot_in_slices[idx],
+                ),
             )
             # input taps
             op_inputs += [op.inner_inputs[i_offset]]
@@ -551,7 +559,7 @@ def reconstruct_graph(inputs, outputs, tag=None):
         tag = ""
     nw_inputs = [safe_new(x, tag) for x in inputs]
 
-    givens = {x: nw_x for nw_x, x in zip(nw_inputs, inputs)}
+    givens = {x: nw_x for nw_x, x in zip(nw_inputs, inputs, strict=True)}
     nw_outputs = clone_replace(outputs, replace=givens)
     return (nw_inputs, nw_outputs)
 
@@ -585,7 +593,7 @@ class ScanArgs:
         _inner_inputs: Sequence[Variable],
         _inner_outputs: Sequence[Variable],
         info: "ScanInfo",
-        clone: Optional[bool] = True,
+        clone: bool | None = True,
     ):
         self.n_steps = outer_inputs[0]
         self.as_while = info.as_while
@@ -741,15 +749,13 @@ class ScanArgs:
     def field_names(self):
         res = ["mit_mot_out_slices", "mit_mot_in_slices", "mit_sot_in_slices"]
         res.extend(
-            [
-                attr
-                for attr in self.__dict__
-                if attr.startswith("inner_in")
-                or attr.startswith("inner_out")
-                or attr.startswith("outer_in")
-                or attr.startswith("outer_out")
-                or attr == "n_steps"
-            ]
+            attr
+            for attr in self.__dict__
+            if attr.startswith("inner_in")
+            or attr.startswith("inner_out")
+            or attr.startswith("outer_in")
+            or attr.startswith("outer_out")
+            or attr == "n_steps"
         )
         return res
 
@@ -757,8 +763,8 @@ class ScanArgs:
     def inner_inputs(self):
         return (
             self.inner_in_seqs
-            + sum(self.inner_in_mit_mot, [])
-            + sum(self.inner_in_mit_sot, [])
+            + list(chain.from_iterable(self.inner_in_mit_mot))
+            + list(chain.from_iterable(self.inner_in_mit_sot))
             + self.inner_in_sit_sot
             + self.inner_in_shared
             + self.inner_in_non_seqs
@@ -766,21 +772,21 @@ class ScanArgs:
 
     @property
     def outer_inputs(self):
-        return (
-            [self.n_steps]
-            + self.outer_in_seqs
-            + self.outer_in_mit_mot
-            + self.outer_in_mit_sot
-            + self.outer_in_sit_sot
-            + self.outer_in_shared
-            + self.outer_in_nit_sot
-            + self.outer_in_non_seqs
-        )
+        return [
+            self.n_steps,
+            *self.outer_in_seqs,
+            *self.outer_in_mit_mot,
+            *self.outer_in_mit_sot,
+            *self.outer_in_sit_sot,
+            *self.outer_in_shared,
+            *self.outer_in_nit_sot,
+            *self.outer_in_non_seqs,
+        ]
 
     @property
     def inner_outputs(self):
         return (
-            sum(self.inner_out_mit_mot, [])
+            list(chain.from_iterable(self.inner_out_mit_mot))
             + self.inner_out_mit_sot
             + self.inner_out_sit_sot
             + self.inner_out_nit_sot
@@ -815,7 +821,7 @@ class ScanArgs:
         )
 
     def get_alt_field(
-        self, var_info: Union[Variable, FieldInfo], alt_prefix: str
+        self, var_info: Variable | FieldInfo, alt_prefix: str
     ) -> Variable:
         """Get the alternate input/output field for a given element of `ScanArgs`.
 
@@ -851,7 +857,7 @@ class ScanArgs:
 
     def find_among_fields(
         self, i: Variable, field_filter: Callable[[str], bool] = default_filter
-    ) -> Optional[FieldInfo]:
+    ) -> FieldInfo | None:
         """Find the type and indices of the field containing a given element.
 
         NOTE: This only returns the *first* field containing the given element.
@@ -903,7 +909,7 @@ class ScanArgs:
 
     def _remove_from_fields(
         self, i: Variable, field_filter: Callable[[str], bool] = default_filter
-    ) -> Optional[FieldInfo]:
+    ) -> FieldInfo | None:
         field_info = self.find_among_fields(i, field_filter=field_filter)
 
         if field_info is None:
@@ -917,7 +923,7 @@ class ScanArgs:
         return field_info
 
     def get_dependent_nodes(
-        self, i: Variable, seen: Optional[set[Variable]] = None
+        self, i: Variable, seen: set[Variable] | None = None
     ) -> set[Variable]:
         if seen is None:
             seen = {i}
@@ -991,13 +997,13 @@ class ScanArgs:
 
     def remove_from_fields(
         self, i: Variable, rm_dependents: bool = True
-    ) -> list[tuple[Variable, Optional[FieldInfo]]]:
+    ) -> list[tuple[Variable, FieldInfo | None]]:
         if rm_dependents:
             vars_to_remove = self.get_dependent_nodes(i) | {i}
         else:
             vars_to_remove = {i}
 
-        rm_info: list[tuple[Variable, Optional[FieldInfo]]] = []
+        rm_info: list[tuple[Variable, FieldInfo | None]] = []
         for v in vars_to_remove:
             dependent_rm_info = self._remove_from_fields(v)
             rm_info.append((v, dependent_rm_info))
@@ -1066,7 +1072,8 @@ class ScanArgs:
             for p in self.field_names
             if p.startswith("outer_out")
         ]
-        res = "ScanArgs(\n{})".format(",\n".join(inner_arg_strs))
+        args = ",\n".join(inner_arg_strs)
+        res = f"ScanArgs(\n{args})"
         return res
 
     def __repr__(self):

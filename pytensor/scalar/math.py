@@ -4,8 +4,8 @@ r"""
 As SciPy is not always available, we treat them separately.
 """
 
-import os
 from functools import reduce
+from pathlib import Path
 from textwrap import dedent
 
 import numpy as np
@@ -14,9 +14,10 @@ import scipy.stats
 
 from pytensor.configdefaults import config
 from pytensor.gradient import grad_not_implemented, grad_undefined
-from pytensor.scalar.basic import BinaryScalarOp, ScalarOp, UnaryScalarOp
-from pytensor.scalar.basic import abs as scalar_abs
 from pytensor.scalar.basic import (
+    BinaryScalarOp,
+    ScalarOp,
+    UnaryScalarOp,
     as_scalar,
     complex_types,
     constant,
@@ -42,7 +43,11 @@ from pytensor.scalar.basic import (
     upgrade_to_float64,
     upgrade_to_float_no_complex,
 )
+from pytensor.scalar.basic import abs as scalar_abs
 from pytensor.scalar.loop import ScalarLoop
+
+
+C_CODE_PATH = Path(__file__).parent / "c_code"
 
 
 class Erf(UnaryScalarOp):
@@ -152,18 +157,12 @@ class Erfcx(UnaryScalarOp):
 
     def c_header_dirs(self, **kwargs):
         # Using the Faddeeva.hh (c++) header for Faddeevva.cc
-        res = super().c_header_dirs(**kwargs) + [
-            os.path.join(os.path.dirname(__file__), "c_code")
-        ]
+        res = [*super().c_header_dirs(**kwargs), str(C_CODE_PATH)]
         return res
 
     def c_support_code(self, **kwargs):
         # Using Faddeeva.cc source file from: http://ab-initio.mit.edu/wiki/index.php/Faddeeva_Package
-        with open(
-            os.path.join(os.path.dirname(__file__), "c_code", "Faddeeva.cc")
-        ) as f:
-            raw = f.read()
-            return raw
+        return (C_CODE_PATH / "Faddeeva.cc").read_text(encoding="utf-8")
 
     def c_code(self, node, name, inp, out, sub):
         (x,) = inp
@@ -609,27 +608,29 @@ class Chi2SF(BinaryScalarOp):
         return Chi2SF.st_impl(x, k)
 
     def c_support_code(self, **kwargs):
-        with open(os.path.join(os.path.dirname(__file__), "c_code", "gamma.c")) as f:
-            raw = f.read()
-            return raw
+        return (C_CODE_PATH / "gamma.c").read_text(encoding="utf-8")
 
     def c_code(self, node, name, inp, out, sub):
         x, k = inp
         (z,) = out
         if node.inputs[0].type in float_types:
             dtype = "npy_" + node.outputs[0].dtype
-            return (
-                """%(z)s =
-                (%(dtype)s) 1 - GammaP(%(k)s/2., %(x)s/2.);"""
-                % locals()
-            )
+            return f"""{z} =
+                ({dtype}) 1 - GammaP({k}/2., {x}/2.);"""
         raise NotImplementedError("only floatingpoint is implemented")
 
     def __eq__(self, other):
-        return type(self) == type(other)
+        return type(self) is type(other)
 
     def __hash__(self):
         return hash(type(self))
+
+    def c_code_cache_version(self):
+        v = super().c_code_cache_version()
+        if v:
+            return (2, *v)
+        else:
+            return v
 
 
 chi2sf = Chi2SF(upgrade_to_float64, name="chi2sf")
@@ -658,27 +659,29 @@ class GammaInc(BinaryScalarOp):
         ]
 
     def c_support_code(self, **kwargs):
-        with open(os.path.join(os.path.dirname(__file__), "c_code", "gamma.c")) as f:
-            raw = f.read()
-            return raw
+        return (C_CODE_PATH / "gamma.c").read_text(encoding="utf-8")
 
     def c_code(self, node, name, inp, out, sub):
         k, x = inp
         (z,) = out
         if node.inputs[0].type in float_types:
             dtype = "npy_" + node.outputs[0].dtype
-            return (
-                """%(z)s =
-                (%(dtype)s) GammaP(%(k)s, %(x)s);"""
-                % locals()
-            )
+            return f"""{z} =
+                ({dtype}) GammaP({k}, {x});"""
         raise NotImplementedError("only floatingpoint is implemented")
 
     def __eq__(self, other):
-        return type(self) == type(other)
+        return type(self) is type(other)
 
     def __hash__(self):
         return hash(type(self))
+
+    def c_code_cache_version(self):
+        v = super().c_code_cache_version()
+        if v:
+            return (2, *v)
+        else:
+            return v
 
 
 gammainc = GammaInc(upgrade_to_float, name="gammainc")
@@ -707,30 +710,90 @@ class GammaIncC(BinaryScalarOp):
         ]
 
     def c_support_code(self, **kwargs):
-        with open(os.path.join(os.path.dirname(__file__), "c_code", "gamma.c")) as f:
-            raw = f.read()
-            return raw
+        return (C_CODE_PATH / "gamma.c").read_text(encoding="utf-8")
 
     def c_code(self, node, name, inp, out, sub):
         k, x = inp
         (z,) = out
         if node.inputs[0].type in float_types:
             dtype = "npy_" + node.outputs[0].dtype
-            return (
-                """%(z)s =
-                (%(dtype)s) GammaQ(%(k)s, %(x)s);"""
-                % locals()
-            )
+            return f"""{z} =
+                ({dtype}) GammaQ({k}, {x});"""
         raise NotImplementedError("only floatingpoint is implemented")
 
     def __eq__(self, other):
-        return type(self) == type(other)
+        return type(self) is type(other)
 
     def __hash__(self):
         return hash(type(self))
 
+    def c_code_cache_version(self):
+        v = super().c_code_cache_version()
+        if v:
+            return (2, *v)
+        else:
+            return v
+
 
 gammaincc = GammaIncC(upgrade_to_float, name="gammaincc")
+
+
+class GammaIncInv(BinaryScalarOp):
+    """
+    Inverse to the regularized lower incomplete gamma function.
+    """
+
+    nfunc_spec = ("scipy.special.gammaincinv", 2, 1)
+
+    @staticmethod
+    def st_impl(k, x):
+        return scipy.special.gammaincinv(k, x)
+
+    def impl(self, k, x):
+        return GammaIncInv.st_impl(k, x)
+
+    def grad(self, inputs, grads):
+        (k, x) = inputs
+        (gz,) = grads
+        return [
+            grad_not_implemented(self, 0, k),
+            gz * exp(gammaincinv(k, x)) * gamma(k) * (gammaincinv(k, x) ** (1 - k)),
+        ]
+
+    def c_code(self, *args, **kwargs):
+        raise NotImplementedError()
+
+
+gammaincinv = GammaIncInv(upgrade_to_float, name="gammaincinv")
+
+
+class GammaIncCInv(BinaryScalarOp):
+    """
+    Inverse to the regularized upper incomplete gamma function.
+    """
+
+    nfunc_spec = ("scipy.special.gammainccinv", 2, 1)
+
+    @staticmethod
+    def st_impl(k, x):
+        return scipy.special.gammainccinv(k, x)
+
+    def impl(self, k, x):
+        return GammaIncCInv.st_impl(k, x)
+
+    def grad(self, inputs, grads):
+        (k, x) = inputs
+        (gz,) = grads
+        return [
+            grad_not_implemented(self, 0, k),
+            gz * -exp(gammainccinv(k, x)) * gamma(k) * (gammainccinv(k, x) ** (1 - k)),
+        ]
+
+    def c_code(self, *args, **kwargs):
+        raise NotImplementedError()
+
+
+gammainccinv = GammaIncCInv(upgrade_to_float, name="gammainccinv")
 
 
 def _make_scalar_loop(n_steps, init, constant, inner_loop_fn, name, loop_op=ScalarLoop):
@@ -958,24 +1021,19 @@ class GammaU(BinaryScalarOp):
         return GammaU.st_impl(k, x)
 
     def c_support_code(self, **kwargs):
-        with open(os.path.join(os.path.dirname(__file__), "c_code", "gamma.c")) as f:
-            raw = f.read()
-            return raw
+        return (C_CODE_PATH / "gamma.c").read_text(encoding="utf-8")
 
     def c_code(self, node, name, inp, out, sub):
         k, x = inp
         (z,) = out
         if node.inputs[0].type in float_types:
             dtype = "npy_" + node.outputs[0].dtype
-            return (
-                """%(z)s =
-                (%(dtype)s) upperGamma(%(k)s, %(x)s);"""
-                % locals()
-            )
+            return f"""{z} =
+                ({dtype}) upperGamma({k}, {x});"""
         raise NotImplementedError("only floatingpoint is implemented")
 
     def __eq__(self, other):
-        return type(self) == type(other)
+        return type(self) is type(other)
 
     def __hash__(self):
         return hash(type(self))
@@ -999,24 +1057,19 @@ class GammaL(BinaryScalarOp):
         return GammaL.st_impl(k, x)
 
     def c_support_code(self, **kwargs):
-        with open(os.path.join(os.path.dirname(__file__), "c_code", "gamma.c")) as f:
-            raw = f.read()
-            return raw
+        return (C_CODE_PATH / "gamma.c").read_text(encoding="utf-8")
 
     def c_code(self, node, name, inp, out, sub):
         k, x = inp
         (z,) = out
         if node.inputs[0].type in float_types:
             dtype = "npy_" + node.outputs[0].dtype
-            return (
-                """%(z)s =
-                (%(dtype)s) lowerGamma(%(k)s, %(x)s);"""
-                % locals()
-            )
+            return f"""{z} =
+                ({dtype}) lowerGamma({k}, {x});"""
         raise NotImplementedError("only floatingpoint is implemented")
 
     def __eq__(self, other):
-        return type(self) == type(other)
+        return type(self) is type(other)
 
     def __hash__(self):
         return hash(type(self))
@@ -1228,6 +1281,38 @@ class Ive(BinaryScalarOp):
 ive = Ive(upgrade_to_float, name="ive")
 
 
+class Kve(BinaryScalarOp):
+    """Exponentially scaled modified Bessel function of the second kind of real order v."""
+
+    nfunc_spec = ("scipy.special.kve", 2, 1)
+
+    @staticmethod
+    def st_impl(v, x):
+        return scipy.special.kve(v, x)
+
+    def impl(self, v, x):
+        return self.st_impl(v, x)
+
+    def L_op(self, inputs, outputs, output_grads):
+        v, x = inputs
+        [kve_vx] = outputs
+        [g_out] = output_grads
+        # (1 -v/x) * kve(v, x) - kve(v - 1, x)
+        kve_vm1x = self(v - 1, x)
+        dx = (1 - v / x) * kve_vx - kve_vm1x
+
+        return [
+            grad_not_implemented(self, 0, v),
+            g_out * dx,
+        ]
+
+    def c_code(self, *args, **kwargs):
+        raise NotImplementedError()
+
+
+kve = Kve(upgrade_to_float, name="kve")
+
+
 class Sigmoid(UnaryScalarOp):
     """
     Logistic sigmoid function (1 / (1 + exp(-x)), also known as expit or inverse logit
@@ -1263,7 +1348,7 @@ class Sigmoid(UnaryScalarOp):
     def c_code_cache_version(self):
         v = super().c_code_cache_version()
         if v:
-            return (2,) + v
+            return (2, *v)
         else:
             return v
 
@@ -1345,7 +1430,7 @@ class Softplus(UnaryScalarOp):
     def c_code_cache_version(self):
         v = super().c_code_cache_version()
         if v:
-            return (3,) + v
+            return (3, *v)
         else:
             return v
 
@@ -1428,8 +1513,23 @@ class BetaInc(ScalarOp):
             ),
         ]
 
-    def c_code(self, *args, **kwargs):
-        raise NotImplementedError()
+    def c_support_code(self, **kwargs):
+        return (C_CODE_PATH / "incbet.c").read_text(encoding="utf-8")
+
+    def c_code(self, node, name, inp, out, sub):
+        (a, b, x) = inp
+        (z,) = out
+        if (
+            node.inputs[0].type in float_types
+            and node.inputs[1].type in float_types
+            and node.inputs[2].type in float_types
+        ):
+            return f"""{z} = BetaInc({a}, {b}, {x});"""
+
+        raise NotImplementedError("type not supported", type)
+
+    def c_code_cache_version(self):
+        return (2,)
 
 
 betainc = BetaInc(upgrade_to_float_no_complex, name="betainc")
@@ -1646,6 +1746,43 @@ def betainc_grad(p, q, x, wrtp: bool):
         ),
     )
     return grad
+
+
+class BetaIncInv(ScalarOp):
+    """
+    Inverse of the regularized incomplete beta function.
+    """
+
+    nfunc_spec = ("scipy.special.betaincinv", 3, 1)
+
+    def impl(self, a, b, x):
+        return scipy.special.betaincinv(a, b, x)
+
+    def grad(self, inputs, grads):
+        (a, b, x) = inputs
+        (gz,) = grads
+        return [
+            grad_not_implemented(self, 0, a),
+            grad_not_implemented(self, 0, b),
+            gz
+            * exp(betaln(a, b))
+            * ((1 - betaincinv(a, b, x)) ** (1 - b))
+            * (betaincinv(a, b, x) ** (1 - a)),
+        ]
+
+    def c_code(self, *args, **kwargs):
+        raise NotImplementedError()
+
+
+betaincinv = BetaIncInv(upgrade_to_float_no_complex, name="betaincinv")
+
+
+def betaln(a, b):
+    """
+    Beta function from gamma function.
+    """
+
+    return gammaln(a) + gammaln(b) - gammaln(a + b)
 
 
 class Hyp2F1(ScalarOp):

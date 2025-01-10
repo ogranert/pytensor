@@ -5,7 +5,6 @@ import pytest
 
 import pytensor
 import pytensor.tensor as pt
-from pytensor.misc.safe_asarray import _asarray
 from pytensor.tensor.basic import AllocEmpty
 from pytensor.tensor.blas import Ger
 from pytensor.tensor.blas_c import CGemv, CGer, check_force_gemv_init
@@ -196,8 +195,8 @@ class TestCGemv(OptimizationTestMixin):
         if check_force_gemv_init():
             warn(
                 "WARNING: The current BLAS requires PyTensor to initialize"
-                + " memory for some GEMV calls which will result in a minor"
-                + " degradation in performance for such calls."
+                " memory for some GEMV calls which will result in a minor"
+                " degradation in performance for such calls."
             )
 
     def t_gemv1(self, m_shp):
@@ -249,8 +248,8 @@ class TestCGemv(OptimizationTestMixin):
         self.t_gemv1((0, 0))
 
     def test_gemv_dimensions(self, dtype="float32"):
-        alpha = pytensor.shared(_asarray(1.0, dtype=dtype), name="alpha")
-        beta = pytensor.shared(_asarray(1.0, dtype=dtype), name="beta")
+        alpha = pytensor.shared(np.asarray(1.0, dtype=dtype), name="alpha")
+        beta = pytensor.shared(np.asarray(1.0, dtype=dtype), name="beta")
 
         z = beta * self.y + alpha * pt.dot(self.A, self.x)
         f = pytensor.function([self.A, self.x, self.y], z, mode=self.mode)
@@ -388,7 +387,7 @@ class TestCGemvNoFlags:
         assert z_val.dtype == dtype
         assert z_val.ndim == 1
         assert z_val.shape[0] == self.M
-        ref_val = self.compute_ref(*(values + (transpose_A, slice_tensors)))
+        ref_val = self.compute_ref(*((*values, transpose_A, slice_tensors)))
         unittest_tools.assert_allclose(ref_val, z_val)
 
     def test_cgemv(self):

@@ -79,12 +79,10 @@ class StructOp(COp):
         return f"counter{name} = 0;"
 
     def c_code(self, node, name, input_names, outputs_names, sub):
-        return """
-%(out)s = counter%(name)s;
-counter%(name)s++;
-""" % dict(
-            out=outputs_names[0], name=name
-        )
+        return f"""
+{outputs_names[0]} = counter{name};
+counter{name}++;
+"""
 
     def c_code_cache_version(self):
         return (1,)
@@ -220,7 +218,6 @@ def test_ExternalCOp_c_code_cache_version():
     with tempfile.NamedTemporaryFile(dir=".", suffix=".py") as tmp:
         tmp.write(externalcop_test_code.encode())
         tmp.seek(0)
-        # modname = os.path.splitext(tmp.name)[0]
         modname = tmp.name
         out_1, err1, returncode1 = get_hash(modname, seed=428)
         out_2, err2, returncode2 = get_hash(modname, seed=3849)

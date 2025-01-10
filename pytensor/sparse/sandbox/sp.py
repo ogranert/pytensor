@@ -19,7 +19,6 @@ from pytensor.graph.op import Op
 from pytensor.tensor.math import dot
 from pytensor.tensor.math import max as pt_max
 from pytensor.tensor.shape import reshape
-from pytensor.tensor.subtensor import DimShuffle
 
 
 def register_specialize(lopt, *tags, **kwargs):
@@ -81,7 +80,7 @@ class ConvolutionIndices(Op):
         # inshp contains either 2 entries (height,width) or 3 (nfeatures,h,w)
         # in the first case, default nfeatures to 1
         if np.size(inshp) == 2:
-            inshp = (1,) + inshp
+            inshp = (1, *inshp)
 
         inshp = np.array(inshp)
         kshp = np.array(kshp)
@@ -158,7 +157,7 @@ class ConvolutionIndices(Op):
                     for ox in np.arange(lbound[1], ubound[1], dx, dtype=int):
                         # kern[l] is filter value to apply at (oj,oi)
                         # for (iy,ix)
-                        l = 0  # noqa: E741
+                        l = 0
 
                         # ... ITERATE OVER INPUT UNITS IN RECEPTIVE FIELD
                         for ky in oy + np.arange(kshp[0], dtype=int):
@@ -337,7 +336,7 @@ def convolve(
     # inshp contains either 2 entries (height,width) or 3 (nfeatures,h,w)
     # in the first case, default nfeatures to 1
     if np.size(imgshp) == 2:
-        imgshp = (1,) + imgshp
+        imgshp = (1, *imgshp)
 
     # construct indices and index pointers for sparse matrix, which,
     # when multiplied with input images will generate a stack of image
@@ -375,7 +374,7 @@ def convolve(
         [images.shape[0], pt.as_tensor(np.prod(outshp)), pt.as_tensor(nkern)]
     )
     tensout = reshape(output, newshp, ndim=3)
-    output = DimShuffle((False,) * tensout.ndim, (0, 2, 1))(tensout)
+    output = tensout.transpose(0, 2, 1)
     if flatten:
         output = pt.flatten(output, 2)
 
@@ -403,7 +402,7 @@ def max_pool(images, imgshp, maxpoolshp):
     # imgshp contains either 2 entries (height,width) or 3 (nfeatures,h,w)
     # in the first case, default nfeatures to 1
     if np.size(imgshp) == 2:
-        imgshp = (1,) + imgshp
+        imgshp = (1, *imgshp)
 
     # construct indices and index pointers for sparse matrix, which,
     # when multiplied with input images will generate a stack of image
@@ -443,6 +442,6 @@ def max_pool(images, imgshp, maxpoolshp):
     )
     out2 = reshape(out1, pshape, ndim=3)
 
-    out3 = DimShuffle(out2.broadcastable, (0, 2, 1))(out2)
+    out3 = out2.transpose(0, 2, 1)
 
     return pt.flatten(out3, 2), outshp

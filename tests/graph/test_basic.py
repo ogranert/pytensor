@@ -6,6 +6,7 @@ import pytest
 
 from pytensor import shared
 from pytensor import tensor as pt
+from pytensor.compile import UnusedInputError
 from pytensor.graph.basic import (
     Apply,
     NominalVariable,
@@ -17,11 +18,11 @@ from pytensor.graph.basic import (
     clone,
     clone_get_equiv,
     equal_computations,
+    explicit_graph_inputs,
     general_toposort,
     get_var_by_name,
     graph_inputs,
     io_toposort,
-    list_of_nodes,
     orphans_between,
     truncated_graph_inputs,
     variable_depends_on,
@@ -30,11 +31,13 @@ from pytensor.graph.basic import (
 )
 from pytensor.graph.op import Op
 from pytensor.graph.type import Type
+from pytensor.printing import debugprint
+from pytensor.tensor import constant
 from pytensor.tensor.math import max_and_argmax
 from pytensor.tensor.type import TensorType, iscalars, matrix, scalars, vector
 from pytensor.tensor.type_other import NoneConst
 from pytensor.tensor.variable import TensorVariable
-from tests.graph.utils import MyInnerGraphOp
+from tests.graph.utils import MyInnerGraphOp, op_multiple_outputs
 
 
 class MyType(Type):
@@ -287,6 +290,45 @@ class TestToposort:
         all = io_toposort([], o0.outputs)
         assert all == [o0]
 
+    def test_multi_output_nodes(self):
+        l0, r0 = op_multiple_outputs(shared(0.0))
+        l1, r1 = op_multiple_outputs(shared(0.0))
+
+        v0 = r0 + 1
+        v1 = pt.exp(v0)
+        out = r1 * v1
+
+        # When either r0 or r1 is provided as an input, the respective node shouldn't be part of the toposort
+        assert set(io_toposort([], [out])) == {
+            r0.owner,
+            r1.owner,
+            v0.owner,
+            v1.owner,
+            out.owner,
+        }
+        assert set(io_toposort([r0], [out])) == {
+            r1.owner,
+            v0.owner,
+            v1.owner,
+            out.owner,
+        }
+        assert set(io_toposort([r1], [out])) == {
+            r0.owner,
+            v0.owner,
+            v1.owner,
+            out.owner,
+        }
+        assert set(io_toposort([r0, r1], [out])) == {v0.owner, v1.owner, out.owner}
+
+        # When l0 and/or l1 are provided, we still need to compute the respective nodes
+        assert set(io_toposort([l0, l1], [out])) == {
+            r0.owner,
+            r1.owner,
+            v0.owner,
+            v1.owner,
+            out.owner,
+        }
+
 
 class TestEval:
     def setup_method(self):
@@ -319,6 +361,28 @@ class TestEval:
         t.name = "p"
         with pytest.raises(Exception, match="o not found in graph"):
             t.eval({"o": 1})
+
+    def test_eval_kwargs(self):
+        with pytest.raises(UnusedInputError):
+            self.w.eval({self.z: 3, self.x: 2.5})
+        assert self.w.eval({self.z: 3, self.x: 2.5}, on_unused_input="ignore") == 6.0
+
+        # regression test for https://github.com/pymc-devs/pytensor/issues/1084
+        q = self.x + 1
+        assert q.eval({"x": 1, "y": 2}, on_unused_input="ignore") == 2.0
+
+    @pytest.mark.filterwarnings("error")
+    def test_eval_unashable_kwargs(self):
+        y_repl = constant(2.0, dtype="floatX")
+
+        assert self.w.eval({self.x: 1.0}, givens=((self.y, y_repl),)) == 6.0
+
+        with pytest.warns(
+            UserWarning,
+            match="Keyword arguments could not be used to create a cache key",
+        ):
+            # givens dict is not hashable
+            assert self.w.eval({self.x: 1.0}, givens={self.y: y_repl}) == 6.0
 
 
 class TestAutoName:
@@ -462,6 +526,20 @@ def test_graph_inputs():
     assert res_list == [r3, r1, r2]
 
 
+def test_explicit_graph_inputs():
+    x = pt.fscalar()
+    y = pt.constant(2)
+    z = shared(1)
+    a = pt.sum(x + y + z)
+    b = pt.true_div(x, y)
+
+    res = list(explicit_graph_inputs([a]))
+    res1 = list(explicit_graph_inputs(b))
+
+    assert res == [x]
+    assert res1 == [x]
+
+
 def test_variables_and_orphans():
     r1, r2, r3 = MyVariable(1), MyVariable(2), MyVariable(3)
     o1 = MyOp(r1, r2)
@@ -490,17 +568,6 @@ def test_ops():
     res = applys_between([r1, r2], [o3])
     res_list = list(res)
     assert res_list == [o3.owner, o2.owner, o1.owner]
-
-
-def test_list_of_nodes():
-    r1, r2, r3 = MyVariable(1), MyVariable(2), MyVariable(3)
-    o1 = MyOp(r1, r2)
-    o1.name = "o1"
-    o2 = MyOp(r3, o1)
-    o2.name = "o2"
-
-    res = list_of_nodes([r1, r2], [o2])
-    assert res == [o2.owner, o1.owner]
 
 
 def test_apply_depends_on():
@@ -644,7 +711,7 @@ def test_NominalVariable():
     assert not nv4.equals(nv5)
     assert hash(nv4) != hash(nv5)
 
-    assert repr(nv5) == f"NominalVariable(2, {repr(type3)})"
+    assert repr(nv5) == f"NominalVariable(2, {type3!r})"
 
     assert nv5.signature() == (type3, 2)
 
@@ -810,3 +877,10 @@ class TestTruncatedGraphInputs:
         assert len(inspect.call_args_list) == len(
             {a for ((a, b), kw) in inspect.call_args_list}
         )
+
+
+def test_dprint():
+    r1, r2 = MyVariable(1), MyVariable(2)
+    o1 = MyOp(r1, r2)
+    assert o1.dprint(file="str") == debugprint(o1, file="str")
+    assert o1.owner.dprint(file="str") == debugprint(o1.owner, file="str")

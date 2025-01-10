@@ -3,7 +3,7 @@ import traceback as tb
 import warnings
 from collections.abc import Iterable
 from numbers import Number
-from typing import Optional, TypeVar
+from typing import TypeVar
 
 import numpy as np
 
@@ -232,6 +232,10 @@ class _tensor_py_operators:
     def T(self):
         return pt.basic.transpose(self)
 
+    @property
+    def mT(self):
+        return pt.basic.matrix_transpose(self)
+
     def transpose(self, *axes):
         """Transpose this array.
 
@@ -338,10 +342,10 @@ class _tensor_py_operators:
         DimShuffle
 
         """
-        if (len(pattern) == 1) and (isinstance(pattern[0], (list, tuple))):
+        if (len(pattern) == 1) and (isinstance(pattern[0], list | tuple)):
             pattern = pattern[0]
-        op = pt.elemwise.DimShuffle(list(self.type.broadcastable), pattern)
-        return op(self)
+        ds_op = pt.elemwise.DimShuffle(input_ndim=self.type.ndim, new_order=pattern)
+        return ds_op(self)
 
     def flatten(self, ndim=1):
         return pt.basic.flatten(self, ndim)
@@ -445,7 +449,7 @@ class _tensor_py_operators:
 
     def __getitem__(self, args):
         def includes_bool(args_el):
-            if isinstance(args_el, (np.bool_, bool)) or (
+            if isinstance(args_el, np.bool_ | bool) or (
                 hasattr(args_el, "dtype") and args_el.dtype == "bool"
             ):
                 return True
@@ -471,7 +475,7 @@ class _tensor_py_operators:
                 # no increase in index_dim_count
                 ellipses.append(i)
             elif (
-                isinstance(arg, (np.ndarray, Variable))
+                isinstance(arg, np.ndarray | Variable)
                 and hasattr(arg, "dtype")
                 and arg.dtype == "bool"
             ):
@@ -509,7 +513,7 @@ class _tensor_py_operators:
             )
 
         def is_empty_array(val):
-            return (isinstance(val, (tuple, list)) and len(val) == 0) or (
+            return (isinstance(val, tuple | list) and len(val) == 0) or (
                 isinstance(val, np.ndarray) and val.size == 0
             )
 
@@ -517,12 +521,10 @@ class _tensor_py_operators:
         # Else leave it as is if it is a real number
         # Convert python literals to pytensor constants
         args = tuple(
-            [
-                pt.subtensor.as_index_constant(
-                    np.array(inp, dtype=np.uint8) if is_empty_array(inp) else inp
-                )
-                for inp in args
-            ]
+            pt.subtensor.as_index_constant(
+                np.array(inp, dtype=np.uint8) if is_empty_array(inp) else inp
+            )
+            for inp in args
         )
 
         # Determine if advanced indexing is needed or not.  The logic is
@@ -596,7 +598,7 @@ class _tensor_py_operators:
 
     def __setitem__(self, key, value):
         raise TypeError(
-            "TensorVariable does not support item assignment. Use the output of `set` or `add` instead."
+            "TensorVariable does not support item assignment. Use the output of `x[idx].set` or `x[idx].inc` instead."
         )
 
     def take(self, indices, axis=None, mode="raise"):
@@ -820,25 +822,36 @@ class _tensor_py_operators:
         """Return selected slices only."""
         return pt.extra_ops.compress(self, a, axis=axis)
 
-    def set(self, idx, y, **kwargs):
-        """Return a copy of self with the indexed values set to y.
+    def set(self, y, **kwargs):
+        """Return a copy of the variable indexed by self with the indexed values set to y.
 
-        Equivalent to set_subtensor(self[idx], y). See docstrings for kwargs.
+        Equivalent to set_subtensor(self, y). See docstrings for kwargs.
+
+        Raises
+        ------
+        TypeError:
+            If self is not the result of a subtensor operation
 
         Examples
         --------
         >>> import pytensor.tensor as pt
         >>>
         >>> x = pt.ones((3,))
-        >>> out = x.set(1, 2)
-        >>> out.eval()  # array([1., 2., 1.])
+        >>> out = x[1].set(2)
+        >>> out.eval()
+        array([1., 2., 1.])
         """
-        return pt.subtensor.set_subtensor(self[idx], y, **kwargs)
+        return pt.subtensor.set_subtensor(self, y, **kwargs)
 
-    def inc(self, idx, y, **kwargs):
-        """Return a copy of self with the indexed values incremented by y.
+    def inc(self, y, **kwargs):
+        """Return a copy of the variable indexed by self with the indexed values incremented by y.
 
-        Equivalent to inc_subtensor(self[idx], y). See docstrings for kwargs.
+        Equivalent to inc_subtensor(self, y). See docstrings for kwargs.
+
+        Raises
+        ------
+        TypeError:
+            If self is not the result of a subtensor operation
 
         Examples
         --------
@@ -846,10 +859,11 @@ class _tensor_py_operators:
         >>> import pytensor.tensor as pt
         >>>
         >>> x = pt.ones((3,))
-        >>> out = x.inc(1, 2)
-        >>> out.eval()  # array([1., 3., 1.])
+        >>> out = x[1].inc(2)
+        >>> out.eval()
+        array([1., 3., 1.])
         """
-        return pt.inc_subtensor(self[idx], y, **kwargs)
+        return pt.inc_subtensor(self, y, **kwargs)
 
 
 class TensorVariable(
@@ -931,7 +945,7 @@ class TensorConstantSignature(tuple):
     """
 
     def __eq__(self, other):
-        if type(self) != type(other):
+        if type(self) is not type(other):
             return False
         try:
             (t0, d0), (t1, d1) = self, other
@@ -1026,16 +1040,18 @@ class TensorConstantSignature(tuple):
         return self._no_nan
 
 
-def get_unique_constant_value(x: TensorVariable) -> Optional[Number]:
+def get_unique_constant_value(x: TensorVariable) -> Number | None:
     """Return the unique value of a tensor, if there is one"""
     if isinstance(x, Constant):
         data = x.data
 
-        if isinstance(data, np.ndarray) and data.ndim > 0:
+        if isinstance(data, np.ndarray) and data.size > 0:
+            if data.size == 1:
+                return data.squeeze()
+
             flat_data = data.ravel()
-            if flat_data.shape[0]:
-                if (flat_data == flat_data[0]).all():
-                    return flat_data[0]
+            if (flat_data == flat_data[0]).all():
+                return flat_data[0]
 
     return None
 
@@ -1047,7 +1063,9 @@ class TensorConstant(TensorVariable, Constant[_TensorTypeType]):
         data_shape = np.shape(data)
 
         if len(data_shape) != type.ndim or any(
-            ds != ts for ds, ts in zip(np.shape(data), type.shape) if ts is not None
+            ds != ts
+            for ds, ts in zip(np.shape(data), type.shape, strict=True)
+            if ts is not None
         ):
             raise ValueError(
                 f"Shape of data ({data_shape}) does not match shape of type ({type.shape})"
@@ -1066,7 +1084,7 @@ class TensorConstant(TensorVariable, Constant[_TensorTypeType]):
     def equals(self, other):
         # Override Constant.equals to allow to compare with
         # numpy.ndarray, and python type.
-        if isinstance(other, (np.ndarray, int, float)):
+        if isinstance(other, np.ndarray | int | float):
             # Make a TensorConstant to be able to compare
             other = pt.basic.constant(other)
         return (
@@ -1091,7 +1109,7 @@ TensorType.constant_type = TensorConstant
 
 class DenseVariableMeta(MetaType):
     def __instancecheck__(self, o):
-        if type(o) == TensorVariable or isinstance(o, DenseVariableMeta):
+        if type(o) is TensorVariable or isinstance(o, DenseVariableMeta):
             return True
         return False
 
@@ -1106,7 +1124,7 @@ class DenseTensorVariable(TensorType, metaclass=DenseVariableMeta):
 
 class DenseConstantMeta(MetaType):
     def __instancecheck__(self, o):
-        if type(o) == TensorConstant or isinstance(o, DenseConstantMeta):
+        if type(o) is TensorConstant or isinstance(o, DenseConstantMeta):
             return True
         return False
 

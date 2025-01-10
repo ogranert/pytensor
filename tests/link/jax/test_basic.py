@@ -1,20 +1,22 @@
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from functools import partial
-from typing import Callable, Optional
 
 import numpy as np
 import pytest
 
+from pytensor.compile.builders import OpFromGraph
 from pytensor.compile.function import function
-from pytensor.compile.mode import get_mode
+from pytensor.compile.mode import JAX, Mode
 from pytensor.compile.sharedvalue import SharedVariable, shared
 from pytensor.configdefaults import config
+from pytensor.graph import RewriteDatabaseQuery
 from pytensor.graph.basic import Apply
 from pytensor.graph.fg import FunctionGraph
 from pytensor.graph.op import Op, get_test_value
 from pytensor.ifelse import ifelse
+from pytensor.link.jax import JAXLinker
 from pytensor.raise_op import assert_op
-from pytensor.tensor.type import dscalar, scalar, vector
+from pytensor.tensor.type import dscalar, matrices, scalar, vector
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -26,15 +28,15 @@ def set_pytensor_flags():
 jax = pytest.importorskip("jax")
 
 
-# We assume that the JAX mode includes all the rewrites needed to transpile JAX graphs
-jax_mode = get_mode("JAX")
-py_mode = get_mode("FAST_COMPILE")
+optimizer = RewriteDatabaseQuery(include=["jax"], exclude=JAX._optimizer.exclude)
+jax_mode = Mode(linker=JAXLinker(), optimizer=optimizer)
+py_mode = Mode(linker="py", optimizer=None)
 
 
 def compare_jax_and_py(
     fgraph: FunctionGraph,
     test_inputs: Iterable,
-    assert_fn: Optional[Callable] = None,
+    assert_fn: Callable | None = None,
     must_be_device_array: bool = True,
     jax_mode=jax_mode,
     py_mode=py_mode,
@@ -74,13 +76,13 @@ def compare_jax_and_py(
         if isinstance(jax_res, list):
             assert all(isinstance(res, jax.Array) for res in jax_res)
         else:
-            assert isinstance(jax_res, jax.interpreters.xla.DeviceArray)
+            assert isinstance(jax_res, jax.Array)
 
     pytensor_py_fn = function(fn_inputs, fgraph.outputs, mode=py_mode)
     py_res = pytensor_py_fn(*test_inputs)
 
     if len(fgraph.outputs) > 1:
-        for j, p in zip(jax_res, py_res):
+        for j, p in zip(jax_res, py_res, strict=True):
             assert_fn(j, p)
     else:
         assert_fn(jax_res, py_res)
@@ -210,3 +212,19 @@ def test_jax_checkandraise():
 def set_test_value(x, v):
     x.tag.test_value = v
     return x
+
+
+def test_OpFromGraph():
+    x, y, z = matrices("xyz")
+    ofg_1 = OpFromGraph([x, y], [x + y], inline=False)
+    ofg_2 = OpFromGraph([x, y], [x * y, x - y], inline=False)
+
+    o1, o2 = ofg_2(y, z)
+    out = ofg_1(x, o1) + o2
+    out_fg = FunctionGraph([x, y, z], [out])
+
+    xv = np.ones((2, 2), dtype=config.floatX)
+    yv = np.ones((2, 2), dtype=config.floatX) * 3
+    zv = np.ones((2, 2), dtype=config.floatX) * 5
+
+    compare_jax_and_py(out_fg, [xv, yv, zv])

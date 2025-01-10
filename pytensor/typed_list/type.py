@@ -55,7 +55,7 @@ class TypedListType(CType):
         Two lists are equal if they contain the same type.
 
         """
-        return type(self) == type(other) and self.ttype == other.ttype
+        return type(self) is type(other) and self.ttype == other.ttype
 
     def __hash__(self):
         return hash((type(self), self.ttype))
@@ -110,31 +110,27 @@ class TypedListType(CType):
 
     def c_extract(self, name, sub, check_input=True, **kwargs):
         if check_input:
-            pre = """
-            if (!PyList_Check(py_%(name)s)) {
+            fail = sub["fail"]
+            pre = f"""
+            if (!PyList_Check(py_{name})) {{
                 PyErr_SetString(PyExc_TypeError, "expected a list");
-                %(fail)s
-            }""" % dict(
-                name=name, fail=sub["fail"]
-            )
+                {fail}
+            }}"""
         else:
             pre = ""
         return (
             pre
-            + """
-        %(name)s = (PyListObject*) (py_%(name)s);
+            + f"""
+        {name} = (PyListObject*) (py_{name});
         """
-            % dict(name=name, fail=sub["fail"])
         )
 
     def c_sync(self, name, sub):
-        return """
-        Py_XDECREF(py_%(name)s);
-        py_%(name)s = (PyObject*)(%(name)s);
-        Py_INCREF(py_%(name)s);
-        """ % dict(
-            name=name
-        )
+        return f"""
+        Py_XDECREF(py_{name});
+        py_{name} = (PyObject*)({name});
+        Py_INCREF(py_{name});
+        """
 
     def c_cleanup(self, name, sub):
         return ""

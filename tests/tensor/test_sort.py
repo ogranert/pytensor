@@ -1,21 +1,8 @@
-from functools import reduce
-from itertools import chain, product
-
 import numpy as np
 import pytest
 
 import pytensor
-from pytensor.compile.mode import Mode
-from pytensor.tensor.sort import (
-    ArgSortOp,
-    SortOp,
-    TopKOp,
-    argsort,
-    argtopk,
-    sort,
-    topk,
-    topk_and_argtopk,
-)
+from pytensor.tensor.sort import ArgSortOp, SortOp, argsort, sort
 from pytensor.tensor.type import (
     dmatrix,
     dvector,
@@ -24,8 +11,6 @@ from pytensor.tensor.type import (
     lscalar,
     matrix,
     scalar,
-    tensor,
-    vector,
 )
 from tests import unittest_tools as utt
 
@@ -81,13 +66,12 @@ class TestSort:
             utt.assert_allclose(gv, gt)
 
     def test5(self):
-        a1 = SortOp("mergesort", [])
-        a2 = SortOp("quicksort", [])
+        a1 = SortOp("mergesort")
+        a2 = SortOp("quicksort")
 
-        # All the below should give true
         assert a1 != a2
-        assert a1 == SortOp("mergesort", [])
-        assert a2 == SortOp("quicksort", [])
+        assert a1 == SortOp("mergesort")
+        assert a2 == SortOp("quicksort")
 
     def test_None(self):
         a = dmatrix()
@@ -224,14 +208,11 @@ def test_argsort():
         utt.assert_allclose(gv, gt)
 
     # Example 5
-    a = dmatrix()
-    axis = lscalar()
-    a1 = ArgSortOp("mergesort", [])
-    a2 = ArgSortOp("quicksort", [])
-    # All the below should give true
+    a1 = ArgSortOp("mergesort")
+    a2 = ArgSortOp("quicksort")
     assert a1 != a2
-    assert a1 == ArgSortOp("mergesort", [])
-    assert a2 == ArgSortOp("quicksort", [])
+    assert a1 == ArgSortOp("mergesort")
+    assert a2 == ArgSortOp("quicksort")
 
     # Example 6: Testing axis=None
     a = dmatrix()
@@ -255,270 +236,20 @@ def test_argsort_grad():
     utt.verify_grad(lambda x: argsort(x, axis=2), [data])
 
 
-class TestTopK:
-    mode = None
-    op_class = TopKOp
+@pytest.mark.parametrize("func", (sort, argsort))
+def test_parse_sort_args(func):
+    x = matrix("x")
 
-    def setup_method(self):
-        pass
+    assert func(x).owner.op.kind == "quicksort"
+    assert func(x, stable=True).owner.op.kind == "stable"
 
-    @pytest.mark.parametrize("dtype", _all_dtypes)
-    @pytest.mark.parametrize("idx_dtype", integer_dtypes)
-    @pytest.mark.parametrize("axis", [-1, 0, None])
-    @pytest.mark.parametrize("sorted", [False])
-    def test_argtopk_sanity(self, dtype, idx_dtype, axis, sorted):
-        x = vector(name="x", dtype=dtype)
-        fn = pytensor.function(
-            [x],
-            argtopk(x, 1, axis=axis, sorted=sorted, idx_dtype=idx_dtype),
-            mode=self.mode,
-        )
-        assert any(isinstance(n.op, self.op_class) for n in fn.maker.fgraph.apply_nodes)
-        xval = np.asarray([1]).astype(dtype)
-        yval = fn(xval)
-        assert yval == np.asarray([0], dtype=idx_dtype)
-        assert yval.dtype == np.dtype(idx_dtype)
+    with pytest.raises(ValueError, match="kind must be one of"):
+        func(x, kind="hanoi")
 
-    @pytest.mark.parametrize("dtype", _all_dtypes)
-    @pytest.mark.parametrize("axis", [-1, 0, None])
-    @pytest.mark.parametrize("sorted", [False])
-    def test_topk_sanity(self, dtype, axis, sorted):
-        x = vector(name="x", dtype=dtype)
-        fn = pytensor.function(
-            [x], topk(x, 1, axis=axis, sorted=sorted), mode=self.mode
-        )
-        assert any(isinstance(n.op, self.op_class) for n in fn.maker.fgraph.apply_nodes)
-        xval = np.asarray([1]).astype(dtype)
-        yval = fn(xval)
-        assert yval == xval
-        assert yval.dtype == xval.dtype
+    with pytest.raises(
+        ValueError, match="kind and stable cannot be set at the same time"
+    ):
+        func(x, kind="quicksort", stable=True)
 
-    @pytest.mark.parametrize("dtype", _all_dtypes)
-    @pytest.mark.parametrize("idx_dtype", integer_dtypes)
-    @pytest.mark.parametrize("axis", [-1, 0, None])
-    @pytest.mark.parametrize("sorted", [False])
-    def test_combined_sanity(self, dtype, idx_dtype, axis, sorted):
-        x = vector(name="x", dtype=dtype)
-        yv, yi = topk_and_argtopk(x, 1, axis=axis, sorted=sorted, idx_dtype=idx_dtype)
-        fn = pytensor.function([x], [yv, yi], mode=self.mode)
-        assert any(isinstance(n.op, self.op_class) for n in fn.maker.fgraph.apply_nodes)
-        xval = np.asarray([1]).astype(dtype)
-        yvval, yival = fn(xval)
-        assert yival == np.asarray([0], dtype=idx_dtype)
-        utt.assert_allclose(xval, yvval)
-        assert yvval.dtype == xval.dtype
-        assert yival.dtype == np.dtype(idx_dtype)
-
-    @pytest.mark.parametrize(
-        "size, k, dtype, sorted",
-        chain(
-            product(
-                (16, 61, 257),
-                (1, -1, -10, "n//2", "n-1", "-n", "1-n"),
-                ("float64", "float16", "int16", "int8"),
-                (False,),
-            ),
-            ((2049, 1337, "float64", False),),
-        ),
-    )
-    def test_topk_1d(self, size, k, dtype, sorted):
-        if isinstance(k, str):
-            k = eval(k.replace("n", str(size)))
-
-        x = vector(name="x", dtype=dtype)
-        y = topk(x, k, sorted=sorted)
-        fn = pytensor.function([x], y, mode=self.mode)
-        assert any(isinstance(n.op, self.op_class) for n in fn.maker.fgraph.apply_nodes)
-        # assert local_useless_topk opt is done properly
-        assert 1 == len(fn.maker.fgraph.outputs[0].owner.outputs)
-
-        # generate a all-unique array
-        xval = gen_unique_vector(size, dtype)
-        yval = fn(xval)
-        idx = slice(-k, None) if k > 0 else slice(-k)
-        goal = np.sort(xval)[idx]
-
-        assert yval.dtype == goal.dtype
-        utt.assert_allclose(goal, np.sort(yval))
-
-    @pytest.mark.parametrize(
-        "size, k, dtype, sorted, idx_dtype",
-        chain(
-            product(
-                (16, 61, 257),
-                (1, -1, -10, "n//2", "n-1", "-n"),
-                ("float32", "int32"),
-                (False,),
-                ("int32", "int64"),
-            ),
-            ((2049, 1337, "float32", False, "int32"),),
-        ),
-    )
-    def test_argtopk_1d(self, size, k, dtype, sorted, idx_dtype):
-        if isinstance(k, str):
-            k = eval(k.replace("n", str(size)))
-
-        x = vector(name="x", dtype=dtype)
-        y = argtopk(x, k, sorted=sorted, idx_dtype=idx_dtype)
-        fn = pytensor.function([x], y, mode=self.mode)
-        assert any(isinstance(n.op, self.op_class) for n in fn.maker.fgraph.apply_nodes)
-
-        # assert local_useless_topk opt is done properly
-        assert 1 == len(fn.maker.fgraph.outputs[0].owner.outputs)
-
-        # generate a all-unique array
-        xval = gen_unique_vector(size, dtype)
-        yval = fn(xval)
-        idx = slice(-k, None) if k > 0 else slice(-k)
-        goal = np.argsort(xval)[idx].astype(idx_dtype)
-
-        # due to uniqueness, we expect indices same
-        assert np.all(xval[np.sort(yval)] == xval[np.sort(goal)])
-
-    @pytest.mark.parametrize(
-        "size, k, dtype, sorted, idx_dtype",
-        chain(
-            product(
-                (16, 61, 257),
-                (1, -1, 10, "n//2", "n-1", "1-n"),
-                ("float32", "int32"),
-                (False,),
-                ("int32", "int64"),
-            ),
-            ((2049, 1337, "float32", False, "int32"),),
-        ),
-    )
-    def test_combined_1d(self, size, k, dtype, sorted, idx_dtype):
-        if isinstance(k, str):
-            k = eval(k.replace("n", str(size)))
-
-        x = vector(name="x", dtype=dtype)
-        yv, yi = topk_and_argtopk(x, k, sorted=sorted, idx_dtype=idx_dtype)
-        fn = pytensor.function([x], [yv, yi], mode=self.mode)
-        assert any(isinstance(n.op, self.op_class) for n in fn.maker.fgraph.apply_nodes)
-        # generate a all-unique array
-        xval = gen_unique_vector(size, dtype)
-        yvval, yival = fn(xval)
-        idx = slice(-k, None) if k > 0 else slice(-k)
-        goali = np.argsort(xval)[idx].astype(idx_dtype)
-        goalv = xval[goali]
-
-        # due to uniqueness, we expect indices same
-        assert np.all(xval[np.sort(yival)] == xval[np.sort(goali)])
-        utt.assert_allclose(np.sort(yvval), goalv)
-
-    @pytest.mark.parametrize(
-        "size, k, dtype, sorted",
-        chain(
-            product((18, 62, 258), (1, -1, "n//2"), ("int32", "float32"), (False,)),
-            ((2048, 1337, "float32", False),),
-        ),
-    )
-    def test_argtopk_1d_collision(self, size, k, dtype, sorted):
-        # with non-unique kth max value
-        if isinstance(k, str):
-            k = eval(k.replace("n", str(size)))
-
-        x = vector(name="x", dtype=dtype)
-        y = argtopk(x, k, sorted=sorted, idx_dtype="int32")
-        # DebugMode won't like the index change on collision on CPU
-        # So don't use DebugMode here.
-        mode = self.mode
-        if isinstance(self.mode, pytensor.compile.debugmode.DebugMode):
-            mode = Mode(optimizer=mode.optimizer)
-        fn = pytensor.function([x], y, mode=mode)
-        assert any(isinstance(n.op, self.op_class) for n in fn.maker.fgraph.apply_nodes)
-        rng = np.random.default_rng(utt.fetch_seed())
-        xval = np.repeat(rng.uniform(-100.0, 100.0, size=size // 2).astype(dtype), 2)
-        xval = xval[rng.permutation(size)]
-        yval = fn(xval)
-        idx = slice(-k, None) if k > 0 else slice(-k)
-        goal = np.argsort(xval)[idx].astype("int32")
-        utt.assert_allclose(np.sort(xval[yval]), np.sort(xval[goal]))
-
-    @pytest.mark.parametrize(
-        "shp, k_, dtype, sorted, idx_dtype",
-        product(
-            (
-                (17, 15),
-                (2, 3, 5, 7, 11),
-                (500, 5, 3),
-            ),  # NB: Test may fail with bigger sizes (e.g. (2017, 5, 3)) due to "too many resources requested" kernel error on some GPUs.
-            (-1, "(1+n)//2", "-n", "1-n"),
-            ("float32", "int32"),
-            (False,),
-            ("int32", "int64"),
-        ),
-    )
-    def test_argtopk_nd(self, shp, k_, dtype, sorted, idx_dtype):
-        ndim = len(shp)
-        for axis in range(-ndim, ndim):
-            if isinstance(k_, str):
-                k = eval(k_.replace("n", str(shp[axis])))
-            else:
-                k = k_
-
-            if k == 0:
-                continue
-
-            x = tensor(name="x", shape=(None,) * len(shp), dtype=dtype)
-            y = argtopk(x, k, axis=axis, sorted=sorted, idx_dtype=idx_dtype)
-            fn = pytensor.function([x], y, mode=self.mode)
-            assert any(
-                isinstance(n.op, self.op_class) for n in fn.maker.fgraph.apply_nodes
-            )
-            size = reduce(int.__mul__, shp)
-            xval = gen_unique_vector(size, dtype).reshape(shp)
-            yval = fn(xval)
-            idx = slice(-k, None) if k > 0 else slice(-k)
-            l = axis % ndim
-            r = ndim - l
-            idx = (slice(None),) * l + (idx,) + (slice(None),) * (r - 1)
-            goal = np.argsort(xval, axis=axis)[idx].astype(idx_dtype)
-
-            assert np.all(np.sort(yval, axis=axis) == np.sort(goal, axis=axis))
-
-    @pytest.mark.parametrize("shp", ((257,), (17, 15), (5, 3, 5, 3), (2, 3, 5, 7, 11)))
-    @pytest.mark.parametrize("k_", (1, -1, "(1+n)//2", "n-1", "-n", "1-n"))
-    @pytest.mark.parametrize("sorted", [False])
-    def test_grad(self, shp, k_, sorted):
-        ndim = len(shp)
-        for axis in range(-ndim, ndim):
-            if isinstance(k_, str):
-                k = eval(k_.replace("n", str(shp[axis])))
-            else:
-                k = k_
-
-            if k == 0:
-                continue
-
-            # make input away from undefined gradient (where some inputs are equal)
-            xval = gen_unique_vector(
-                reduce(int.__mul__, shp), dtype=pytensor.config.floatX
-            ).reshape(shp)
-            utt.verify_grad(
-                lambda x: topk(x, k, axis=axis, sorted=sorted), [xval], eps=1e-2
-            )
-
-
-class TestTopKInferShape(utt.InferShapeTester):
-    @pytest.mark.parametrize(
-        "shp", ((2, 3), (15, 17), (11, 7, 5), (2, 3, 5, 7, 11), (2, 4, 3, 1))
-    )
-    @pytest.mark.parametrize("k_", (1, "(1+n)//2", "n-1", "n"))
-    def test_combined_infer_shape(self, shp, k_):
-        ndim = len(shp)
-        for axis in range(-ndim, ndim):
-            if isinstance(k_, str):
-                k = eval(k_.replace("n", str(shp[axis])))
-            else:
-                k = k_
-
-            if k == 0:
-                continue
-
-            x = tensor(name="x", shape=(None,) * len(shp), dtype=pytensor.config.floatX)
-            yv, yi = topk_and_argtopk(x, k, axis=axis, sorted=False, idx_dtype="int32")
-            size = reduce(int.__mul__, shp)
-            xval = gen_unique_vector(size, pytensor.config.floatX).reshape(shp)
-            self._compile_and_check([x], [yv, yi], [xval], TopKOp)
+    with pytest.raises(ValueError, match="order argument is not applicable"):
+        func(x, order=[])

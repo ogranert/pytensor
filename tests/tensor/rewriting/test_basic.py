@@ -6,19 +6,21 @@ import pytest
 import pytensor
 import pytensor.scalar as ps
 import pytensor.tensor as pt
-from pytensor import shared
+from pytensor import graph_replace, shared
 from pytensor.compile import optdb
 from pytensor.compile.function import function
 from pytensor.compile.mode import get_default_mode, get_mode
 from pytensor.compile.ops import DeepCopyOp, deep_copy_op
 from pytensor.configdefaults import config
-from pytensor.graph.basic import equal_computations, vars_between
+from pytensor.graph import Op
+from pytensor.graph.basic import Constant, equal_computations
 from pytensor.graph.fg import FunctionGraph
 from pytensor.graph.rewriting.basic import check_stack_trace, out2in
 from pytensor.graph.rewriting.db import RewriteDatabaseQuery
 from pytensor.graph.rewriting.utils import rewrite_graph
 from pytensor.printing import debugprint, pprint
 from pytensor.raise_op import Assert, CheckAndRaise
+from pytensor.scalar import Composite, float64
 from pytensor.tensor.basic import (
     Alloc,
     Join,
@@ -26,12 +28,14 @@ from pytensor.tensor.basic import (
     ScalarFromTensor,
     Split,
     TensorFromScalar,
+    as_tensor,
+    cast,
+    constant,
     join,
     tile,
 )
 from pytensor.tensor.elemwise import DimShuffle, Elemwise
 from pytensor.tensor.math import (
-    Sum,
     add,
     bitwise_and,
     bitwise_or,
@@ -50,17 +54,22 @@ from pytensor.tensor.math import (
     minimum,
     mul,
     neq,
+    softplus,
+    sqrt,
+    sub,
+    true_div,
 )
 from pytensor.tensor.math import pow as pt_pow
-from pytensor.tensor.math import softplus, sqrt, sub
 from pytensor.tensor.math import sum as pt_sum
-from pytensor.tensor.math import true_div
 from pytensor.tensor.rewriting.basic import (
     assert_op,
     local_alloc_sink_dimshuffle,
     local_merge_alloc,
     local_useless_alloc,
     local_useless_elemwise,
+    topo_constant_folding,
+    topo_unconditional_constant_folding,
+    topological_fill_sink,
 )
 from pytensor.tensor.rewriting.math import local_lift_transpose_through_dot
 from pytensor.tensor.rewriting.shape import ShapeFeature
@@ -737,56 +746,92 @@ class TestCastCast:
         ) or (len(topo) > 1)
 
 
-def test_constant_folding():
-    # Test that constant folding get registered at fast_compile
-    # An error removed that registration during the registration.
-    x = dvector()
-    mode = get_mode("FAST_COMPILE").excluding("fusion")
-    f = function([x], [x * 2, x + x], mode=mode)
-    topo = f.maker.fgraph.toposort()
-    assert len(topo) == 2
+class TestConstantFolding:
+    def test_constant_folding(self):
+        # Test that constant folding get registered at fast_compile
+        # An error removed that registration during the registration.
+        x = dvector()
+        mode = get_mode("FAST_COMPILE").excluding("fusion")
+        f = function([x], [x * 2, x + x], mode=mode)
+        topo = f.maker.fgraph.toposort()
+        assert len(topo) == 2
 
-    # Test that we do not crash when constant folding elemwise scalar
-    # as they should not generate c code.
+        # Test that we do not crash when constant folding elemwise scalar
+        # as they should not generate c code.
 
-    x = pt.constant(3)
-    assert x.ndim == 0
-    mode = get_mode("FAST_COMPILE").excluding("fusion")
-    f = function([], [x * 2, x + x], mode=mode)
-    topo = f.maker.fgraph.toposort()
-    assert len(topo) == 2
-    assert all(isinstance(n.op, DeepCopyOp) for n in topo)
+        x = pt.constant(3)
+        assert x.ndim == 0
+        mode = get_mode("FAST_COMPILE").excluding("fusion")
+        f = function([], [x * 2, x + x], mode=mode)
+        topo = f.maker.fgraph.toposort()
+        assert len(topo) == 2
+        assert all(isinstance(n.op, DeepCopyOp) for n in topo)
 
+    @pytest.mark.xfail(
+        reason="PyTensor rewrites constants before stabilization. "
+        "This breaks stabilization rewrites in some cases. See #504.",
+        raises=AssertionError,
+    )
+    def test_constant_get_stabilized(self):
+        # Currently PyTensor enables the `constant_folding` rewrite before stabilization rewrites.
+        # This caused some stabilization rewrites to not be activated and that
+        # caused inf values to appear when they should not.
 
-@pytest.mark.xfail(
-    reason="PyTensor rewrites constants before stabilization. "
-    "This breaks stabilization rewrites in some cases. See #504.",
-    raises=AssertionError,
-)
-def test_constant_get_stabilized():
-    # Currently PyTensor enables the `constant_folding` rewrite before stabilization rewrites.
-    # This caused some stabilization rewrites to not be activated and that
-    # caused inf values to appear when they should not.
+        # We can't simply move the `constant_folding` rewrite to
+        # specialize since this will break other rewrites.  We will need to
+        # partially duplicate some canonicalize rewrites to fix this issue.
 
-    # We can't simply move the `constant_folding` rewrite to
-    # specialize since this will break other rewrites.  We will need to
-    # partially duplicate some canonicalize rewrites to fix this issue.
+        x2 = scalar()
+        y2 = log(1 + exp(x2))
+        mode = get_default_mode()
+        mode.check_isfinite = False
+        f2 = function([x2], y2, mode=mode)
 
-    x2 = scalar()
-    y2 = log(1 + exp(x2))
-    mode = get_default_mode()
-    mode.check_isfinite = False
-    f2 = function([x2], y2, mode=mode)
+        assert len(f2.maker.fgraph.toposort()) == 1
+        assert f2.maker.fgraph.toposort()[0].op == softplus
+        assert f2(800) == 800
 
-    assert len(f2.maker.fgraph.toposort()) == 1
-    assert f2.maker.fgraph.toposort()[0].op == softplus
-    assert f2(800) == 800
+        x = pt.as_tensor_variable(800)
+        y = log(1 + exp(x))
+        f = function([], y, mode=mode)
+        # When this error is fixed, the following line should be ok.
+        assert f() == 800, f()
 
-    x = pt.as_tensor_variable(800)
-    y = log(1 + exp(x))
-    f = function([], y, mode=mode)
-    # When this error is fixed, the following line should be ok.
-    assert f() == 800, f()
+    def test_unconditional(self):
+        x = pt.alloc(np.e, *(3, 5))
+        fg = FunctionGraph(outputs=[x], clone=False)
+
+        # Default constant folding doesn't apply to Alloc used as outputs
+        topo_constant_folding.apply(fg)
+        assert not isinstance(fg.outputs[0], Constant)
+
+        # Unconditional constant folding does apply
+        topo_unconditional_constant_folding.apply(fg)
+        assert isinstance(fg.outputs[0], Constant)
+        np.testing.assert_allclose(fg.outputs[0].data, np.full((3, 5), np.e))
+
+    def test_unconditional_no_perform_method(self):
+        """Test that errors are caught when the Op does not have a perform method."""
+
+        class OpNoPerform(Op):
+            itypes = [scalar(dtype="float64").type]
+            otypes = [scalar(dtype="float64").type]
+
+            def perform(self, *args, **kwargs):
+                raise NotImplementedError("This Op cannot be evaluated")
+
+        x = constant(np.array(5.0))
+        out = OpNoPerform()(x)
+
+        fg = FunctionGraph(outputs=[out], clone=False)
+        # Default constant_folding will raise
+        with pytest.raises(NotImplementedError):
+            topo_constant_folding.apply(fg)
+
+        # Unconditional constant folding will be silent
+        topo_unconditional_constant_folding.apply(fg)
+        assert not isinstance(fg.outputs[0], Constant)
+        assert isinstance(fg.outputs[0].owner.op, OpNoPerform)
 
 
 class TestLocalSwitchSink:
@@ -861,7 +906,7 @@ class TestLocalSwitchSink:
                 f = self.function_remove_nan(
                     [condition[0], x[0], c], [y], mode=self.mode
                 )
-                if type(condition[1]) is list:
+                if isinstance(condition[1], list):
                     for i in range(len(condition[1])):
                         res = f(condition[1][i], x[1], -1)
                         assert (
@@ -901,7 +946,7 @@ class TestLocalSwitchSink:
                 f = self.function_remove_nan(
                     [condition[0], x[0], c], [y], mode=self.mode
                 )
-                if type(condition[1]) is list:
+                if isinstance(condition[1], list):
                     for i in range(len(condition[1])):
                         res = f(condition[1][i], x[1], -1)
                         assert (
@@ -980,6 +1025,21 @@ class TestLocalUselessSwitch:
         assert np.array_equal(f1(vx), vx)
         assert np.array_equal(f0(vx), vx)
         assert np.array_equal(f2(vx, vc), vx)
+
+    def test_left_is_right_constant(self):
+        int8_one = as_tensor(np.int8(1))
+        int8_zero = as_tensor(np.int8(0))
+        int64_zero = as_tensor(np.int64(0))
+        cond = scalar("cond", dtype=bool)
+
+        out = pt.switch(cond, int8_zero, int64_zero)
+        assert equal_computations([rewrite_graph(out)], [int64_zero])
+
+        out = pt.switch(cond, int64_zero, int8_zero)
+        assert equal_computations([rewrite_graph(out)], [int64_zero])
+
+        out = pt.switch(cond, int8_one, int8_zero)
+        assert equal_computations([rewrite_graph(out)], [out])
 
     @pytest.mark.parametrize(
         "dtype1",
@@ -1071,6 +1131,25 @@ class TestLocalUselessSwitch:
         assert isinstance(f.maker.fgraph.outputs[0].owner.op, Alloc)
         assert not any(node.op == pt.switch for node in f.maker.fgraph.toposort())
 
+    def test_broadcasting_different_dtype(self):
+        cond = vector("x", dtype="bool")
+        float32_branch = as_tensor(np.array([0], dtype="float32"))
+        float64_branch = as_tensor(np.array([0], dtype="float64"))
+
+        out = pt.switch(cond, float32_branch, float64_branch)
+        expected_out = pt.alloc(float64_branch, cond.shape)
+
+        rewritten_out = rewrite_graph(
+            out, include=("canonicalize", "stabilize", "specialize")
+        )
+        assert equal_computations([rewritten_out], [expected_out])
+
+        out = pt.switch(cond, float64_branch, float32_branch)
+        rewritten_out = rewrite_graph(
+            out, include=("canonicalize", "stabilize", "specialize")
+        )
+        assert equal_computations([rewritten_out], [expected_out])
+
 
 class TestLocalMergeSwitchSameCond:
     @pytest.mark.parametrize(
@@ -1129,7 +1208,7 @@ class TestLocalMergeSwitchSameCond:
         s2 = pt.switch(c, x, y)
         u, v = matrices("uv")
         s3 = pt.switch(c, u, v)
-        g = rewrite(FunctionGraph(mats + [u, v], [op(s1, s2, s3)]))
+        g = rewrite(FunctionGraph([*mats, u, v], [op(s1, s2, s3)]))
         assert debugprint(g, file="str").count("Switch") == 1
 
 
@@ -1296,41 +1375,48 @@ def test_local_join_make_vector():
 
 
 def test_local_sum_make_vector():
+    # To check that rewrite is applied, we must enforce dtype to
+    # allow rewrite to occur even if floatX != "float64"
     a, b, c = scalars("abc")
     mv = MakeVector(config.floatX)
-    output = mv(a, b, c).sum()
+    output = mv(a, b, c).sum(dtype="float64")
+    rewrite_output = rewrite_graph(output)
+    expected_output = cast(
+        add(*[cast(value, "float64") for value in [a, b, c]]), dtype="float64"
+    )
+    assert equal_computations([expected_output], [rewrite_output])
 
-    output = rewrite_graph(output)
-    between = vars_between([a, b, c], [output])
-    for var in between:
-        assert (var.owner is None) or (not isinstance(var.owner.op, MakeVector))
-
-    # Check for empty sum
+    # Empty axes should return input vector since no sum is applied
     a, b, c = scalars("abc")
     mv = MakeVector(config.floatX)
     output = mv(a, b, c).sum(axis=[])
+    rewrite_output = rewrite_graph(output)
+    expected_output = mv(a, b, c)
+    assert equal_computations([expected_output], [rewrite_output])
 
-    output = rewrite_graph(output)
-    between = vars_between([a, b, c], [output])
-    for var in between:
-        assert (var.owner is None) or (not isinstance(var.owner.op, Sum))
-
-    # Check empty MakeVector
+    # Empty input should return 0
     mv = MakeVector(config.floatX)
     output = mv().sum()
+    rewrite_output = rewrite_graph(output)
+    expected_output = pt.as_tensor(0, dtype=config.floatX)
+    assert equal_computations([expected_output], [rewrite_output])
 
-    output = rewrite_graph(output)
-    between = vars_between([a, b, c], [output])
-    for var in between:
-        assert (var.owner is None) or (not isinstance(var.owner.op, Sum))
-
+    # Single element input should return element value
+    a = scalars("a")
     mv = MakeVector(config.floatX)
     output = mv(a).sum()
+    rewrite_output = rewrite_graph(output)
+    expected_output = cast(a, config.floatX)
+    assert equal_computations([expected_output], [rewrite_output])
 
-    output = rewrite_graph(output)
-    between = vars_between([a, b, c], [output])
-    for var in between:
-        assert (var.owner is None) or (not isinstance(var.owner.op, Sum))
+    # This is a regression test for #653. Ensure that rewrite is NOT
+    # applied when user requests float32
+    with config.change_flags(floatX="float32", warn_float64="raise"):
+        a, b, c = scalars("abc")
+        mv = MakeVector(config.floatX)
+        output = mv(a, b, c).sum()
+        rewrite_output = rewrite_graph(output)
+        assert equal_computations([output], [rewrite_output])
 
 
 @pytest.mark.parametrize(
@@ -1359,7 +1445,7 @@ def test_local_tensor_scalar_tensor(dtype):
     f = function([t], t2, mode=rewrite_mode)
     e = f.maker.fgraph.toposort()
     assert not any(
-        n for n in e if isinstance(n.op, (TensorFromScalar, ScalarFromTensor))
+        n for n in e if isinstance(n.op, TensorFromScalar | ScalarFromTensor)
     )
 
 
@@ -1389,7 +1475,7 @@ def test_local_scalar_tensor_scalar(dtype):
     f = function([s], s2, mode=rewrite_mode)
     e = f.maker.fgraph.toposort()
     assert not any(
-        n for n in e if isinstance(n.op, (TensorFromScalar, ScalarFromTensor))
+        n for n in e if isinstance(n.op, TensorFromScalar | ScalarFromTensor)
     )
 
 
@@ -1440,7 +1526,7 @@ def test_local_flatten_lift(i):
     x_np = np.random.random((5, 4, 3, 2)).astype(config.floatX)
     out_np = f(x_np)
     topo = f.maker.fgraph.toposort()
-    shape_out_np = tuple(x_np.shape[: i - 1]) + (np.prod(x_np.shape[i - 1 :]),)
+    shape_out_np = (*x_np.shape[: i - 1], np.prod(x_np.shape[i - 1 :]))
     assert shape_out_np == out_np.shape
 
     reshape_nodes = [n for n in topo if isinstance(n.op, Reshape)]
@@ -1948,3 +2034,35 @@ def test_shape_unsafe_tag():
     fn = function([x, y], out, mode=mode.excluding("shape_unsafe"))
     with pytest.raises(ValueError):
         fn([0, 1], [2, 3, 4]), [0, 1]
+
+
+def test_topological_fill_sink_multi_output_client():
+    x = float64("x")
+    elem_op_with_2_outputs = Elemwise(Composite([x], [x + 1, x + 2]))
+
+    x = pt.vector("x", shape=(1,))
+    z = pt.vector("z", shape=(None,))
+    bcast_x = pt.full_like(z, x)
+    out = pt.add(*elem_op_with_2_outputs(pt.exp(bcast_x)))
+
+    fg = FunctionGraph([x, z], [out], copy_inputs=False)
+    topological_fill_sink.rewrite(fg)
+    [new_out] = fg.outputs
+    expected_out = pt.full_like(z, pt.add(*elem_op_with_2_outputs(pt.exp(x))))
+    assert equal_computations([new_out], [expected_out])
+
+
+def test_topological_fill_sink_broadcastable_change():
+    """Test rewrite doesn't fail after a graph replacement that provides a broadcastable change."""
+    a = vector("a", shape=(1,))
+    b = vector("b", shape=(1,))
+    zeros = pt.vector("zeros", shape=(None,))
+    initial_out = pt.full_like(zeros, a) + b
+
+    # Make broadcast to zeros irrelevant
+    out = graph_replace(initial_out, {zeros: pt.zeros((1,))}, strict=False)
+
+    fg = FunctionGraph([a, b], [out], copy_inputs=False)
+    topological_fill_sink.rewrite(fg)
+    [new_out] = fg.outputs
+    assert equal_computations([new_out], [a + b])

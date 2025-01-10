@@ -4,9 +4,11 @@ import numpy as np
 import scipy
 
 from pytensor.graph.basic import Apply
+from pytensor.graph.replace import _vectorize_node
 from pytensor.link.c.op import COp
 from pytensor.tensor.basic import as_tensor_variable
-from pytensor.tensor.math import gamma, neg, sum
+from pytensor.tensor.elemwise import get_normalized_batch_axes
+from pytensor.tensor.math import gamma, gammaln, log, neg, sum
 
 
 class SoftmaxGrad(COp):
@@ -736,6 +738,32 @@ def log_softmax(c, axis=None):
     return LogSoftmax(axis=axis)(c)
 
 
+@_vectorize_node.register(Softmax)
+@_vectorize_node.register(LogSoftmax)
+def vectorize_softmax_node(op, node, batched_x):
+    """
+    Vectorize Softmax and LogSoftmax nodes.
+
+    """
+    core_ndim = node.inputs[0].type.ndim
+    batch_ndim = batched_x.type.ndim - core_ndim
+
+    if not batch_ndim:
+        return op.make_node(batched_x)
+
+    batch_axes = get_normalized_batch_axes(op.axis, core_ndim, batch_ndim)
+
+    if len(batch_axes) > 1:
+        from pytensor.tensor.blockwise import vectorize_node_fallback
+
+        # The softmax Ops only allow a specific axis (integer) or all axis (None).
+        # If the vectorized operation requires more than one axis we have to default to a Blockwise
+        return vectorize_node_fallback(op, node, batched_x)
+
+    [batch_axis] = batch_axes
+    return type(op)(axis=batch_axis).make_node(batched_x)
+
+
 def poch(z, m):
     """
     Pochhammer symbol (rising factorial) function.
@@ -752,9 +780,36 @@ def factorial(n):
     return gamma(n + 1)
 
 
+def logit(x):
+    """
+    Logit function.
+
+    """
+    return log(x / (1 - x))
+
+
+def beta(a, b):
+    """
+    Beta function.
+
+    """
+    return (gamma(a) * gamma(b)) / gamma(a + b)
+
+
+def betaln(a, b):
+    """
+    Log beta function.
+
+    """
+    return gammaln(a) + gammaln(b) - gammaln(a + b)
+
+
 __all__ = [
     "softmax",
     "log_softmax",
     "poch",
     "factorial",
+    "logit",
+    "beta",
+    "betaln",
 ]

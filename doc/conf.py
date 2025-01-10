@@ -12,11 +12,12 @@
 # serve to show the default value.
 
 # If your extensions are in another directory, add it here. If the directory
-# is relative to the documentation root, use os.path.abspath to make it
+# is relative to the documentation root, use Path.absolute to make it
 # absolute, like shown here.
-# sys.path.append(os.path.abspath('some/directory'))
+# sys.path.append(str(Path("some/directory").absolute()))
 
 import os
+import inspect
 import sys
 import pytensor
 
@@ -32,7 +33,15 @@ extensions = [
     "sphinx.ext.napoleon",
     "sphinx.ext.linkcode",
     "sphinx.ext.mathjax",
+    "sphinx_design",
+    "sphinx.ext.intersphinx"
 ]
+
+intersphinx_mapping = {
+    "jax": ("https://jax.readthedocs.io/en/latest", None),
+    "numpy": ("https://numpy.org/doc/stable", None),
+    "torch": ("https://pytorch.org/docs/stable", None),
+}
 
 needs_sphinx = "3"
 
@@ -121,6 +130,32 @@ html_logo = "images/PyTensor_RGB.svg"
 html_theme = "pymc_sphinx_theme"
 html_theme_options = {
     "use_search_override": False,
+    "icon_links": [
+        {
+            "url": "https://github.com/pymc-devs/pytensor/",
+            "icon": "fa-brands fa-github",
+            "name": "GitHub",
+            "type": "fontawesome",
+        },
+        {
+            "url": "https://twitter.com/pymc_devs/",
+            "icon": "fa-brands fa-twitter",
+            "name": "Twitter",
+            "type": "fontawesome",
+        },
+        {
+            "url": "https://www.youtube.com/c/PyMCDevelopers",
+            "icon": "fa-brands fa-youtube",
+            "name": "YouTube",
+            "type": "fontawesome",
+        },
+        {
+            "url": "https://discourse.pymc.io",
+            "icon": "fa-brands fa-discourse",
+            "name": "Discourse",
+            "type": "fontawesome",
+        },
+    ],
 }
 html_context = {
     "github_user": "pymc-devs",
@@ -190,6 +225,7 @@ html_use_smartypants = True
 # Output file base name for HTML help builder.
 htmlhelp_basename = "pytensor_doc"
 
+
 # Options for the linkcode extension
 # ----------------------------------
 # Resolve function
@@ -201,11 +237,9 @@ def linkcode_resolve(domain, info):
         obj = sys.modules[info["module"]]
         for part in info["fullname"].split("."):
             obj = getattr(obj, part)
-        import inspect
-        import os
 
-        fn = inspect.getsourcefile(obj)
-        fn = os.path.relpath(fn, start=os.path.dirname(pytensor.__file__))
+        fn = Path(inspect.getsourcefile(obj))
+        fn = fn.relative_to(Path(__file__).parent)
         source, lineno = inspect.getsourcelines(obj)
         return fn, lineno, lineno + len(source) - 1
 
@@ -239,7 +273,13 @@ latex_elements = {
 # (source start file, target name, title, author, document class
 # [howto/manual]).
 latex_documents = [
-    ("index", "pytensor.tex", "PyTensor Documentation", "PyTensor Developers", "manual"),
+    (
+        "index",
+        "pytensor.tex",
+        "PyTensor Documentation",
+        "PyTensor Developers",
+        "manual",
+    ),
 ]
 
 # The name of an image file (relative to this directory) to place at the top of

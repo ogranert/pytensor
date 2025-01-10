@@ -1,6 +1,7 @@
 """
 Tests of printing functionality
 """
+
 import logging
 from io import StringIO
 from textwrap import dedent
@@ -9,12 +10,14 @@ import numpy as np
 import pytest
 
 import pytensor
+from pytensor import config
 from pytensor.compile.mode import get_mode
 from pytensor.compile.ops import deep_copy_op
 from pytensor.printing import (
     PatternPrinter,
     PPrinter,
     Print,
+    char_from_number,
     debugprint,
     default_printer,
     get_node_by_id,
@@ -26,6 +29,22 @@ from pytensor.printing import (
 from pytensor.tensor import as_tensor_variable
 from pytensor.tensor.type import dmatrix, dvector, matrix
 from tests.graph.utils import MyInnerGraphOp, MyOp, MyVariable
+
+
+@pytest.mark.parametrize(
+    "number,s",
+    [
+        (0, "A"),
+        (1, "B"),
+        (25, "Z"),
+        (26, "BA"),
+        (27, "BB"),
+        (3 * 26**2 + 2 * 26 + 0, "DCA"),
+        (42421337, "DOVPLX"),
+    ],
+)
+def test_char_from_number(number: int, s: str):
+    assert char_from_number(number) == s
 
 
 @pytest.mark.skipif(not pydot_imported, reason="pydot not available")
@@ -59,7 +78,7 @@ def test_pydotprint_cond_highlight():
 def test_pydotprint_return_image():
     x = dvector()
     ret = pydotprint(x * 2, return_image=True)
-    assert isinstance(ret, (str, bytes))
+    assert isinstance(ret, str | bytes)
 
 
 @pytest.mark.skipif(not pydot_imported, reason="pydot not available")
@@ -366,7 +385,7 @@ MyInnerGraphOp [id A]
     └─ *1-<MyType()> [id F]
     """
 
-    for exp_line, res_line in zip(exp_res.split("\n"), lines):
+    for exp_line, res_line in zip(exp_res.split("\n"), lines, strict=True):
         assert exp_line.strip() == res_line.strip()
 
     # Test nested inner-graph `Op`s
@@ -394,7 +413,7 @@ MyInnerGraphOp [id C]
     └─ *1-<MyType()> [id E]
     """
 
-    for exp_line, res_line in zip(exp_res.split("\n"), lines):
+    for exp_line, res_line in zip(exp_res.split("\n"), lines, strict=True):
         assert exp_line.strip() == res_line.strip()
 
 
@@ -464,8 +483,10 @@ def test_Print(capsys):
     assert "hello" in stdout
 
 
-def test_summary():
-    old_profile_optimizer_config_value = pytensor.config.profile_optimizer = True
-    f = pytensor.function(inputs=[], outputs=[], profile=True)
-    f.profile.summary()
-    pytensor.config.profile_optimizer = old_profile_optimizer_config_value
+def test_summary_with_profile_optimizer():
+    with config.change_flags(profile_optimizer=True):
+        f = pytensor.function(inputs=[], outputs=[], profile=True)
+
+    s = StringIO()
+    f.profile.summary(file=s)
+    assert "Rewriter Profile" in s.getvalue()

@@ -7,11 +7,11 @@ name: pytensor-dev
 channels:
   - conda-forge
 dependencies:
-  - python
+  - python>=3.10
   - compilers
-  - numpy>=1.17.0
-  - scipy>=0.14
-  - filelock
+  - numpy>=1.17.0,<2
+  - scipy>=1,<2
+  - filelock>=3.15
   - etuples
   - logical-unification
   - miniKanren
@@ -23,32 +23,32 @@ dependencies:
   - libblas=*=*mkl
   # numba backend
   - numba>=0.57
-  - numba-scipy
   # For testing
   - coveralls
   - diff-cover
+  - mypy
+  - types-setuptools
   - pytest
   - pytest-cov
   - pytest-xdist
   - pytest-benchmark
   - pytest-mock
+  - pip:
+    - pytest-sphinx
   # For building docs
   - sphinx>=5.1.0,<6
   - sphinx_rtd_theme
   - pygments
   - pydot
   - ipython
+  - pymc-sphinx-theme
+  - sphinx-design
   # code style
-  - black
-  - isort
-  # For linting
-  - flake8
-  - pep8
-  - pyflakes
+  - ruff
   # developer tools
+  - pandas # required to run mypy script
   - pre-commit
   - packaging
-  - typing_extensions
   # optional
   - cython
   - graphviz

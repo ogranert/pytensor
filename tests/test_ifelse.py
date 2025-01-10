@@ -90,7 +90,7 @@ class TestIfelse(utt.OptimizationTestMixin):
             "constant_folding",
             "constant_folding",
         )
-        y2 = reduce(lambda x, y: x + y, [y] + list(range(200)))
+        y2 = reduce(lambda x, y: x + y, [y, *range(200)])
         f = function([c, x, y], ifelse(c, x, y2), mode=mode)
         # For not inplace ifelse
         ifnode = [n for n in f.maker.fgraph.toposort() if isinstance(n.op, IfElse)]
@@ -194,7 +194,7 @@ class TestIfelse(utt.OptimizationTestMixin):
         f = function([c, x1, x2, y1, y2], z, mode=self.mode)
         self.assertFunctionContains1(f, self.get_ifelse(2))
 
-        ifnode = [x for x in f.maker.fgraph.toposort() if isinstance(x.op, IfElse)][0]
+        ifnode = next(x for x in f.maker.fgraph.toposort() if isinstance(x.op, IfElse))
         assert len(ifnode.outputs) == 2
 
         rng = np.random.default_rng(utt.fetch_seed())
@@ -234,14 +234,14 @@ class TestIfelse(utt.OptimizationTestMixin):
             np.asarray(rng.uniform(size=(l,)), pytensor.config.floatX) for l in lens
         ]
         outs_1 = f(1, *values)
-        assert all(x.shape[0] == y for x, y in zip(outs_1, lens))
+        assert all(x.shape[0] == y for x, y in zip(outs_1, lens, strict=True))
         assert np.all(outs_1[0] == 1.0)
         assert np.all(outs_1[1] == 1.0)
         assert np.all(outs_1[2] == 0.0)
         assert np.all(outs_1[3] == 0.0)
 
         outs_0 = f(0, *values)
-        assert all(x.shape[0] == y for x, y in zip(outs_1, lens))
+        assert all(x.shape[0] == y for x, y in zip(outs_1, lens, strict=True))
         assert np.all(outs_0[0] == 0.0)
         assert np.all(outs_0[1] == 0.0)
         assert np.all(outs_0[2] == 1.0)
@@ -369,7 +369,7 @@ class TestIfelse(utt.OptimizationTestMixin):
         z = ifelse(c, (x, x), (y, y))
         f = function([c, x, y], z)
 
-        ifnode = [n for n in f.maker.fgraph.toposort() if isinstance(n.op, IfElse)][0]
+        ifnode = next(n for n in f.maker.fgraph.toposort() if isinstance(n.op, IfElse))
         assert len(ifnode.inputs) == 3
 
     @pytest.mark.skip(reason="Optimization temporarily disabled")
@@ -382,7 +382,7 @@ class TestIfelse(utt.OptimizationTestMixin):
         z = ifelse(c, (x1, x1, x1, x2, x2), (y1, y1, y2, y2, y2))
         f = function([c, x1, x2, y1, y2], z)
 
-        ifnode = [x for x in f.maker.fgraph.toposort() if isinstance(x.op, IfElse)][0]
+        ifnode = next(x for x in f.maker.fgraph.toposort() if isinstance(x.op, IfElse))
         assert len(ifnode.outputs) == 3
 
     @pytest.mark.skip(reason="Optimization temporarily disabled")

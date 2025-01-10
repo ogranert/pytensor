@@ -2,9 +2,9 @@
 
 import time
 import warnings
-from collections.abc import Mapping, MutableSequence, Sequence
+from collections.abc import Callable, Mapping, MutableSequence, Sequence
 from functools import partial, reduce
-from typing import TYPE_CHECKING, Callable, Literal, Optional, TypeVar, Union
+from typing import TYPE_CHECKING, Literal, TypeVar, Union, overload
 
 import numpy as np
 
@@ -22,7 +22,7 @@ if TYPE_CHECKING:
     from pytensor.compile.mode import Mode
 
 
-V = TypeVar("V", bound=Optional[Variable])
+V = TypeVar("V", bound=Variable | None)
 
 
 # TODO: Refactor this so that it's not a global variable
@@ -31,8 +31,8 @@ grad_time: float = 0.0
 
 # TODO: Add `overload` variants
 def as_list_or_tuple(
-    use_list: bool, use_tuple: bool, outputs: Union[V, Sequence[V]]
-) -> Union[V, list[V], tuple[V, ...]]:
+    use_list: bool, use_tuple: bool, outputs: V | Sequence[V]
+) -> V | list[V] | tuple[V, ...]:
     """Return either a single object or a list/tuple of objects.
 
     If `use_list` is True, `outputs` is returned as a list (if `outputs`
@@ -128,9 +128,6 @@ class DisconnectedType(Type):
             " a symbolic placeholder."
         )
 
-    def may_share_memory(a, b):
-        return False
-
     def value_eq(a, b, force_same_dtype=True):
         raise AssertionError(
             "If you're assigning to a DisconnectedType you're"
@@ -146,12 +143,12 @@ disconnected_type = DisconnectedType()
 
 
 def Rop(
-    f: Union[Variable, Sequence[Variable]],
-    wrt: Union[Variable, Sequence[Variable]],
-    eval_points: Union[Variable, Sequence[Variable]],
+    f: Variable | Sequence[Variable],
+    wrt: Variable | Sequence[Variable],
+    eval_points: Variable | Sequence[Variable],
     disconnected_outputs: Literal["ignore", "warn", "raise"] = "raise",
     return_disconnected: Literal["none", "zero", "disconnected"] = "zero",
-) -> Union[Optional[Variable], Sequence[Optional[Variable]]]:
+) -> Variable | None | Sequence[Variable | None]:
     """Computes the R-operator applied to `f` with respect to `wrt` at `eval_points`.
 
     Mathematically this stands for the Jacobian of `f` right multiplied by the
@@ -193,17 +190,17 @@ def Rop(
         If `f` is a list/tuple, then return a list/tuple with the results.
     """
 
-    if not isinstance(wrt, (list, tuple)):
+    if not isinstance(wrt, list | tuple):
         _wrt: list[Variable] = [pytensor.tensor.as_tensor_variable(wrt)]
     else:
         _wrt = [pytensor.tensor.as_tensor_variable(x) for x in wrt]
 
-    if not isinstance(eval_points, (list, tuple)):
+    if not isinstance(eval_points, list | tuple):
         _eval_points: list[Variable] = [pytensor.tensor.as_tensor_variable(eval_points)]
     else:
         _eval_points = [pytensor.tensor.as_tensor_variable(x) for x in eval_points]
 
-    if not isinstance(f, (list, tuple)):
+    if not isinstance(f, list | tuple):
         _f: list[Variable] = [pytensor.tensor.as_tensor_variable(f)]
     else:
         _f = [pytensor.tensor.as_tensor_variable(x) for x in f]
@@ -213,7 +210,7 @@ def Rop(
 
     # Check that each element of wrt corresponds to an element
     # of eval_points with the same dimensionality.
-    for i, (wrt_elem, eval_point) in enumerate(zip(_wrt, _eval_points)):
+    for i, (wrt_elem, eval_point) in enumerate(zip(_wrt, _eval_points, strict=True)):
         try:
             if wrt_elem.type.ndim != eval_point.type.ndim:
                 raise ValueError(
@@ -262,7 +259,7 @@ def Rop(
                     seen_nodes[inp.owner][inp.owner.outputs.index(inp)]
                 )
         same_type_eval_points = []
-        for x, y in zip(inputs, local_eval_points):
+        for x, y in zip(inputs, local_eval_points, strict=True):
             if y is not None:
                 if not isinstance(x, Variable):
                     x = pytensor.tensor.as_tensor_variable(x)
@@ -298,7 +295,7 @@ def Rop(
     for out in _f:
         _traverse(out.owner)
 
-    rval: list[Optional[Variable]] = []
+    rval: list[Variable | None] = []
     for out in _f:
         if out in _wrt:
             rval.append(_eval_points[_wrt.index(out)])
@@ -346,12 +343,12 @@ def Rop(
 
 
 def Lop(
-    f: Union[Variable, Sequence[Variable]],
-    wrt: Union[Variable, Sequence[Variable]],
-    eval_points: Union[Variable, Sequence[Variable]],
-    consider_constant: Optional[Sequence[Variable]] = None,
+    f: Variable | Sequence[Variable],
+    wrt: Variable | Sequence[Variable],
+    eval_points: Variable | Sequence[Variable],
+    consider_constant: Sequence[Variable] | None = None,
     disconnected_inputs: Literal["ignore", "warn", "raise"] = "raise",
-) -> Union[Optional[Variable], Sequence[Optional[Variable]]]:
+) -> Variable | None | Sequence[Variable | None]:
     """Computes the L-operator applied to `f` with respect to `wrt` at `eval_points`.
 
     Mathematically this stands for the Jacobian of `f` with respect to `wrt`
@@ -381,25 +378,25 @@ def Lop(
         coordinates of the tensor elements.
         If `f` is a list/tuple, then return a list/tuple with the results.
     """
-    if not isinstance(eval_points, (list, tuple)):
+    if not isinstance(eval_points, list | tuple):
         _eval_points: list[Variable] = [pytensor.tensor.as_tensor_variable(eval_points)]
     else:
         _eval_points = [pytensor.tensor.as_tensor_variable(x) for x in eval_points]
 
-    if not isinstance(f, (list, tuple)):
+    if not isinstance(f, list | tuple):
         _f: list[Variable] = [pytensor.tensor.as_tensor_variable(f)]
     else:
         _f = [pytensor.tensor.as_tensor_variable(x) for x in f]
 
     grads = list(_eval_points)
 
-    if not isinstance(wrt, (list, tuple)):
+    if not isinstance(wrt, list | tuple):
         _wrt: list[Variable] = [pytensor.tensor.as_tensor_variable(wrt)]
     else:
         _wrt = [pytensor.tensor.as_tensor_variable(x) for x in wrt]
 
     assert len(_f) == len(grads)
-    known = dict(zip(_f, grads))
+    known = dict(zip(_f, grads, strict=True))
 
     ret = grad(
         cost=None,
@@ -414,16 +411,42 @@ def Lop(
     return as_list_or_tuple(using_list, using_tuple, ret)
 
 
+@overload
 def grad(
-    cost: Optional[Variable],
-    wrt: Union[Variable, Sequence[Variable]],
-    consider_constant: Optional[Sequence[Variable]] = None,
+    cost: Variable | None,
+    wrt: Variable | Sequence[Variable],
+    consider_constant: Sequence[Variable] | None = ...,
+    disconnected_inputs: Literal["ignore", "warn", "raise"] = ...,
+    add_names: bool = ...,
+    known_grads: Mapping[Variable, Variable] | None = ...,
+    return_disconnected: Literal["zero", "disconnected"] = ...,
+    null_gradients: Literal["raise", "return"] = ...,
+) -> Variable | None | Sequence[Variable]: ...
+
+
+@overload
+def grad(
+    cost: Variable | None,
+    wrt: Variable | Sequence[Variable],
+    consider_constant: Sequence[Variable] | None = ...,
+    disconnected_inputs: Literal["ignore", "warn", "raise"] = ...,
+    add_names: bool = ...,
+    known_grads: Mapping[Variable, Variable] | None = ...,
+    return_disconnected: Literal["none"] = ...,
+    null_gradients: Literal["raise", "return"] = ...,
+) -> Variable | None | Sequence[Variable | None]: ...
+
+
+def grad(
+    cost: Variable | None,
+    wrt: Variable | Sequence[Variable],
+    consider_constant: Sequence[Variable] | None = None,
     disconnected_inputs: Literal["ignore", "warn", "raise"] = "raise",
     add_names: bool = True,
-    known_grads: Optional[Mapping[Variable, Variable]] = None,
+    known_grads: Mapping[Variable, Variable] | None = None,
     return_disconnected: Literal["none", "zero", "disconnected"] = "zero",
     null_gradients: Literal["raise", "return"] = "raise",
-) -> Union[Optional[Variable], Sequence[Optional[Variable]]]:
+) -> Variable | None | Sequence[Variable | None] | Sequence[Variable]:
     """
     Return symbolic gradients of one cost with respect to one or more variables.
 
@@ -500,7 +523,7 @@ def grad(
     if cost is not None:
         outputs.append(cost)
     if known_grads is not None:
-        outputs.extend(list(known_grads.keys()))
+        outputs.extend(list(known_grads))
 
     var_to_app_to_idx = _populate_var_to_app_to_idx(outputs, _wrt, consider_constant)
 
@@ -547,7 +570,7 @@ def grad(
             )
 
         if not isinstance(
-            g_var.type, (NullType, DisconnectedType)
+            g_var.type, NullType | DisconnectedType
         ) and "float" not in str(g_var.type.dtype):
             raise TypeError(
                 "Gradients must always be NullType, "
@@ -608,7 +631,7 @@ def grad(
         var_to_app_to_idx, grad_dict, _wrt, cost_name
     )
 
-    rval: MutableSequence[Optional[Variable]] = list(_rval)
+    rval: MutableSequence[Variable | None] = list(_rval)
 
     for i in range(len(_rval)):
         if isinstance(_rval[i].type, NullType):
@@ -666,25 +689,24 @@ def subgraph_grad(wrt, end, start=None, cost=None, details=False):
 
     .. code-block:: python
 
-        x, t = pytensor.tensor.fvector('x'), pytensor.tensor.fvector('t')
-        w1 = pytensor.shared(np.random.standard_normal((3,4)))
-        w2 = pytensor.shared(np.random.standard_normal((4,2)))
-        a1 = pytensor.tensor.tanh(pytensor.tensor.dot(x,w1))
-        a2 = pytensor.tensor.tanh(pytensor.tensor.dot(a1,w2))
+        x, t = pytensor.tensor.fvector("x"), pytensor.tensor.fvector("t")
+        w1 = pytensor.shared(np.random.standard_normal((3, 4)))
+        w2 = pytensor.shared(np.random.standard_normal((4, 2)))
+        a1 = pytensor.tensor.tanh(pytensor.tensor.dot(x, w1))
+        a2 = pytensor.tensor.tanh(pytensor.tensor.dot(a1, w2))
         cost2 = pytensor.tensor.sqr(a2 - t).sum()
         cost2 += pytensor.tensor.sqr(w2.sum())
         cost1 = pytensor.tensor.sqr(w1.sum())
 
-        params = [[w2],[w1]]
-        costs = [cost2,cost1]
+        params = [[w2], [w1]]
+        costs = [cost2, cost1]
         grad_ends = [[a1], [x]]
 
         next_grad = None
         param_grads = []
         for i in range(2):
             param_grad, next_grad = pytensor.subgraph_grad(
-                wrt=params[i], end=grad_ends[i],
-                start=next_grad, cost=costs[i]
+                wrt=params[i], end=grad_ends[i], start=next_grad, cost=costs[i]
             )
             next_grad = dict(zip(grad_ends[i], next_grad))
             param_grads.extend(param_grad)
@@ -778,7 +800,7 @@ def subgraph_grad(wrt, end, start=None, cost=None, details=False):
             for i in range(len(grads)):
                 grads[i] += cost_grads[i]
 
-    pgrads = dict(zip(params, grads))
+    pgrads = dict(zip(params, grads, strict=True))
     # separate wrt from end grads:
     wrt_grads = [pgrads[k] for k in wrt]
     end_grads = [pgrads[k] for k in end]
@@ -802,20 +824,20 @@ def _node_to_pattern(node):
         if not isinstance(connection_pattern, list):
             raise TypeError(
                 "Op.connection_pattern should return "
-                + f"list of list of bool, but for Op={node.op}"
-                + f"got {connection_pattern} with type {type(connection_pattern)}."
+                f"list of list of bool, but for Op={node.op}"
+                f"got {connection_pattern} with type {type(connection_pattern)}."
             )
         if len(connection_pattern) != len(node.inputs):
             raise ValueError(
                 f"{node.op}.connection_pattern should have {len(node.inputs)}"
-                + f" rows but has {len(connection_pattern)}."
+                f" rows but has {len(connection_pattern)}."
             )
         for ii, output_pattern in enumerate(connection_pattern):
             if not isinstance(output_pattern, list):
                 raise TypeError(
                     f"{node.op}.connection_pattern should return"
-                    + f" a list of lists, but element {int(ii)}"
-                    + f"is {output_pattern} of type {type(output_pattern)}."
+                    f" a list of lists, but element {int(ii)}"
+                    f"is {output_pattern} of type {type(output_pattern)}."
                 )
     else:
         connection_pattern = [[True for output in node.outputs] for ipt in node.inputs]
@@ -929,12 +951,7 @@ def _populate_var_to_app_to_idx(outputs, wrt, consider_constant):
                     continue
 
                 if ipt not in var_to_app_to_idx:
-                    # This object here *must* be ordered, because
-                    # we iterate over its keys when adding up the terms of the
-                    # gradient on ipt. If it is a regular dict, the grad method
-                    # will return something that is analytically correct, but
-                    # whose order of doing additions depends on the memory
-                    # location of the apply nodes.
+                    # This object *must* be ordered for the grad graph to be deterministic
                     var_to_app_to_idx[ipt] = {}
                 app_to_idx = var_to_app_to_idx[ipt]
                 if app not in app_to_idx:
@@ -971,7 +988,7 @@ def _populate_var_to_app_to_idx(outputs, wrt, consider_constant):
         visit(elem)
 
     # Remove variables that don't have wrt as a true ancestor
-    orig_vars = list(var_to_app_to_idx.keys())
+    orig_vars = list(var_to_app_to_idx)
     for var in orig_vars:
         if var not in visited:
             del var_to_app_to_idx[var]
@@ -1046,13 +1063,12 @@ def _populate_grad_dict(var_to_app_to_idx, grad_dict, wrt, cost_name=None):
             # list of bools indicating if each input is connected to the cost
             inputs_connected = [
                 (
-                    True
-                    in [
+                    any(
                         input_to_output and output_to_cost
                         for input_to_output, output_to_cost in zip(
-                            input_to_outputs, outputs_connected
+                            input_to_outputs, outputs_connected, strict=True
                         )
-                    ]
+                    )
                 )
                 for input_to_outputs in connection_pattern
             ]
@@ -1072,25 +1088,24 @@ def _populate_grad_dict(var_to_app_to_idx, grad_dict, wrt, cost_name=None):
             # List of bools indicating if each input only has NullType outputs
             only_connected_to_nan = [
                 (
-                    True
-                    not in [
+                    not any(
                         in_to_out and out_to_cost and not out_nan
                         for in_to_out, out_to_cost, out_nan in zip(
-                            in_to_outs, outputs_connected, ograd_is_nan
+                            in_to_outs, outputs_connected, ograd_is_nan, strict=True
                         )
-                    ]
+                    )
                 )
                 for in_to_outs in connection_pattern
             ]
 
-            if True not in inputs_connected:
+            if not any(inputs_connected):
                 # All outputs of this op are disconnected so we can skip
                 # Calling the op's grad method and report that the inputs
                 # are disconnected
                 # (The op's grad method could do this too, but this saves the
                 # implementer the trouble of worrying about this case)
                 input_grads = [disconnected_type() for ipt in inputs]
-            elif False not in only_connected_to_nan:
+            elif all(only_connected_to_nan):
                 # All inputs are only connected to nan gradients, so we don't
                 # need to bother calling the grad method. We know the gradient
                 # with respect to all connected inputs is nan.
@@ -1136,7 +1151,7 @@ def _populate_grad_dict(var_to_app_to_idx, grad_dict, wrt, cost_name=None):
                 # DO NOT force integer variables to have integer dtype.
                 # This is a violation of the op contract.
                 new_output_grads = []
-                for o, og in zip(node.outputs, output_grads):
+                for o, og in zip(node.outputs, output_grads, strict=True):
                     o_dt = getattr(o.type, "dtype", None)
                     og_dt = getattr(og.type, "dtype", None)
                     if (
@@ -1150,7 +1165,7 @@ def _populate_grad_dict(var_to_app_to_idx, grad_dict, wrt, cost_name=None):
 
                 # Make sure that, if new_output_grads[i] has a floating point
                 # dtype, it is the same dtype as outputs[i]
-                for o, ng in zip(node.outputs, new_output_grads):
+                for o, ng in zip(node.outputs, new_output_grads, strict=True):
                     o_dt = getattr(o.type, "dtype", None)
                     ng_dt = getattr(ng.type, "dtype", None)
                     if (
@@ -1172,7 +1187,9 @@ def _populate_grad_dict(var_to_app_to_idx, grad_dict, wrt, cost_name=None):
                 # by the user, not computed by Op.grad, and some gradients are
                 # only computed and returned, but never passed as another
                 # node's output grads.
-                for idx, packed in enumerate(zip(node.outputs, new_output_grads)):
+                for idx, packed in enumerate(
+                    zip(node.outputs, new_output_grads, strict=True)
+                ):
                     orig_output, new_output_grad = packed
                     if not hasattr(orig_output, "shape"):
                         continue
@@ -1238,7 +1255,7 @@ def _populate_grad_dict(var_to_app_to_idx, grad_dict, wrt, cost_name=None):
                     not in [
                         in_to_out and out_to_cost and not out_int
                         for in_to_out, out_to_cost, out_int in zip(
-                            in_to_outs, outputs_connected, output_is_int
+                            in_to_outs, outputs_connected, output_is_int, strict=True
                         )
                     ]
                 )
@@ -1276,7 +1293,7 @@ def _populate_grad_dict(var_to_app_to_idx, grad_dict, wrt, cost_name=None):
                                     f"of shape {i_shape}"
                                 )
 
-                if not isinstance(term.type, (NullType, DisconnectedType)):
+                if not isinstance(term.type, NullType | DisconnectedType):
                     if term.type.dtype not in pytensor.tensor.type.float_dtypes:
                         raise TypeError(
                             str(node.op) + ".grad illegally "
@@ -1319,7 +1336,7 @@ def _populate_grad_dict(var_to_app_to_idx, grad_dict, wrt, cost_name=None):
             # Check that op.connection_pattern matches the connectivity
             # logic driving the op.grad method
             for i, (ipt, ig, connected) in enumerate(
-                zip(inputs, input_grads, inputs_connected)
+                zip(inputs, input_grads, inputs_connected, strict=True)
             ):
                 actually_connected = not isinstance(ig.type, DisconnectedType)
 
@@ -1335,7 +1352,7 @@ def _populate_grad_dict(var_to_app_to_idx, grad_dict, wrt, cost_name=None):
                 elif connected and not actually_connected:
                     msg = f"{node.op}.grad returned DisconnectedType for input {i}."
                     if hasattr(node.op, "connection_pattern"):
-                        msg += " Its connection_pattern method does not" " allow this."
+                        msg += " Its connection_pattern method does not allow this."
                         raise TypeError(msg)
                     else:
                         msg += (
@@ -1500,7 +1517,7 @@ class numeric_grad:
             return rval
 
         packed_pt = False
-        if not isinstance(pt, (list, tuple)):
+        if not isinstance(pt, list | tuple):
             pt = [pt]
             packed_pt = True
 
@@ -1606,7 +1623,7 @@ class numeric_grad:
         if len(g_pt) != len(self.gf):
             raise ValueError("argument has wrong number of elements", len(g_pt))
         errs = []
-        for i, (a, b) in enumerate(zip(g_pt, self.gf)):
+        for i, (a, b) in enumerate(zip(g_pt, self.gf, strict=True)):
             if a.shape != b.shape:
                 raise ValueError(
                     f"argument element {i} has wrong shapes {a.shape}, {b.shape}"
@@ -1667,12 +1684,12 @@ def verify_grad(
     fun: Callable,
     pt: list[np.ndarray],
     n_tests: int = 2,
-    rng: Optional[Union[np.random.Generator, np.random.RandomState]] = None,
-    eps: Optional[float] = None,
-    out_type: Optional[str] = None,
-    abs_tol: Optional[float] = None,
-    rel_tol: Optional[float] = None,
-    mode: Optional[Union["Mode", str]] = None,
+    rng: np.random.Generator | np.random.RandomState | None = None,
+    eps: float | None = None,
+    out_type: str | None = None,
+    abs_tol: float | None = None,
+    rel_tol: float | None = None,
+    mode: Union["Mode", str] | None = None,
     cast_to_output_type: bool = False,
     no_debug_ref: bool = True,
 ):
@@ -1685,9 +1702,11 @@ def verify_grad(
 
     Examples
     --------
-    >>> verify_grad(pytensor.tensor.tanh,
-    ...             (np.asarray([[2, 3, 4], [-1, 3.3, 9.9]]),),
-    ...             rng=np.random.default_rng(23098))
+    >>> verify_grad(
+    ...     pytensor.tensor.tanh,
+    ...     (np.asarray([[2, 3, 4], [-1, 3.3, 9.9]]),),
+    ...     rng=np.random.default_rng(23098),
+    ... )
 
     Parameters
     ----------
@@ -1732,7 +1751,7 @@ def verify_grad(
     from pytensor.compile.function import function
     from pytensor.compile.sharedvalue import shared
 
-    if not isinstance(pt, (list, tuple)):
+    if not isinstance(pt, list | tuple):
         raise TypeError("`pt` should be a list or tuple")
 
     pt = [np.array(p) for p in pt]
@@ -1753,14 +1772,9 @@ def verify_grad(
     if rel_tol is None:
         rel_tol = max(_type_tol[str(p.dtype)] for p in pt)
 
+    # Initialize RNG if not provided
     if rng is None:
-        raise TypeError(
-            "rng should be a valid instance of "
-            "numpy.random.RandomState. You may "
-            "want to use tests.unittest"
-            "_tools.verify_grad instead of "
-            "pytensor.gradient.verify_grad."
-        )
+        rng = np.random.default_rng()
 
     # We allow input downcast in `function`, because `numeric_grad` works in
     # the most precise dtype used among the inputs, so we may need to cast
@@ -1793,7 +1807,7 @@ def verify_grad(
     o_fn = fn_maker(tensor_pt, o_output, name="gradient.py fwd")
     o_fn_out = o_fn(*[p.copy() for p in pt])
 
-    if isinstance(o_fn_out, tuple) or isinstance(o_fn_out, list):
+    if isinstance(o_fn_out, tuple | list):
         raise TypeError(
             "It seems like you are trying to use verify_grad "
             "on an Op or a function which outputs a list: there should"
@@ -1933,7 +1947,7 @@ def jacobian(expression, wrt, consider_constant=None, disconnected_inputs="raise
     using_list = isinstance(wrt, list)
     using_tuple = isinstance(wrt, tuple)
 
-    if isinstance(wrt, (list, tuple)):
+    if isinstance(wrt, list | tuple):
         wrt = list(wrt)
     else:
         wrt = [wrt]
@@ -1972,7 +1986,7 @@ def jacobian(expression, wrt, consider_constant=None, disconnected_inputs="raise
     jacobs, updates = pytensor.scan(
         inner_function,
         sequences=pytensor.tensor.arange(expression.shape[0]),
-        non_sequences=[expression] + wrt,
+        non_sequences=[expression, *wrt],
     )
     assert not updates, "Scan has returned a list of updates; this should not happen."
     return as_list_or_tuple(using_list, using_tuple, jacobs)
@@ -2015,7 +2029,7 @@ def hessian(cost, wrt, consider_constant=None, disconnected_inputs="raise"):
     using_list = isinstance(wrt, list)
     using_tuple = isinstance(wrt, tuple)
 
-    if isinstance(wrt, (list, tuple)):
+    if isinstance(wrt, list | tuple):
         wrt = list(wrt)
     else:
         wrt = [wrt]
@@ -2055,6 +2069,85 @@ def hessian(cost, wrt, consider_constant=None, disconnected_inputs="raise"):
         ), "Scan has returned a list of updates; this should not happen."
         hessians.append(hess)
     return as_list_or_tuple(using_list, using_tuple, hessians)
+
+
+def hessian_vector_product(cost, wrt, p, **grad_kwargs):
+    """Return the expression of the Hessian times a vector p.
+
+    Notes
+    -----
+    This function uses backward autodiff twice to obtain the desired expression.
+    You may want to manually build the equivalent expression by combining backward
+    followed by forward (if all Ops support it) autodiff.
+    See {ref}`docs/_tutcomputinggrads#Hessian-times-a-Vector` for how to do this.
+
+    Parameters
+    ----------
+    cost: Scalar (0-dimensional) variable.
+    wrt: Vector (1-dimensional tensor) 'Variable' or list of Vectors
+    p: Vector (1-dimensional tensor) 'Variable' or list of Vectors
+        Each vector will be used for the hessp wirt to exach input variable
+    **grad_kwargs:
+        Keyword arguments passed to `grad` function.
+
+    Returns
+    -------
+    :class:` Vector or list of Vectors
+        The Hessian times p of the `cost` with respect to (elements of) `wrt`.
+
+    Examples
+    --------
+
+    .. testcode::
+
+        import numpy as np
+        from scipy.optimize import minimize
+        from pytensor import function
+        from pytensor.tensor import vector
+        from pytensor.gradient import grad, hessian_vector_product
+
+        x = vector('x')
+        p = vector('p')
+
+        rosen = (100 * (x[1:] - x[:-1] ** 2) ** 2 + (1 - x[:-1]) ** 2).sum()
+        rosen_jac = grad(rosen, x)
+        rosen_hessp = hessian_vector_product(rosen, x, p)
+
+        rosen_fn = function([x], rosen)
+        rosen_jac_fn = function([x], rosen_jac)
+        rosen_hessp_fn = function([x, p], rosen_hessp)
+        x0 = np.array([1.3, 0.7, 0.8, 1.9, 1.2])
+        res = minimize(
+            rosen_fn,
+            x0,
+            method="Newton-CG",
+            jac=rosen_jac_fn,
+            hessp=rosen_hessp_fn,
+            options={"xtol": 1e-8},
+        )
+        print(res.x)
+
+    .. testoutput::
+
+        [1.         1.         1.         0.99999999 0.99999999]
+
+
+
+    """
+    wrt_list = wrt if isinstance(wrt, Sequence) else [wrt]
+    p_list = p if isinstance(p, Sequence) else [p]
+    grad_wrt_list = grad(cost, wrt=wrt_list, **grad_kwargs)
+    hessian_cost = pytensor.tensor.add(
+        *[
+            (grad_wrt * p).sum()
+            for grad_wrt, p in zip(grad_wrt_list, p_list, strict=True)
+        ]
+    )
+    Hp_list = grad(hessian_cost, wrt=wrt_list, **grad_kwargs)
+
+    if isinstance(wrt, Variable):
+        return Hp_list[0]
+    return Hp_list
 
 
 def _is_zero(x):
@@ -2244,11 +2337,11 @@ def grad_clip(x, lower_bound, upper_bound):
     Examples
     --------
     >>> x = pytensor.tensor.type.scalar()
-    >>> z = pytensor.gradient.grad(grad_clip(x, -1, 1)**2, x)
+    >>> z = pytensor.gradient.grad(grad_clip(x, -1, 1) ** 2, x)
     >>> z2 = pytensor.gradient.grad(x**2, x)
-    >>> f = pytensor.function([x], outputs = [z, z2])
+    >>> f = pytensor.function([x], outputs=[z, z2])
     >>> print(f(2.0))
-    [array(1.0), array(4.0)]
+    [array(1.), array(4.)]
 
     Notes
     -----
@@ -2285,7 +2378,7 @@ def grad_scale(x, multiplier):
     >>> fprime = pytensor.function([x], fp)
     >>> print(fprime(2))  # doctest: +ELLIPSIS
     -0.416...
-    >>> f_inverse=grad_scale(fx, -1.)
+    >>> f_inverse = grad_scale(fx, -1.0)
     >>> fpp = pytensor.grad(f_inverse, wrt=x)
     >>> fpprime = pytensor.function([x], fpp)
     >>> print(fpprime(2))  # doctest: +ELLIPSIS

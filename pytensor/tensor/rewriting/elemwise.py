@@ -1,8 +1,9 @@
+import itertools
 import sys
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 from collections.abc import Generator
-from functools import lru_cache
-from typing import DefaultDict, TypeVar
+from functools import cache
+from typing import TypeVar
 from warnings import warn
 
 import pytensor
@@ -13,7 +14,7 @@ from pytensor.configdefaults import config
 from pytensor.graph import FunctionGraph
 from pytensor.graph.basic import Apply, Constant, Variable, ancestors, io_toposort
 from pytensor.graph.features import ReplaceValidate
-from pytensor.graph.fg import ApplyOrOutput
+from pytensor.graph.fg import Output
 from pytensor.graph.rewriting.basic import (
     EquilibriumGraphRewriter,
     GraphRewriter,
@@ -70,7 +71,7 @@ class InplaceElemwiseOptimizer(GraphRewriter):
         ndim = prof["ndim"]
         if ndim:
             print(blanc, "ndim", "nb", file=stream)
-            for n in sorted(ndim.keys()):
+            for n in sorted(ndim):
                 print(blanc, n, ndim[n], file=stream)
 
     def candidate_input_idxs(self, node):
@@ -126,7 +127,7 @@ class InplaceElemwiseOptimizer(GraphRewriter):
             "nb_call_replace": 0,
             "nb_call_validate": 0,
             "nb_inconsistent": 0,
-            "ndim": defaultdict(lambda: 0),
+            "ndim": Counter(),
         }
 
         check_each_change = config.tensor__insert_inplace_optimizer_validate_nb
@@ -144,12 +145,12 @@ class InplaceElemwiseOptimizer(GraphRewriter):
         else:
             update_outs = []
 
-        protected_inputs = [
-            f.protected
-            for f in fgraph._features
-            if isinstance(f, pytensor.compile.function.types.Supervisor)
-        ]
-        protected_inputs = sum(protected_inputs, [])  # flatten the list
+        Supervisor = pytensor.compile.function.types.Supervisor
+        protected_inputs = list(
+            itertools.chain.from_iterable(
+                f.protected for f in fgraph._features if isinstance(f, Supervisor)
+            )
+        )
         protected_inputs.extend(fgraph.outputs)
         for node in list(io_toposort(fgraph.inputs, fgraph.outputs)):
             op = node.op
@@ -185,9 +186,8 @@ class InplaceElemwiseOptimizer(GraphRewriter):
                     for i in range(len(node.inputs))
                     if i not in baseline.values()
                     and not isinstance(node.inputs[i], Constant)
-                    and
                     # the next line should not be costly most of the time.
-                    not fgraph.has_destroyers([node.inputs[i]])
+                    and not fgraph.has_destroyers([node.inputs[i]])
                     and node.inputs[i] not in protected_inputs
                 ]
             else:
@@ -299,7 +299,7 @@ class InplaceElemwiseOptimizer(GraphRewriter):
                         )
                         new_node = new_outputs[0].owner
 
-                        for r, new_r in zip(node.outputs, new_outputs):
+                        for r, new_r in zip(node.outputs, new_outputs, strict=True):
                             prof["nb_call_replace"] += 1
                             fgraph.replace(
                                 r, new_r, reason="inplace_elemwise_optimizer"
@@ -361,7 +361,7 @@ compile.optdb.register(
     "inplace_elemwise_optimizer",
     "fast_run",
     "inplace",
-    position=75,
+    position=50.5,
 )
 
 
@@ -369,7 +369,7 @@ def apply_local_dimshuffle_lift(fgraph, var):
     """
     lift recursively
     """
-    if not var.owner:
+    if var.owner is None:
         return var
     new = local_dimshuffle_lift.transform(fgraph, var.owner)
     if new:
@@ -421,8 +421,6 @@ def local_dimshuffle_lift(fgraph, node):
 
     """
     op = node.op
-    if not isinstance(op, DimShuffle):
-        return False
 
     inp = node.inputs[0]
     inode = inp.owner
@@ -436,7 +434,7 @@ def local_dimshuffle_lift(fgraph, node):
         # Don't use make_node to have tag.test_value set.
         new_inputs = []
         for inp in inode.inputs:
-            new_inp = op.__class__(inp.type.broadcastable, op.new_order)(inp)
+            new_inp = inp.dimshuffle(op.new_order)
             new_inputs.append(apply_local_dimshuffle_lift(fgraph, new_inp))
         copy_stack_trace(node.outputs[0], new_inputs)
         ret = inode.op(*new_inputs, return_list=True)
@@ -448,7 +446,7 @@ def local_dimshuffle_lift(fgraph, node):
     if is_dimshuffle_useless(new_order, inp):
         return [inp]
     elif inode and isinstance(inode.op, DimShuffle):
-        ret = op.__class__(inp.type.broadcastable, new_order)(inp)
+        ret = inp.dimshuffle(new_order)
         ret = apply_local_dimshuffle_lift(fgraph, ret)
         copy_stack_trace(node.outputs[0], ret)
         return [ret]
@@ -472,10 +470,10 @@ def local_useless_dimshuffle_makevector(fgraph, node):
 
     makevector_out = node.inputs[0]
 
-    if (
-        not makevector_out.owner
-        or not isinstance(makevector_out.owner.op, MakeVector)
-        or not makevector_out.broadcastable == (True,)
+    if not (
+        makevector_out.owner
+        and isinstance(makevector_out.owner.op, MakeVector)
+        and makevector_out.broadcastable == (True,)
     ):
         return
 
@@ -569,8 +567,8 @@ def local_add_mul_fusion(fgraph, node):
     This rewrite is almost useless after the AlgebraicCanonizer is used,
     but it catches a few edge cases that are not canonicalized by it
     """
-    if not isinstance(node.op, Elemwise) or not isinstance(
-        node.op.scalar_op, (ps.Add, ps.Mul)
+    if not (
+        isinstance(node.op, Elemwise) and isinstance(node.op.scalar_op, ps.Add | ps.Mul)
     ):
         return False
 
@@ -686,24 +684,22 @@ class FusionOptimizer(GraphRewriter):
             Elemwise Composite before being accessed again in the next iteration.
             """
 
-            FUSEABLE_MAPPING = DefaultDict[Variable, list[Apply]]
-            UNFUSEABLE_MAPPING = DefaultDict[Variable, set[ApplyOrOutput]]
+            FUSEABLE_MAPPING = defaultdict[Variable, list[Apply]]
+            UNFUSEABLE_MAPPING = defaultdict[Variable, set[Apply]]
 
             def initialize_fuseable_mappings(
                 *, fg: FunctionGraph
             ) -> tuple[FUSEABLE_MAPPING, UNFUSEABLE_MAPPING]:
-                @lru_cache(maxsize=None)
+                @cache
                 def elemwise_scalar_op_has_c_code(node: Apply) -> bool:
                     # TODO: This should not play a role in non-c backends!
                     if node.op.scalar_op.supports_c_code(node.inputs, node.outputs):
                         return True
                     else:
-                        warn(
-                            "Optimization Warning: "
-                            f"The Op {node.op.scalar_op} does not provide a C implementation."
-                            " As well as being potentially slow, this also disables "
-                            "loop fusion."
-                        )
+                        if config.optimizer_verbose:
+                            warn(
+                                f"Loop fusion interrupted because {node.op.scalar_op} does not provide a C implementation."
+                            )
                         return False
 
                 # Fuseable nodes have to be accessed in a deterministic manner
@@ -728,7 +724,6 @@ class FusionOptimizer(GraphRewriter):
                     for client, _ in clients:
                         if (
                             out_maybe_fuseable
-                            and not isinstance(client, str)  # "output"
                             and isinstance(client.op, Elemwise)
                             # and not isinstance(client.op.scalar_op, ps.Composite)
                             and len(client.outputs) == 1
@@ -754,9 +749,9 @@ class FusionOptimizer(GraphRewriter):
                 VT = TypeVar("VT", list, set)
 
                 def shallow_clone_defaultdict(
-                    d: DefaultDict[KT, VT]
-                ) -> DefaultDict[KT, VT]:
-                    new_dict: DefaultDict[KT, VT] = defaultdict(d.default_factory)
+                    d: defaultdict[KT, VT],
+                ) -> defaultdict[KT, VT]:
+                    new_dict: defaultdict[KT, VT] = defaultdict(d.default_factory)
                     new_dict.update({k: v.copy() for k, v in d.items()})
                     return new_dict
 
@@ -842,7 +837,7 @@ class FusionOptimizer(GraphRewriter):
                             implied_unfuseable_clients = {
                                 c
                                 for client in unfuseable_clients_clone.get(next_out, ())
-                                if not isinstance(client, str)  # "output"
+                                if not isinstance(client.op, Output)
                                 for c in client.outputs
                             }
 
@@ -1038,12 +1033,12 @@ class FusionOptimizer(GraphRewriter):
             )
             if not isinstance(composite_outputs, list):
                 composite_outputs = [composite_outputs]
-            for old_out, composite_out in zip(outputs, composite_outputs):
+            for old_out, composite_out in zip(outputs, composite_outputs, strict=True):
                 if old_out.name:
                     composite_out.name = old_out.name
 
             fgraph.replace_all_validate(
-                list(zip(outputs, composite_outputs)),
+                list(zip(outputs, composite_outputs, strict=True)),
                 reason=self.__class__.__name__,
             )
             nb_replacement += 1
@@ -1095,8 +1090,8 @@ class FusionOptimizer(GraphRewriter):
 @node_rewriter([Elemwise])
 def local_useless_composite_outputs(fgraph, node):
     """Remove inputs and outputs of Composite Ops that are not used anywhere."""
-    if not isinstance(node.op, Elemwise) or not isinstance(
-        node.op.scalar_op, ps.Composite
+    if not (
+        isinstance(node.op, Elemwise) and isinstance(node.op.scalar_op, ps.Composite)
     ):
         return
     comp = node.op.scalar_op
@@ -1119,7 +1114,7 @@ def local_useless_composite_outputs(fgraph, node):
         used_inputs = [node.inputs[i] for i in used_inputs_idxs]
         c = ps.Composite(inputs=used_inner_inputs, outputs=used_inner_outputs)
         e = Elemwise(scalar_op=c)(*used_inputs, return_list=True)
-        return dict(zip([node.outputs[i] for i in used_outputs_idxs], e))
+        return dict(zip([node.outputs[i] for i in used_outputs_idxs], e, strict=True))
 
 
 @node_rewriter([CAReduce])
@@ -1131,12 +1126,12 @@ def local_careduce_fusion(fgraph, node):
 
     # FIXME: This check is needed because of the faulty logic in the FIXME below!
     # Right now, rewrite only works for `Sum`/`Prod`
-    if not isinstance(car_scalar_op, (ps.Add, ps.Mul)):
+    if not isinstance(car_scalar_op, ps.Add | ps.Mul):
         return None
 
     elm_node = car_input.owner
 
-    if elm_node is None or not isinstance(elm_node.op, Elemwise):
+    if not (elm_node and isinstance(elm_node.op, Elemwise)):
         return False
 
     elm_scalar_op = elm_node.op.scalar_op
@@ -1188,7 +1183,7 @@ def local_careduce_fusion(fgraph, node):
         scalar_fused_output = ps.cast(scalar_fused_output, car_acc_dtype)
 
     fused_scalar_op = ps.Composite(
-        inputs=[carried_car_input] + scalar_elm_inputs, outputs=[scalar_fused_output]
+        inputs=[carried_car_input, *scalar_elm_inputs], outputs=[scalar_fused_output]
     )
 
     # The fused `Op` needs to look and behave like a `BinaryScalarOp`
@@ -1219,7 +1214,9 @@ def local_inline_composite_constants(fgraph, node):
     new_outer_inputs = []
     new_inner_inputs = []
     inner_replacements = {}
-    for outer_inp, inner_inp in zip(node.inputs, composite_op.fgraph.inputs):
+    for outer_inp, inner_inp in zip(
+        node.inputs, composite_op.fgraph.inputs, strict=True
+    ):
         # Complex variables don't have a `c_literal` that can be inlined
         if "complex" not in outer_inp.type.dtype:
             unique_value = get_unique_constant_value(outer_inp)
@@ -1356,7 +1353,7 @@ def local_useless_2f1grad_loop(fgraph, node):
 
     replacements = {converges: new_converges}
     i = 0
-    for grad_var, is_used in zip(grad_vars, grad_var_is_used):
+    for grad_var, is_used in zip(grad_vars, grad_var_is_used, strict=True):
         if not is_used:
             continue
         replacements[grad_var] = new_outs[i]

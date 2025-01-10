@@ -1,19 +1,19 @@
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from functools import wraps
 from itertools import zip_longest
 from types import ModuleType
-from typing import TYPE_CHECKING, Literal, Optional, Union
+from typing import TYPE_CHECKING
 
 import numpy as np
 
 from pytensor.compile.sharedvalue import shared
 from pytensor.graph.basic import Constant, Variable
 from pytensor.scalar import ScalarVariable
-from pytensor.tensor import get_vector_length
-from pytensor.tensor.basic import as_tensor_variable, cast, constant
-from pytensor.tensor.extra_ops import broadcast_to
+from pytensor.tensor import NoneConst, get_vector_length
+from pytensor.tensor.basic import as_tensor_variable, cast
+from pytensor.tensor.extra_ops import broadcast_arrays, broadcast_to
 from pytensor.tensor.math import maximum
-from pytensor.tensor.shape import specify_shape
+from pytensor.tensor.shape import shape_padleft, specify_shape
 from pytensor.tensor.type import int_dtypes
 from pytensor.tensor.variable import TensorVariable
 
@@ -22,7 +22,9 @@ if TYPE_CHECKING:
     from pytensor.tensor.random.op import RandomVariable
 
 
-def params_broadcast_shapes(param_shapes, ndims_params, use_pytensor=True):
+def params_broadcast_shapes(
+    param_shapes: Sequence, ndims_params: Sequence[int], use_pytensor: bool = True
+) -> list[tuple[int, ...]]:
     """Broadcast parameters that have different dimensions.
 
     Parameters
@@ -36,13 +38,14 @@ def params_broadcast_shapes(param_shapes, ndims_params, use_pytensor=True):
 
     Returns
     =======
-    bcast_shapes : list of ndarray
+    bcast_shapes : list of tuples of ints
         The broadcasted values of `params`.
     """
     max_fn = maximum if use_pytensor else max
 
-    rev_extra_dims = []
-    for ndim_param, param_shape in zip(ndims_params, param_shapes):
+    rev_extra_dims: list[int] = []
+    # strict=False because we are in a hot loop
+    for ndim_param, param_shape in zip(ndims_params, param_shapes, strict=False):
         # We need this in order to use `len`
         param_shape = tuple(param_shape)
         extras = tuple(param_shape[: (len(param_shape) - ndim_param)])
@@ -61,31 +64,38 @@ def params_broadcast_shapes(param_shapes, ndims_params, use_pytensor=True):
 
     extra_dims = tuple(reversed(rev_extra_dims))
 
+    # strict=False because we are in a hot loop
     bcast_shapes = [
         (extra_dims + tuple(param_shape)[-ndim_param:])
         if ndim_param > 0
         else extra_dims
-        for ndim_param, param_shape in zip(ndims_params, param_shapes)
+        for ndim_param, param_shape in zip(ndims_params, param_shapes, strict=False)
     ]
 
     return bcast_shapes
 
 
-def broadcast_params(params, ndims_params):
+def broadcast_params(
+    params: Sequence[np.ndarray | TensorVariable], ndims_params: Sequence[int]
+) -> list[np.ndarray]:
     """Broadcast parameters that have different dimensions.
 
     >>> ndims_params = [1, 2]
     >>> mean = np.array([1, 2, 3])
     >>> cov = np.stack([np.eye(3), np.eye(3)])
     >>> params = [mean, cov]
-    >>> res = broadcast_params(params, ndims_params)
-    [array([[1, 2, 3]]),
+    >>> mean_bcast, cov_bcast = broadcast_params(params, ndims_params)
+    >>> mean_bcast
+    array([[1, 2, 3],
+           [1, 2, 3]])
+    >>> cov_bcast
     array([[[1., 0., 0.],
-             [0., 1., 0.],
-             [0., 0., 1.]],
-            [[1., 0., 0.],
-             [0., 1., 0.],
-             [0., 0., 1.]]])]
+            [0., 1., 0.],
+            [0., 0., 1.]],
+    <BLANKLINE>
+           [[1., 0., 0.],
+            [0., 1., 0.],
+            [0., 0., 1.]]])
 
     Parameters
     ==========
@@ -102,9 +112,12 @@ def broadcast_params(params, ndims_params):
     use_pytensor = False
     param_shapes = []
     for p in params:
+        # strict=False because we are in a hot loop
         param_shape = tuple(
             1 if bcast else s
-            for s, bcast in zip(p.shape, getattr(p, "broadcastable", (False,) * p.ndim))
+            for s, bcast in zip(
+                p.shape, getattr(p, "broadcastable", (False,) * p.ndim), strict=False
+            )
         )
         use_pytensor |= isinstance(p, Variable)
         param_shapes.append(param_shape)
@@ -114,38 +127,78 @@ def broadcast_params(params, ndims_params):
     )
     broadcast_to_fn = broadcast_to if use_pytensor else np.broadcast_to
 
+    # strict=False because we are in a hot loop
     bcast_params = [
-        broadcast_to_fn(param, shape) for shape, param in zip(shapes, params)
+        broadcast_to_fn(param, shape)
+        for shape, param in zip(shapes, params, strict=False)
     ]
 
     return bcast_params
 
 
+def explicit_expand_dims(
+    params: Sequence[TensorVariable],
+    ndim_params: Sequence[int],
+    size_length: int | None = None,
+) -> list[TensorVariable]:
+    """Introduce explicit expand_dims in RV parameters that are implicitly broadcasted together and/or by size."""
+
+    batch_dims = [
+        param.type.ndim - ndim_param
+        for param, ndim_param in zip(params, ndim_params, strict=True)
+    ]
+
+    if size_length is not None:
+        max_batch_dims = size_length
+    else:
+        max_batch_dims = max(batch_dims, default=0)
+
+    new_params = []
+    for new_param, batch_dim in zip(params, batch_dims, strict=True):
+        missing_dims = max_batch_dims - batch_dim
+        if missing_dims:
+            new_param = shape_padleft(new_param, missing_dims)
+        new_params.append(new_param)
+
+    return new_params
+
+
+def compute_batch_shape(
+    params: Sequence[TensorVariable], ndims_params: Sequence[int]
+) -> TensorVariable:
+    params = explicit_expand_dims(params, ndims_params)
+    batch_params = [
+        param[(..., *(0,) * core_ndim)]
+        for param, core_ndim in zip(params, ndims_params, strict=True)
+    ]
+    return broadcast_arrays(*batch_params)[0].shape
+
+
 def normalize_size_param(
-    size: Optional[Union[int, np.ndarray, Variable, Sequence]]
+    shape: int | np.ndarray | Variable | Sequence | None,
 ) -> Variable:
     """Create an PyTensor value for a ``RandomVariable`` ``size`` parameter."""
-    if size is None:
-        size = constant([], dtype="int64")
-    elif isinstance(size, int):
-        size = as_tensor_variable([size], ndim=1)
-    elif not isinstance(size, (np.ndarray, Variable, Sequence)):
+    if shape is None or NoneConst.equals(shape):
+        return NoneConst
+    elif isinstance(shape, int):
+        shape = as_tensor_variable([shape], ndim=1)
+    elif not isinstance(shape, np.ndarray | Variable | Sequence):
         raise TypeError(
             "Parameter size must be None, an integer, or a sequence with integers."
         )
     else:
-        size = cast(as_tensor_variable(size, ndim=1, dtype="int64"), "int64")
+        shape = cast(as_tensor_variable(shape, ndim=1, dtype="int64"), "int64")
 
-        if not isinstance(size, Constant):
+        if not isinstance(shape, Constant):
             # This should help ensure that the length of non-constant `size`s
             # will be available after certain types of cloning (e.g. the kind
             # `Scan` performs)
-            size = specify_shape(size, (get_vector_length(size),))
+            shape = specify_shape(shape, (get_vector_length(shape),))
 
-    assert not any(s is None for s in size.type.shape)
-    assert size.dtype in int_dtypes
+    assert not any(s is None for s in shape.type.shape)
+    assert shape.dtype in int_dtypes
 
-    return size
+    return shape
 
 
 class RandomStream:
@@ -172,48 +225,40 @@ class RandomStream:
 
     def __init__(
         self,
-        seed: Optional[int] = None,
-        namespace: Optional[ModuleType] = None,
-        rng_ctor: Literal[
-            np.random.RandomState, np.random.Generator
+        seed: int | None = None,
+        namespace: ModuleType | None = None,
+        rng_ctor: Callable[
+            [np.random.SeedSequence], np.random.Generator
         ] = np.random.default_rng,
     ):
         if namespace is None:
             from pytensor.tensor.random import basic  # pylint: disable=import-self
 
-            self.namespaces = [basic]
+            self.namespaces = [(basic, set(basic.__all__))]
         else:
-            self.namespaces = [namespace]
+            self.namespaces = [(namespace, set(namespace.__all__))]
 
         self.default_instance_seed = seed
         self.state_updates = []
         self.gen_seedgen = np.random.SeedSequence(seed)
-
-        if isinstance(rng_ctor, type) and issubclass(rng_ctor, np.random.RandomState):
-            # The legacy state does not accept `SeedSequence`s directly
-            def rng_ctor(seed):
-                return np.random.RandomState(np.random.MT19937(seed))
-
         self.rng_ctor = rng_ctor
 
     def __getattr__(self, obj):
         ns_obj = next(
-            (getattr(ns, obj) for ns in self.namespaces if hasattr(ns, obj)), None
+            (
+                getattr(ns, obj)
+                for ns, all_ in self.namespaces
+                if obj in all_ and hasattr(ns, obj)
+            ),
+            None,
         )
 
         if ns_obj is None:
             raise AttributeError(f"No attribute {obj}.")
 
-        from pytensor.tensor.random.op import RandomVariable
-
-        if isinstance(ns_obj, RandomVariable):
-
-            @wraps(ns_obj)
-            def meta_obj(*args, **kwargs):
-                return self.gen(ns_obj, *args, **kwargs)
-
-        else:
-            raise AttributeError(f"No attribute {obj}.")
+        @wraps(ns_obj)
+        def meta_obj(*args, **kwargs):
+            return self.gen(ns_obj, *args, **kwargs)
 
         setattr(self, obj, meta_obj)
         return getattr(self, obj)
@@ -242,7 +287,9 @@ class RandomStream:
         self.gen_seedgen = np.random.SeedSequence(seed)
         old_r_seeds = self.gen_seedgen.spawn(len(self.state_updates))
 
-        for (old_r, new_r), old_r_seed in zip(self.state_updates, old_r_seeds):
+        for (old_r, new_r), old_r_seed in zip(
+            self.state_updates, old_r_seeds, strict=True
+        ):
             old_r.set_value(self.rng_ctor(old_r_seed), borrow=True)
 
     def gen(self, op: "RandomVariable", *args, **kwargs) -> TensorVariable:
@@ -292,9 +339,9 @@ def supp_shape_from_ref_param_shape(
     *,
     ndim_supp: int,
     dist_params: Sequence[Variable],
-    param_shapes: Optional[Sequence[tuple[ScalarVariable, ...]]] = None,
+    param_shapes: Sequence[tuple[ScalarVariable, ...]] | None = None,
     ref_param_idx: int,
-) -> Union[TensorVariable, tuple[ScalarVariable, ...]]:
+) -> TensorVariable | tuple[ScalarVariable, ...]:
     """Extract the support shape of a multivariate `RandomVariable` from the shape of a reference parameter.
 
     Several multivariate `RandomVariable`s have a support shape determined by the last dimensions of a parameter.
@@ -318,6 +365,11 @@ def supp_shape_from_ref_param_shape(
     -------
     out: tuple
         Representing the support shape for a `RandomVariable` with the given `dist_params`.
+
+    Notes
+    _____
+    This helper is no longer necessary when using signatures in `RandomVariable` subclasses.
+
 
     """
     if ndim_supp <= 0:

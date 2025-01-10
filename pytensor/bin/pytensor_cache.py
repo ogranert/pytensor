@@ -30,9 +30,7 @@ def print_help(exit_status):
     print('Type "pytensor-cache clear" to erase the cache')
     print('Type "pytensor-cache list" to print the cache content')
     print('Type "pytensor-cache unlock" to unlock the cache directory')
-    print(
-        'Type "pytensor-cache cleanup" to delete keys in the old ' "format/code version"
-    )
+    print('Type "pytensor-cache cleanup" to delete keys in the old format/code version')
     print('Type "pytensor-cache purge" to force deletion of the cache directory')
     print(
         'Type "pytensor-cache basecompiledir" '
@@ -75,9 +73,9 @@ def main():
             if items:
                 _logger.warning(
                     "There remain elements in the cache dir that you may "
-                    "need to erase manually. The cache dir is:\n  %s\n"
+                    f"need to erase manually. The cache dir is:\n  {config.compiledir}\n"
                     'You can also call "pytensor-cache purge" to '
-                    "remove everything from that directory." % config.compiledir
+                    "remove everything from that directory."
                 )
                 _logger.debug(f"Remaining elements ({len(items)}): {', '.join(items)}")
         elif sys.argv[1] == "list":

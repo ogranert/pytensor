@@ -16,7 +16,7 @@ from pytensor.tensor.type import DenseTensorType
 
 class ExceptionType(Generic):
     def __eq__(self, other):
-        return type(self) == type(other)
+        return type(self) is type(other)
 
     def __hash__(self):
         return hash(type(self))
@@ -48,10 +48,16 @@ class CheckAndRaise(COp):
         self.msg = msg
 
     def __str__(self):
-        return f"CheckAndRaise{{{self.exc_type}({self.msg})}}"
+        name = self.__class__.__name__
+        exc_name = self.exc_type.__name__
+        if len(self.msg) > 30:
+            msg = self.msg[:27] + "..."
+        else:
+            msg = self.msg
+        return f"{name}{{raises={exc_name}, msg='{msg}'}}"
 
     def __eq__(self, other):
-        if type(self) != type(other):
+        if type(self) is not type(other):
             return False
 
         if self.msg == other.msg and self.exc_type == other.exc_type:
@@ -87,7 +93,7 @@ class CheckAndRaise(COp):
 
         return Apply(
             self,
-            [value] + conds,
+            [value, *conds],
             [value.type()],
         )
 
@@ -105,7 +111,7 @@ class CheckAndRaise(COp):
         return [[1]] + [[0]] * (len(node.inputs) - 1)
 
     def c_code(self, node, name, inames, onames, props):
-        if not isinstance(node.inputs[0].type, (DenseTensorType, ScalarType)):
+        if not isinstance(node.inputs[0].type, DenseTensorType | ScalarType):
             raise NotImplementedError(
                 f"CheckAndRaise c_code not implemented for input type {node.inputs[0].type}"
             )
@@ -195,7 +201,11 @@ class Assert(CheckAndRaise):
         super().__init__(AssertionError, msg)
 
     def __str__(self):
-        return f"Assert{{msg={self.msg}}}"
+        if len(self.msg) > 30:
+            msg = self.msg[:27] + "..."
+        else:
+            msg = self.msg
+        return f"Assert{{msg='{msg}'}}"
 
 
 assert_op = Assert()

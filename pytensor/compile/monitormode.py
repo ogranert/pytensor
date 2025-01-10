@@ -105,11 +105,11 @@ def detect_nan(fgraph, i, node, fn):
 
     for output in fn.outputs:
         if (
-            not isinstance(output[0], (np.random.RandomState, np.random.Generator))
+            not isinstance(output[0], np.random.RandomState | np.random.Generator)
             and np.isnan(output[0]).any()
         ):
             print("*** NaN detected ***")
             debugprint(node)
-            print("Inputs : %s" % [input[0] for input in fn.inputs])
-            print("Outputs: %s" % [output[0] for output in fn.outputs])
+            print(f"Inputs : {[input[0] for input in fn.inputs]}")
+            print(f"Outputs: {[output[0] for output in fn.outputs]}")
             break

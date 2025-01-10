@@ -6,7 +6,7 @@ import logging
 import time
 import warnings
 from itertools import chain
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -14,6 +14,7 @@ import pytensor
 import pytensor.compile.profiling
 from pytensor.compile.io import In, SymbolicInput, SymbolicOutput
 from pytensor.compile.ops import deep_copy_op, view_op
+from pytensor.compile.profiling import ProfileStats
 from pytensor.configdefaults import config
 from pytensor.graph.basic import (
     Constant,
@@ -77,8 +78,6 @@ def view_tree_set(fgraph, v, treeset):
     """
     treeset.add(v)
     for cl, v_input_pos_to_cl in fgraph.clients[v]:
-        if cl == "output":
-            continue
         vmap = cl.op.view_map
         dmap = cl.op.destroy_map
         for opos, iposlist in chain(vmap.items(), dmap.items()):
@@ -173,7 +172,7 @@ def std_fgraph(
     input_specs: list[SymbolicInput],
     output_specs: list[SymbolicOutput],
     accept_inplace: bool = False,
-    fgraph: Optional[FunctionGraph] = None,
+    fgraph: FunctionGraph | None = None,
     features: list[type[Feature]] = [PreserveVariableAttributes],
     force_clone=False,
 ) -> tuple[FunctionGraph, list[SymbolicOutput]]:
@@ -212,18 +211,14 @@ def std_fgraph(
 
         found_updates.extend(map(SymbolicOutput, updates))
     elif fgraph is None:
-        input_vars = []
-
         # If one of the inputs is non-atomic (i.e. has a non-`None` `Variable.owner`),
         # then we need to create/clone the graph starting at these inputs.
         # The result will be atomic versions of the given inputs connected to
         # the same outputs.
         # Otherwise, when all the inputs are already atomic, there's no need to
         # clone the graph.
-        clone = force_clone
-        for spec in input_specs:
-            input_vars.append(spec.variable)
-            clone |= spec.variable.owner is not None
+        input_vars = [spec.variable for spec in input_specs]
+        clone = force_clone or any(var.owner is not None for var in input_vars)
 
         fgraph = FunctionGraph(
             input_vars,
@@ -246,7 +241,7 @@ def std_fgraph(
     fgraph.attach_feature(
         Supervisor(
             input
-            for spec, input in zip(input_specs, fgraph.inputs)
+            for spec, input in zip(input_specs, fgraph.inputs, strict=True)
             if not (
                 spec.mutable
                 or (hasattr(fgraph, "destroyers") and fgraph.has_destroyers([input]))
@@ -331,8 +326,8 @@ class Function:
     def __init__(
         self,
         vm: "VM",
-        input_storage,
-        output_storage,
+        input_storage: list[Container],
+        output_storage: list[Container],
         indices,
         outputs,
         defaults,
@@ -340,7 +335,7 @@ class Function:
         return_none: bool,
         output_keys,
         maker: "FunctionMaker",
-        name: Optional[str] = None,
+        name: str | None = None,
     ):
         """
         Parameters
@@ -377,7 +372,6 @@ class Function:
         name
             A string name.
         """
-        # TODO: Rename to `vm`
         self.vm = vm
         self.input_storage = input_storage
         self.output_storage = output_storage
@@ -393,30 +387,53 @@ class Function:
         self.nodes_with_inner_function = []
         self.output_keys = output_keys
 
-        # See if we have any mutable / borrow inputs
-        # TODO: this only need to be set if there is more than one input
-        self._check_for_aliased_inputs = False
-        for i in maker.inputs:
-            # If the input is a shared variable, the memory region is
-            # under PyTensor control and so we don't need to check if it
-            # is aliased as we never do that.
-            if (
-                isinstance(i, In)
-                and not i.shared
-                and (getattr(i, "borrow", False) or getattr(i, "mutable", False))
+        if self.output_keys is not None:
+            warnings.warn("output_keys is deprecated.", FutureWarning)
+
+        assert len(self.input_storage) == len(self.maker.fgraph.inputs)
+        assert len(self.output_storage) == len(self.maker.fgraph.outputs)
+
+        self.has_defaults = any(refeed for _, refeed, _ in self.defaults)
+
+        # Group indexes of inputs that are potentially aliased to each other
+        # Note: Historically, we only worried about aliasing inputs if they belonged to the same type,
+        #  even though there could be two distinct types that use the same kinds of underlying objects.
+        potential_aliased_input_groups = []
+        for inp in maker.inputs:
+            # If the input is a shared variable, the memory region is under PyTensor control
+            # and can't be aliased.
+            if not (
+                isinstance(inp, In)
+                and inp.borrow
+                and not inp.shared
+                and hasattr(inp.variable.type, "may_share_memory")
             ):
-                self._check_for_aliased_inputs = True
-                break
+                continue
+
+            for group in potential_aliased_input_groups:
+                # If one is super of the other, that means one could be replaced by the other
+                if any(
+                    inp.variable.type.is_super(other_inp.variable.type)
+                    or other_inp.variable.type.is_super(inp.variable.type)
+                    for other_inp in group
+                ):
+                    group.append(inp)
+                    break
+            else:  # no break
+                # Input makes a new group
+                potential_aliased_input_groups.append([inp])
+
+        # Potential aliased inputs are those that belong to the same group
+        self._potential_aliased_input_groups: tuple[tuple[int, ...], ...] = tuple(
+            tuple(maker.inputs.index(inp) for inp in group)
+            for group in potential_aliased_input_groups
+            if len(group) > 1
+        )
 
         # We will be popping stuff off this `containers` object.  It is a copy.
         containers = list(self.input_storage)
         finder = {}
         inv_finder = {}
-
-        def distribute(indices, cs, value):
-            input.distribute(value, indices, cs)
-            for c in cs:
-                c.provided += 1
 
         # Store the list of names of named inputs.
         named_inputs = []
@@ -427,7 +444,7 @@ class Function:
         # this loop works by modifying the elements (as variable c) of
         # self.input_storage inplace.
         for i, ((input, indices, sinputs), (required, refeed, value)) in enumerate(
-            zip(self.indices, defaults)
+            zip(self.indices, defaults, strict=True)
         ):
             if indices is None:
                 # containers is being used as a stack. Here we pop off
@@ -525,14 +542,40 @@ class Function:
         self._value = ValueAttribute()
         self._container = ContainerAttribute()
 
-        # TODO: Get rid of all this `expanded_inputs` nonsense
-        assert len(self.maker.expanded_inputs) == len(self.input_storage)
+        update_storage = [
+            container
+            for inp, container in zip(
+                self.maker.expanded_inputs, input_storage, strict=True
+            )
+            if inp.update is not None
+        ]
+        # Updates are the last inner outputs that are not returned by Function.__call__
+        self.n_returned_outputs = len(self.output_storage) - len(update_storage)
 
-        # This is used only when `vm.need_update_inputs` is `False`, because
-        # we're using one of the VM objects and it is putting updates back into
-        # the input containers all by itself.
-        self.n_returned_outputs = len(self.output_storage) - sum(
-            inp.update is not None for inp in self.maker.expanded_inputs
+        # Function.__call__ is responsible for updating the inputs, unless the vm promises to do it itself
+        self.update_input_storage: tuple[int, Container] = ()
+        if getattr(vm, "need_update_inputs", True):
+            self.update_input_storage = tuple(
+                zip(
+                    range(self.n_returned_outputs, len(output_storage)),
+                    update_storage,
+                    strict=True,
+                )
+            )
+
+        # In every function call we place inputs in the input_storage, and the vm places outputs in the output_storage
+        # After the call, we want to erase (some of) these references, to allow Python to GC them if unused
+        # Required input containers are the non-default inputs, must always be provided again, so we GC them
+        self.clear_input_storage_data = tuple(
+            container.storage for container in input_storage if container.required
+        )
+        # This is only done when `vm.allow_gc` is True, which can change at runtime.
+        self.clear_output_storage_data = tuple(
+            container.storage
+            for container, variable in zip(
+                self.output_storage, self.maker.fgraph.outputs, strict=True
+            )
+            if variable.owner is not None  # Not a constant output
         )
 
         for node in self.maker.fgraph.apply_nodes:
@@ -557,11 +600,11 @@ class Function:
 
     def copy(
         self,
-        share_memory=False,
-        swap=None,
-        delete_updates=False,
-        name=None,
-        profile=None,
+        share_memory: bool = False,
+        swap: dict | None = None,
+        delete_updates: bool = False,
+        name: str | None = None,
+        profile: bool | str | ProfileStats | None = None,
     ):
         """
         Copy this function. Copied function will have separated maker and
@@ -588,7 +631,7 @@ class Function:
             If provided, will be the name of the new
             Function. Otherwise, it will be old + " copy"
 
-        profile :
+        profile : bool | str | ProfileStats | None
             as pytensor.function profile parameter
 
         Returns
@@ -656,7 +699,7 @@ class Function:
         else:
             outs = list(map(SymbolicOutput, fg_cpy.outputs))
 
-        for out_ori, out_cpy in zip(maker.outputs, outs):
+        for out_ori, out_cpy in zip(maker.outputs, outs, strict=False):
             out_cpy.borrow = out_ori.borrow
 
         # swap SharedVariable
@@ -664,12 +707,12 @@ class Function:
             exist_svs = [i.variable for i in maker.inputs]
 
             # Check if given ShareVariables exist
-            for sv in swap.keys():
+            for sv in swap:
                 if sv not in exist_svs:
                     raise ValueError(f"SharedVariable: {sv.name} not found")
 
             # Swap SharedVariable in fgraph and In instances
-            for index, (i, in_v) in enumerate(zip(ins, fg_cpy.inputs)):
+            for index, (i, in_v) in enumerate(zip(ins, fg_cpy.inputs, strict=True)):
                 # Variables in maker.inputs are defined by user, therefore we
                 # use them to make comparison and do the mapping.
                 # Otherwise we don't touch them.
@@ -693,7 +736,7 @@ class Function:
 
         # Delete update if needed
         rev_update_mapping = {v: k for k, v in fg_cpy.update_mapping.items()}
-        for n, (inp, in_var) in enumerate(zip(ins, fg_cpy.inputs)):
+        for n, (inp, in_var) in enumerate(zip(ins, fg_cpy.inputs, strict=True)):
             inp.variable = in_var
             if not delete_updates and inp.update is not None:
                 out_idx = rev_update_mapping[n]
@@ -716,9 +759,9 @@ class Function:
         # it is well tested, we don't share the part of the storage_map.
         if share_memory:
             i_o_vars = maker.fgraph.inputs + maker.fgraph.outputs
-            for key in storage_map.keys():
+            for key, val in storage_map.items():
                 if key not in i_o_vars:
-                    new_storage_map[memo[key]] = storage_map[key]
+                    new_storage_map[memo[key]] = val
 
         if not name and self.name:
             name = self.name + " copy"
@@ -727,18 +770,12 @@ class Function:
         # reinitialize new maker and create new function
         if profile is None:
             profile = config.profile or config.print_global_stats
-            # profile -> True or False
         if profile is True:
-            if name:
-                message = name
-            else:
-                message = str(profile.message) + " copy"
-            profile = pytensor.compile.profiling.ProfileStats(message=message)
-            # profile -> object
+            profile = pytensor.compile.profiling.ProfileStats(message=name)
         elif isinstance(profile, str):
             profile = pytensor.compile.profiling.ProfileStats(message=profile)
 
-        f_cpy = maker.__class__(
+        f_cpy = type(maker)(
             inputs=ins,
             outputs=outs,
             fgraph=fg_cpy,
@@ -756,10 +793,16 @@ class Function:
             # check that.
             accept_inplace=True,
             no_fgraph_prep=True,
+            output_keys=maker.output_keys,
+            name=name,
         ).create(input_storage, storage_map=new_storage_map)
 
         for in_ori, in_cpy, ori, cpy in zip(
-            maker.inputs, f_cpy.maker.inputs, self.input_storage, f_cpy.input_storage
+            maker.inputs,
+            f_cpy.maker.inputs,
+            self.input_storage,
+            f_cpy.input_storage,
+            strict=True,
         ):
             # Share immutable ShareVariable and constant input's storage
             swapped = swap is not None and in_ori.variable in swap
@@ -784,11 +827,16 @@ class Function:
 
         f_cpy.trust_input = self.trust_input
         f_cpy.unpack_single = self.unpack_single
-        f_cpy.name = name
-        f_cpy.maker.fgraph.name = name
         return f_cpy
 
-    def __call__(self, *args, **kwargs):
+    def _restore_defaults(self):
+        for i, (required, refeed, value) in enumerate(self.defaults):
+            if refeed:
+                if isinstance(value, Container):
+                    value = value.storage[0]
+                self[i] = value
+
+    def __call__(self, *args, output_subset=None, **kwargs):
         """
         Evaluates value of a function on given arguments.
 
@@ -816,52 +864,46 @@ class Function:
             List of outputs on indices/keys from ``output_subset`` or all of them,
             if ``output_subset`` is not passed.
         """
-
-        def restore_defaults():
-            for i, (required, refeed, value) in enumerate(self.defaults):
-                if refeed:
-                    if isinstance(value, Container):
-                        value = value.storage[0]
-                    self[i] = value
-
+        trust_input = self.trust_input
+        input_storage = self.input_storage
+        vm = self.vm
         profile = self.profile
-        t0 = time.perf_counter()
 
-        output_subset = kwargs.pop("output_subset", None)
-        if output_subset is not None and self.output_keys is not None:
-            output_subset = [self.output_keys.index(key) for key in output_subset]
+        if profile:
+            t0 = time.perf_counter()
+
+        if output_subset is not None:
+            warnings.warn("output_subset is deprecated.", FutureWarning)
+            if self.output_keys is not None:
+                output_subset = [self.output_keys.index(key) for key in output_subset]
 
         # Reinitialize each container's 'provided' counter
-        if self.trust_input:
-            i = 0
-            for arg in args:
-                s = self.input_storage[i]
-                s.storage[0] = arg
-                i += 1
+        if trust_input:
+            for arg_container, arg in zip(input_storage, args, strict=False):
+                arg_container.storage[0] = arg
         else:
-            for c in self.input_storage:
-                c.provided = 0
+            for arg_container in input_storage:
+                arg_container.provided = 0
 
-            if len(args) + len(kwargs) > len(self.input_storage):
+            if len(args) + len(kwargs) > len(input_storage):
                 raise TypeError("Too many parameter passed to pytensor function")
 
             # Set positional arguments
-            i = 0
-            for arg in args:
-                # TODO: provide a option for skipping the filter if we really
-                # want speed.
-                s = self.input_storage[i]
-                # see this emails for a discuation about None as input
+            for arg_container, arg in zip(input_storage, args, strict=False):
+                # See discussion about None as input
                 # https://groups.google.com/group/theano-dev/browse_thread/thread/920a5e904e8a8525/4f1b311a28fc27e5
                 if arg is None:
-                    s.storage[0] = arg
+                    arg_container.storage[0] = arg
                 else:
                     try:
-                        s.storage[0] = s.type.filter(
-                            arg, strict=s.strict, allow_downcast=s.allow_downcast
+                        arg_container.storage[0] = arg_container.type.filter(
+                            arg,
+                            strict=arg_container.strict,
+                            allow_downcast=arg_container.allow_downcast,
                         )
 
                     except Exception as e:
+                        i = input_storage.index(arg_container)
                         function_name = "pytensor function"
                         argument_name = "argument"
                         if self.name:
@@ -886,93 +928,70 @@ class Function:
                                 + function_name
                                 + f" at index {int(i)} (0-based). {where}"
                             ) + e.args
-                        restore_defaults()
+                        self._restore_defaults()
                         raise
-                s.provided += 1
-                i += 1
+                arg_container.provided += 1
 
         # Set keyword arguments
         if kwargs:  # for speed, skip the items for empty kwargs
             for k, arg in kwargs.items():
                 self[k] = arg
 
-        if (
-            not self.trust_input
-            and
-            # The getattr is only needed for old pickle
-            getattr(self, "_check_for_aliased_inputs", True)
-        ):
+        if not trust_input:
             # Collect aliased inputs among the storage space
-            args_share_memory = []
-            for i in range(len(self.input_storage)):
-                i_var = self.maker.inputs[i].variable
-                i_val = self.input_storage[i].storage[0]
-                if hasattr(i_var.type, "may_share_memory"):
-                    is_aliased = False
-                    for j in range(len(args_share_memory)):
-                        group_j = zip(
-                            [
-                                self.maker.inputs[k].variable
-                                for k in args_share_memory[j]
-                            ],
-                            [
-                                self.input_storage[k].storage[0]
-                                for k in args_share_memory[j]
-                            ],
-                        )
-                        if any(
-                            (
-                                var.type is i_var.type
-                                and var.type.may_share_memory(val, i_val)
-                            )
-                            for (var, val) in group_j
-                        ):
-                            is_aliased = True
-                            args_share_memory[j].append(i)
-                            break
+            for potential_group in self._potential_aliased_input_groups:
+                args_share_memory: list[list[int]] = []
+                for i in potential_group:
+                    i_type = self.maker.inputs[i].variable.type
+                    i_val = input_storage[i].storage[0]
 
-                    if not is_aliased:
+                    # Check if value is aliased with any of the values in one of the groups
+                    for j_group in args_share_memory:
+                        if any(
+                            i_type.may_share_memory(input_storage[j].storage[0], i_val)
+                            for j in j_group
+                        ):
+                            j_group.append(i)
+                            break
+                    else:  # no break
+                        # Create a new group
                         args_share_memory.append([i])
 
-            # Check for groups of more than one argument that share memory
-            for group in args_share_memory:
-                if len(group) > 1:
-                    # copy all but the first
-                    for j in group[1:]:
-                        self.input_storage[j].storage[0] = copy.copy(
-                            self.input_storage[j].storage[0]
-                        )
+                # Check for groups of more than one argument that share memory
+                for group in args_share_memory:
+                    if len(group) > 1:
+                        # copy all but the first
+                        for i in group[1:]:
+                            input_storage[i].storage[0] = copy.copy(
+                                input_storage[i].storage[0]
+                            )
 
-        # Check if inputs are missing, or if inputs were set more than once, or
-        # if we tried to provide inputs that are supposed to be implicit.
-        if not self.trust_input:
-            for c in self.input_storage:
-                if c.required and not c.provided:
-                    restore_defaults()
+            # Check if inputs are missing, or if inputs were set more than once, or
+            # if we tried to provide inputs that are supposed to be implicit.
+            for arg_container in input_storage:
+                if arg_container.required and not arg_container.provided:
+                    self._restore_defaults()
                     raise TypeError(
-                        f"Missing required input: {getattr(self.inv_finder[c], 'variable', self.inv_finder[c])}"
+                        f"Missing required input: {getattr(self.inv_finder[arg_container], 'variable', self.inv_finder[arg_container])}"
                     )
-                if c.provided > 1:
-                    restore_defaults()
+                if arg_container.provided > 1:
+                    self._restore_defaults()
                     raise TypeError(
-                        f"Multiple values for input: {getattr(self.inv_finder[c], 'variable', self.inv_finder[c])}"
+                        f"Multiple values for input: {getattr(self.inv_finder[arg_container], 'variable', self.inv_finder[arg_container])}"
                     )
-                if c.implicit and c.provided > 0:
-                    restore_defaults()
+                if arg_container.implicit and arg_container.provided > 0:
+                    self._restore_defaults()
                     raise TypeError(
-                        f"Tried to provide value for implicit input: {getattr(self.inv_finder[c], 'variable', self.inv_finder[c])}"
+                        f"Tried to provide value for implicit input: {getattr(self.inv_finder[arg_container], 'variable', self.inv_finder[arg_container])}"
                     )
 
         # Do the actual work
-        t0_fn = time.perf_counter()
+        if profile:
+            t0_fn = time.perf_counter()
         try:
-            outputs = (
-                self.vm()
-                if output_subset is None
-                else self.vm(output_subset=output_subset)
-            )
+            outputs = vm() if output_subset is None else vm(output_subset=output_subset)
         except Exception:
-            restore_defaults()
+            self._restore_defaults()
             if hasattr(self.vm, "position_of_error"):
                 # this is a new vm-provided function or c linker
                 # they need this because the exception manipulation
@@ -990,85 +1009,60 @@ class Function:
                 # old-style linkers raise their own exceptions
                 raise
 
-        dt_fn = time.perf_counter() - t0_fn
-        self.maker.mode.fn_time += dt_fn
         if profile:
+            dt_fn = time.perf_counter() - t0_fn
+            self.maker.mode.fn_time += dt_fn
             profile.vm_call_time += dt_fn
 
         # Retrieve the values that were computed
         if outputs is None:
-            outputs = [x.data for x in self.output_storage]
-        assert len(outputs) == len(self.output_storage)
+            outputs = [x.storage[0] for x in self.output_storage]
 
-        # Remove internal references to required inputs.
-        # These cannot be re-used anyway.
-        for c in self.input_storage:
-            if c.required:
-                c.storage[0] = None
+        # Set updates and filter them out from the returned outputs
+        for i, input_storage in self.update_input_storage:
+            input_storage.storage[0] = outputs[i]
+        outputs = outputs[: self.n_returned_outputs]
 
-        # if we are allowing garbage collection, remove the
-        # output reference from the internal storage cells
-        if getattr(self.vm, "allow_gc", False):
-            assert len(self.output_storage) == len(self.maker.fgraph.outputs)
-            for o_container, o_variable in zip(
-                self.output_storage, self.maker.fgraph.outputs
-            ):
-                if o_variable.owner is not None:
-                    # this node is the variable of computation
-                    # WARNING: This circumvents the 'readonly' attribute in x
-                    o_container.storage[0] = None
-
-        # TODO: Get rid of this and `expanded_inputs`, since all the VMs now
-        # perform the updates themselves
-        if getattr(self.vm, "need_update_inputs", True):
-            # Update the inputs that have an update function
-            for input, storage in reversed(
-                list(zip(self.maker.expanded_inputs, self.input_storage))
-            ):
-                if input.update is not None:
-                    storage.data = outputs.pop()
-        else:
-            outputs = outputs[: self.n_returned_outputs]
+        # Remove input and output values from storage data
+        for storage_data in self.clear_input_storage_data:
+            storage_data[0] = None
+        if getattr(vm, "allow_gc", False):
+            for storage_data in self.clear_output_storage_data:
+                storage_data[0] = None
 
         # Put default values back in the storage
-        restore_defaults()
-        #
-        # NOTE: This logic needs to be replicated in
-        #       scan.
-        #       grep for 'PROFILE_CODE'
-        #
+        if self.has_defaults:
+            self._restore_defaults()
 
-        dt_call = time.perf_counter() - t0
-        pytensor.compile.profiling.total_fct_exec_time += dt_call
-        self.maker.mode.call_time += dt_call
         if profile:
+            dt_call = time.perf_counter() - t0
+            pytensor.compile.profiling.total_fct_exec_time += dt_call
+            self.maker.mode.call_time += dt_call
             profile.fct_callcount += 1
             profile.fct_call_time += dt_call
-            if hasattr(self.vm, "update_profile"):
-                self.vm.update_profile(profile)
+            if hasattr(vm, "update_profile"):
+                vm.update_profile(profile)
             if profile.ignore_first_call:
                 profile.reset()
                 profile.ignore_first_call = False
+
         if self.return_none:
             return None
-        elif self.unpack_single and len(outputs) == 1 and output_subset is None:
-            return outputs[0]
-        else:
-            if self.output_keys is not None:
-                assert len(self.output_keys) == len(outputs)
 
-                if output_subset is None:
-                    return dict(zip(self.output_keys, outputs))
-                else:
-                    return {
-                        self.output_keys[index]: outputs[index]
-                        for index in output_subset
-                    }
+        if output_subset is not None:
+            outputs = [outputs[i] for i in output_subset]
 
-            if output_subset is None:
-                return outputs
+        if self.output_keys is None:
+            if self.unpack_single:
+                [out] = outputs
+                return out
             else:
-                return [outputs[i] for i in output_subset]
+                return outputs
+        else:
+            output_keys = self.output_keys
+            if output_subset is not None:
+                output_keys = [output_keys[i] for i in output_subset]
+            return dict(zip(output_keys, outputs, strict=True))
 
     value = property(
         lambda self: self._value,
@@ -1078,7 +1072,7 @@ class Function:
     container = property(
         lambda self: self._container,
         None,  # this property itself is not settable
-        doc=("dictionary-like access to the containers associated with " "Variables"),
+        doc=("dictionary-like access to the containers associated with Variables"),
     )
 
     def free(self):
@@ -1088,9 +1082,10 @@ class Function:
         # 1.no allow_gc return False
         # 2.has allow_gc, if allow_gc is False, return True
         if not getattr(self.vm, "allow_gc", True):
-            for key in self.vm.storage_map:
-                if not isinstance(key, Constant):
-                    self.vm.storage_map[key][0] = None
+            storage_map = self.vm.storage_map
+            for key, value in storage_map.items():
+                if key.owner is not None:  # Not a constant
+                    value[0] = None
 
             for node in self.nodes_with_inner_function:
                 if hasattr(node.fn, "free"):
@@ -1102,9 +1097,17 @@ class Function:
         """
         return [i.variable for i in self.maker.inputs if i.implicit]
 
-    def sync_shared(self):
-        # NOTE: sync was needed on old gpu backend
-        pass
+    def dprint(self, **kwargs):
+        """Debug print itself
+
+        Parameters
+        ----------
+        kwargs:
+            Optional keyword arguments to pass to debugprint function.
+        """
+        from pytensor.printing import debugprint
+
+        return debugprint(self, **kwargs)
 
 
 # pickling/deepcopy support for Function
@@ -1113,8 +1116,9 @@ def _pickle_Function(f):
     ins = list(f.input_storage)
     input_storage = []
 
+    # strict=False because we are in a hot loop
     for (input, indices, inputs), (required, refeed, default) in zip(
-        f.indices, f.defaults
+        f.indices, f.defaults, strict=False
     ):
         input_storage.append(ins[0])
         del ins[0]
@@ -1156,7 +1160,7 @@ def _constructor_Function(maker, input_storage, inputs_data, trust_input=False):
 
     f = maker.create(input_storage)
     assert len(f.input_storage) == len(inputs_data)
-    for container, x in zip(f.input_storage, inputs_data):
+    for container, x in zip(f.input_storage, inputs_data, strict=True):
         assert (
             (container.data is x)
             or (isinstance(x, np.ndarray) and (container.data == x).all())
@@ -1190,7 +1194,7 @@ def insert_deepcopy(fgraph, wrapped_inputs, wrapped_outputs):
     reason = "insert_deepcopy"
     updated_fgraph_inputs = {
         fgraph_i
-        for i, fgraph_i in zip(wrapped_inputs, fgraph.inputs)
+        for i, fgraph_i in zip(wrapped_inputs, fgraph.inputs, strict=True)
         if getattr(i, "update", False)
     }
 
@@ -1199,8 +1203,11 @@ def insert_deepcopy(fgraph, wrapped_inputs, wrapped_outputs):
     has_destroyers_attr = hasattr(fgraph, "has_destroyers")
 
     for i in range(len(fgraph.outputs)):
+        original_out = fgraph.outputs[i]
+        output_client = fgraph.get_output_client(i)
+
         views_of_output_i = set()
-        view_tree_set(fgraph, alias_root(fgraph.outputs[i]), views_of_output_i)
+        view_tree_set(fgraph, alias_root(original_out), views_of_output_i)
         copied = False
         # do not allow outputs to be aliased
         for j in range(i + 1, len(fgraph.outputs)):
@@ -1209,16 +1216,16 @@ def insert_deepcopy(fgraph, wrapped_inputs, wrapped_outputs):
             if fgraph.outputs[j] in views_of_output_i:
                 if wrapped_outputs[i].borrow and wrapped_outputs[j].borrow:
                     fgraph.change_node_input(
-                        "output", i, view_op(fgraph.outputs[i]), reason=reason
+                        *output_client, view_op(original_out), reason=reason
                     )
                 else:
                     fgraph.change_node_input(
-                        "output", i, deep_copy_op(fgraph.outputs[i]), reason=reason
+                        *output_client, deep_copy_op(original_out), reason=reason
                     )
                 copied = True
                 break
 
-        if not copied:
+        if not copied:  # no-break
             for input_j in all_graph_inputs:
                 # do not allow outputs to be aliased to an inputs (j), unless
                 # a) that j'th input has been 'destroyed' by
@@ -1236,33 +1243,29 @@ def insert_deepcopy(fgraph, wrapped_inputs, wrapped_outputs):
                         j = fgraph.inputs.index(input_j)
                         if wrapped_outputs[i].borrow and wrapped_inputs[j].borrow:
                             fgraph.change_node_input(
-                                "output",
-                                i,
-                                view_op(fgraph.outputs[i]),
+                                *output_client,
+                                view_op(original_out),
                                 reason=reason,
                             )
                             break
                         else:
                             fgraph.change_node_input(
-                                "output",
-                                i,
-                                deep_copy_op(fgraph.outputs[i]),
+                                *output_client,
+                                deep_copy_op(original_out),
                                 reason=reason,
                             )
                             break
                     elif wrapped_outputs[i].borrow:
                         fgraph.change_node_input(
-                            "output",
-                            i,
-                            view_op(fgraph.outputs[i]),
+                            *output_client,
+                            view_op(original_out),
                             reason=reason,
                         )
                         break
                     else:
                         fgraph.change_node_input(
-                            "output",
-                            i,
-                            deep_copy_op(fgraph.outputs[i]),
+                            *output_client,
+                            deep_copy_op(original_out),
                             reason=reason,
                         )
                         break
@@ -1310,7 +1313,7 @@ class FunctionMaker:
         elif isinstance(input, Variable):
             # r -> SymbolicInput(variable=r)
             return SymbolicInput(input)
-        elif isinstance(input, (list, tuple)):
+        elif isinstance(input, list | tuple):
             # (r, u) -> SymbolicInput(variable=r, update=u)
             if len(input) == 2:
                 return SymbolicInput(input[0], update=input[1])
@@ -1446,7 +1449,7 @@ class FunctionMaker:
         if not hasattr(mode.linker, "accept"):
             raise ValueError(
                 "'linker' parameter of FunctionMaker should be "
-                f"a Linker with an accept method or one of {list(pytensor.compile.mode.predefined_linkers.keys())}"
+                f"a Linker with an accept method or one of {list(pytensor.compile.mode.predefined_linkers)}"
             )
 
     def __init__(
@@ -1495,10 +1498,10 @@ class FunctionMaker:
         if outputs is None:
             return_none = True
             outputs = []
-        if not isinstance(outputs, (list, tuple)):
+        if not isinstance(outputs, list | tuple):
             unpack_single = True
             outputs = [outputs]
-        if not isinstance(inputs, (list, tuple)):
+        if not isinstance(inputs, list | tuple):
             inputs = [inputs]
 
         # Wrap them in In or Out instances if needed.
@@ -1528,7 +1531,9 @@ class FunctionMaker:
         # return the internal storage pointer.
         no_borrow = [
             output
-            for output, spec in zip(fgraph.outputs, outputs + found_updates)
+            for output, spec in zip(
+                fgraph.outputs, outputs + found_updates, strict=True
+            )
             if not spec.borrow
         ]
 
@@ -1572,6 +1577,8 @@ class FunctionMaker:
             )
             for i in self.inputs
         ]
+        if any(self.refeed):
+            warnings.warn("Inputs with default values are deprecated.", FutureWarning)
 
     def create(self, input_storage=None, storage_map=None):
         """
@@ -1595,7 +1602,7 @@ class FunctionMaker:
         # defaults lists.
         assert len(self.indices) == len(input_storage)
         for i, ((input, indices, subinputs), input_storage_i) in enumerate(
-            zip(self.indices, input_storage)
+            zip(self.indices, input_storage, strict=True)
         ):
             # Replace any default value given as a variable by its
             # container.  Note that this makes sense only in the
@@ -1693,7 +1700,7 @@ def orig_function(
     profile=None,
     on_unused_input=None,
     output_keys=None,
-    fgraph: Optional[FunctionGraph] = None,
+    fgraph: FunctionGraph | None = None,
 ) -> Function:
     """
     Return a Function that will calculate the outputs from the inputs.
@@ -1734,14 +1741,14 @@ def orig_function(
     inputs = list(map(convert_function_input, inputs))
 
     if outputs is not None:
-        if isinstance(outputs, (list, tuple)):
+        if isinstance(outputs, list | tuple):
             outputs = list(map(FunctionMaker.wrap_out, outputs))
         else:
             outputs = FunctionMaker.wrap_out(outputs)
 
     defaults = [getattr(input, "value", None) for input in inputs]
 
-    if isinstance(mode, (list, tuple)):
+    if isinstance(mode, list | tuple):
         raise ValueError("We do not support the passing of multiple modes")
 
     fn = None
@@ -1797,7 +1804,7 @@ def convert_function_input(input):
         raise TypeError(f"A Constant instance is not a legal function input: {input}")
     elif isinstance(input, Variable):
         return In(input)
-    elif isinstance(input, (list, tuple)):
+    elif isinstance(input, list | tuple):
         orig = input
         if not input:
             raise TypeError(f"Nonsensical input specification: {input}")
@@ -1806,7 +1813,7 @@ def convert_function_input(input):
             input = input[1:]
         else:
             name = None
-        if isinstance(input[0], (list, tuple)):
+        if isinstance(input[0], list | tuple):
             if len(input[0]) != 2 or len(input) != 2:
                 raise TypeError(
                     f"Invalid input syntax: {orig} (check "
@@ -1843,7 +1850,7 @@ def convert_function_input(input):
             raise TypeError(
                 f"Unknown update type: {type(update)}, expected Variable instance"
             )
-        if value is not None and isinstance(value, (Variable, SymbolicInput)):
+        if value is not None and isinstance(value, Variable | SymbolicInput):
             raise TypeError(
                 f"The value for input {variable} should not be a Variable "
                 f"or SymbolicInput instance (got: {value})"
@@ -1890,11 +1897,7 @@ def get_info_on_inputs(named_inputs, n_unnamed_inputs):
                 )
     else:
         if n_unnamed_inputs == 0:
-            msg = "The function has {} named input{} ({}).".format(
-                n_named_inputs,
-                get_plural(n_named_inputs),
-                ", ".join(named_inputs),
-            )
+            msg = f"The function has {n_named_inputs} named input{get_plural(n_named_inputs)} ({', '.join(named_inputs)})."
         else:
             msg = (
                 f"The function has {n_named_inputs} named input{get_plural(n_named_inputs)} ({', '.join(named_inputs)}), and {n_unnamed_inputs} unnamed "

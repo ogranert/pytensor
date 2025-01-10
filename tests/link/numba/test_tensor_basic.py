@@ -44,7 +44,7 @@ def test_Alloc(v, shape):
         [
             i.tag.test_value
             for i in g_fg.inputs
-            if not isinstance(i, (SharedVariable, Constant))
+            if not isinstance(i, SharedVariable | Constant)
         ],
     )
 
@@ -74,7 +74,7 @@ def test_TensorFromScalar(v):
         [
             i.tag.test_value
             for i in g_fg.inputs
-            if not isinstance(i, (SharedVariable, Constant))
+            if not isinstance(i, SharedVariable | Constant)
         ],
     )
 
@@ -93,7 +93,7 @@ def test_ScalarFromTensor(v):
         [
             i.tag.test_value
             for i in g_fg.inputs
-            if not isinstance(i, (SharedVariable, Constant))
+            if not isinstance(i, SharedVariable | Constant)
         ],
     )
 
@@ -107,7 +107,7 @@ def test_Unbroadcast():
         [
             i.tag.test_value
             for i in g_fg.inputs
-            if not isinstance(i, (SharedVariable, Constant))
+            if not isinstance(i, SharedVariable | Constant)
         ],
     )
 
@@ -149,7 +149,7 @@ def test_MakeVector(vals, dtype):
         [
             i.tag.test_value
             for i in g_fg.inputs
-            if not isinstance(i, (SharedVariable, Constant))
+            if not isinstance(i, SharedVariable | Constant)
         ],
     )
 
@@ -174,7 +174,7 @@ def test_ARange(start, stop, step, dtype):
         [
             i.tag.test_value
             for i in g_fg.inputs
-            if not isinstance(i, (SharedVariable, Constant))
+            if not isinstance(i, SharedVariable | Constant)
         ],
     )
 
@@ -237,7 +237,7 @@ def test_Join(vals, axis):
         [
             i.tag.test_value
             for i in g_fg.inputs
-            if not isinstance(i, (SharedVariable, Constant))
+            if not isinstance(i, SharedVariable | Constant)
         ],
     )
 
@@ -256,7 +256,7 @@ def test_Join_view():
             [
                 i.tag.test_value
                 for i in g_fg.inputs
-                if not isinstance(i, (SharedVariable, Constant))
+                if not isinstance(i, SharedVariable | Constant)
             ],
         )
 
@@ -316,7 +316,7 @@ def test_Split(n_splits, axis, values, sizes):
         [
             i.tag.test_value
             for i in g_fg.inputs
-            if not isinstance(i, (SharedVariable, Constant))
+            if not isinstance(i, SharedVariable | Constant)
         ],
     )
 
@@ -375,7 +375,7 @@ def test_ExtractDiag(val, offset):
         [
             i.tag.test_value
             for i in g_fg.inputs
-            if not isinstance(i, (SharedVariable, Constant))
+            if not isinstance(i, SharedVariable | Constant)
         ],
     )
 
@@ -386,6 +386,8 @@ def test_ExtractDiag(val, offset):
 )
 @pytest.mark.parametrize("reverse_axis", (False, True))
 def test_ExtractDiag_exhaustive(k, axis1, axis2, reverse_axis):
+    from pytensor.link.numba.dispatch.basic import numba_njit
+
     if reverse_axis:
         axis1, axis2 = axis2, axis1
 
@@ -394,7 +396,12 @@ def test_ExtractDiag_exhaustive(k, axis1, axis2, reverse_axis):
     x_test = np.arange(np.prod(x_shape)).reshape(x_shape)
     out = pt.diagonal(x, k, axis1, axis2)
     numba_fn = numba_funcify(out.owner.op, out.owner)
-    np.testing.assert_allclose(numba_fn(x_test), np.diagonal(x_test, k, axis1, axis2))
+
+    @numba_njit(no_cpython_wrapper=False)
+    def wrap(x):
+        return numba_fn(x)
+
+    np.testing.assert_allclose(wrap(x_test), np.diagonal(x_test, k, axis1, axis2))
 
 
 @pytest.mark.parametrize(
@@ -424,6 +431,6 @@ def test_Eye(n, m, k, dtype):
         [
             i.tag.test_value
             for i in g_fg.inputs
-            if not isinstance(i, (SharedVariable, Constant))
+            if not isinstance(i, SharedVariable | Constant)
         ],
     )

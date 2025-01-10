@@ -2,10 +2,11 @@
 Locking mechanism to ensure no two compilations occur simultaneously
 in the same compilation directory (which can cause crashes).
 """
+
 import os
 import threading
 from contextlib import contextmanager
-from typing import Optional, Union
+from pathlib import Path
 
 import filelock
 
@@ -35,7 +36,7 @@ def force_unlock(lock_dir: os.PathLike):
         Path to a directory that was locked with `lock_ctx`.
     """
 
-    fl = filelock.FileLock(os.path.join(lock_dir, ".lock"))
+    fl = filelock.FileLock(Path(lock_dir) / ".lock")
     fl.release(force=True)
 
     dir_key = f"{lock_dir}-{os.getpid()}"
@@ -46,7 +47,9 @@ def force_unlock(lock_dir: os.PathLike):
 
 @contextmanager
 def lock_ctx(
-    lock_dir: Union[str, os.PathLike] = None, *, timeout: Optional[float] = None
+    lock_dir: str | os.PathLike | None = None,
+    *,
+    timeout: float | None = None,
 ):
     """Context manager that wraps around FileLock and SoftFileLock from filelock package.
 
@@ -70,7 +73,7 @@ def lock_ctx(
 
     if dir_key not in local_mem._locks:
         local_mem._locks[dir_key] = True
-        fl = filelock.FileLock(os.path.join(lock_dir, ".lock"))
+        fl = filelock.FileLock(Path(lock_dir) / ".lock")
         fl.acquire(timeout=timeout)
         try:
             yield

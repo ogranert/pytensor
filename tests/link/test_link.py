@@ -1,5 +1,5 @@
+from collections.abc import Callable
 from copy import deepcopy
-from typing import Callable
 
 import numpy as np
 
@@ -44,7 +44,7 @@ def make_function(linker: Linker, unpack_single: bool = True, **kwargs) -> Calla
         got = len(args)
         if got != takes:
             raise TypeError(f"Function call takes exactly {takes} args ({got} given)")
-        for arg, variable in zip(args, inputs):
+        for arg, variable in zip(args, inputs, strict=True):
             variable.data = arg
         thunk()
         if unpack_single:

@@ -5,7 +5,6 @@ TODO: add support for IfElse Op, LazyLinker, etc.
 
 """
 
-
 import copy
 import gc
 import logging
@@ -14,7 +13,6 @@ from io import StringIO
 from itertools import chain
 from itertools import product as itertools_product
 from logging import Logger
-from typing import Optional
 from warnings import warn
 
 import numpy as np
@@ -32,6 +30,7 @@ from pytensor.configdefaults import config
 from pytensor.graph.basic import Variable, io_toposort
 from pytensor.graph.destroyhandler import DestroyHandler
 from pytensor.graph.features import AlreadyThere, BadOptimization
+from pytensor.graph.fg import Output
 from pytensor.graph.op import HasInnerGraph, Op
 from pytensor.graph.utils import InconsistencyError, MethodNotDefined
 from pytensor.link.basic import Container, LocalLinker
@@ -479,7 +478,7 @@ def _check_inputs(
     """
     destroyed_idx_list = []
     destroy_map = node.op.destroy_map
-    for o_pos, i_pos_list in destroy_map.items():
+    for i_pos_list in destroy_map.values():
         destroyed_idx_list.extend(i_pos_list)
     destroyed_res_list = [node.inputs[i] for i in destroyed_idx_list]
 
@@ -599,7 +598,7 @@ def _check_viewmap(fgraph, node, storage_map):
         # TODO: make sure this is correct
         # According to OB, duplicate inputs are rejected on build graph time
         # if they cause problems. So if they are here it should be ok.
-        for key, val in good_alias.items():
+        for key in good_alias:
             bad_alias.pop(key, None)
         if bad_alias:
             raise BadViewMap(node, oi, outstorage, list(bad_alias.values()))
@@ -630,7 +629,9 @@ def _is_used_in_graph(fgraph, var):
         True if `var` is used by another node in the graph.
 
     """
-    return not (fgraph.clients[var] == [("output", 1)] or fgraph.clients[var] == [])
+    return any(
+        client for client, _ in fgraph.clients[var] if not isinstance(client.op, Output)
+    )
 
 
 def _check_strides_match(a, b, warn_err, op):
@@ -681,7 +682,7 @@ def _lessbroken_deepcopy(a):
     # This logic is also in link.py
     from pytensor.link.c.type import _cdata_type
 
-    if isinstance(a, (np.ndarray, np.memmap)):
+    if isinstance(a, np.ndarray | np.memmap):
         rval = a.copy(order="K")
     elif isinstance(a, _cdata_type):
         # This is not copyable (and should be used for constant data).
@@ -689,7 +690,7 @@ def _lessbroken_deepcopy(a):
     else:
         rval = copy.deepcopy(a)
 
-    assert type(rval) == type(a), (type(rval), type(a))
+    assert type(rval) is type(a), (type(rval), type(a))
 
     if isinstance(rval, np.ndarray):
         assert rval.dtype == a.dtype
@@ -755,10 +756,7 @@ def _get_preallocated_maps(
     # TODO: Sparse? Scalar does not really make sense.
 
     # Do not preallocate memory for outputs that actually work inplace
-    considered_outputs = []
-    for r in node.outputs:
-        if r not in inplace_outs:
-            considered_outputs.append(r)
+    considered_outputs = [r for r in node.outputs if r not in inplace_outs]
 
     # Output storage that was initially present in the storage_map
     if "initial" in prealloc_modes or "ALL" in prealloc_modes:
@@ -867,7 +865,7 @@ def _get_preallocated_maps(
                 # except if broadcastable, or for dimensions above
                 # config.DebugMode__check_preallocated_output_ndim
                 buf_shape = []
-                for s, b in zip(r_vals[r].shape, r.broadcastable):
+                for s, b in zip(r_vals[r].shape, r.broadcastable, strict=True):
                     if b or ((r.ndim - len(buf_shape)) > check_ndim):
                         buf_shape.append(s)
                     else:
@@ -892,9 +890,9 @@ def _get_preallocated_maps(
 
         # Use the same step on all dimensions before the last check_ndim.
         if all(s == 1 for s in out_shape[:-check_ndim]):
-            step_signs_list = [(1,)] + step_signs_list
+            step_signs_list = [(1,), *step_signs_list]
         else:
-            step_signs_list = [(-1, 1)] + step_signs_list
+            step_signs_list = [(-1, 1), *step_signs_list]
 
         for step_signs in itertools_product(*step_signs_list):
             for step_size in (1, 2):
@@ -908,11 +906,10 @@ def _get_preallocated_maps(
                 name = f"strided{tuple(steps)}"
                 for r in considered_outputs:
                     if r in init_strided:
-                        strides = []
-                        shapes = []
-                        for i, size in enumerate(r_vals[r].shape):
-                            shapes.append(slice(None, size, None))
-                            strides.append(slice(None, None, steps[i]))
+                        shapes = [slice(None, size, None) for size in r_vals[r].shape]
+                        strides = [
+                            slice(None, None, steps[i]) for i in range(r_vals[r].ndim)
+                        ]
 
                         r_buf = init_strided[r]
 
@@ -946,7 +943,7 @@ def _get_preallocated_maps(
                         r_shape_diff = shape_diff[: r.ndim]
                         new_buf_shape = [
                             max((s + sd), 0)
-                            for s, sd in zip(r_vals[r].shape, r_shape_diff)
+                            for s, sd in zip(r_vals[r].shape, r_shape_diff, strict=True)
                         ]
                         new_buf = np.empty(new_buf_shape, dtype=r.type.dtype)
                         new_buf[...] = np.asarray(def_val).astype(r.type.dtype)
@@ -980,9 +977,9 @@ def _check_preallocated_output(
     # disable memory checks in that mode, since they were already run.
     try:
         changed_inner_mode = False
-        if isinstance(getattr(node, "op", None), HasInnerGraph):
+        if isinstance(node.op, HasInnerGraph):
             fn = node.op.fn
-            if not fn or not hasattr(fn, "maker") or not hasattr(fn.maker, "mode"):
+            if not (fn and hasattr(fn, "maker") and hasattr(fn.maker, "mode")):
                 _logger.warning(f"Expected pytensor function not found in {node.op}.fn")
             else:
                 if isinstance(fn.maker.mode, DebugMode):
@@ -1135,18 +1132,14 @@ class _FunctionGraphEvent:
 
     def __init__(self, kind, node, idx=None, reason=None):
         self.kind = kind
-        if node == "output":
-            self.node = "output"
-            self.op = "output"
-        else:
-            self.node = node
-            self.op = node.op
+        self.node = node
+        self.op = node.op
         self.idx = idx
         self.reason = str(reason)
 
     def __str__(self):
         if self.kind == "change":
-            if self.op != "output":
+            if not isinstance(self.op, Output):
                 msg = str(len(self.node.inputs))
             else:
                 msg = ""
@@ -1156,7 +1149,7 @@ class _FunctionGraphEvent:
             return str(self.__dict__)
 
     def __eq__(self, other):
-        rval = type(self) == type(other)
+        rval = type(self) is type(other)
         if rval:
             # nodes are not compared because this comparison is
             # supposed to be true for corresponding events that happen
@@ -1355,7 +1348,7 @@ class _Linker(LocalLinker):
         self.maker = maker
         super().__init__(scheduler=schedule)
 
-    def accept(self, fgraph, no_recycling: Optional[list] = None, profile=None):
+    def accept(self, fgraph, no_recycling: list | None = None, profile=None):
         if no_recycling is None:
             no_recycling = []
         if self.fgraph is not None and self.fgraph is not fgraph:
@@ -1582,7 +1575,7 @@ class _Linker(LocalLinker):
                 # try:
                 # compute the value of all variables
                 for i, (thunk_py, thunk_c, node) in enumerate(
-                    zip(thunks_py, thunks_c, order)
+                    zip(thunks_py, thunks_c, order, strict=True)
                 ):
                     _logger.debug(f"{i} - starting node {i} {node}")
 
@@ -1621,14 +1614,10 @@ class _Linker(LocalLinker):
                             opt = str(reason[0][0])
                             msg = (
                                 f"An optimization (probably {opt}) inserted an "
-                                "apply node that raise an error."
-                                + "\nThe information we have about this "
-                                "optimizations is:"
-                                + str(reason[0][1])
-                                + "\n"
-                                + reason[0][2]
-                                + "\n\nThe original exception: \n"
-                                + str(e)
+                                "apply node that raise an error.\n"
+                                "The information we have about this optimization is:"
+                                f"{reason[0][1]}\n{reason[0][2]}\n"
+                                f"\nThe original exception: \n{e}"
                             )
                             new_e = e.__class__(msg)
                             exc_type, exc_value, exc_trace = sys.exc_info()
@@ -1732,15 +1721,11 @@ class _Linker(LocalLinker):
                                 raise
                             opt = str(reason[0][0])
                             msg = (
-                                f"An optimization (probably {opt}) inserted "
-                                "an apply node that raise an error."
-                                + "\nThe information we have about this "
-                                "optimizations is:"
-                                + str(reason[0][1])
-                                + "\n"
-                                + reason[0][2]
-                                + "\n\nThe original exception: \n"
-                                + str(e)
+                                f"An optimization (probably {opt}) inserted an "
+                                "apply node that raise an error.\n"
+                                "The information we have about this optimization is:"
+                                f"{reason[0][1]}\n{reason[0][2]}\n"
+                                f"\nThe original exception: \n{e}"
                             )
                             new_e = e.__class__(msg)
                             exc_type, exc_value, exc_trace = sys.exc_info()
@@ -1866,11 +1851,11 @@ class _Linker(LocalLinker):
                 # Nothing should be in storage map after evaluating
                 # each the thunk (specifically the last one)
                 for r, s in storage_map.items():
-                    assert type(s) is list
+                    assert isinstance(s, list)
                     assert s[0] is None
 
                 # store our output variables to their respective storage lists
-                for output, storage in zip(fgraph.outputs, output_storage):
+                for output, storage in zip(fgraph.outputs, output_storage, strict=True):
                     storage[0] = r_vals[output]
 
                 # transfer all inputs back to their respective storage lists
@@ -1891,7 +1876,7 @@ class _Linker(LocalLinker):
                         # HACK TO LOOK LIKE A REAL DESTRUCTIVE ACTION
                         # TOOK PLACE
                         if (
-                            isinstance(dr_vals[r][0], (np.ndarray, np.memmap))
+                            isinstance(dr_vals[r][0], np.ndarray | np.memmap)
                             and (dr_vals[r][0].dtype == storage_map[r][0].dtype)
                             and (dr_vals[r][0].shape == storage_map[r][0].shape)
                         ):
@@ -1946,11 +1931,11 @@ class _Linker(LocalLinker):
             f,
             [
                 Container(input, storage, readonly=False)
-                for input, storage in zip(fgraph.inputs, input_storage)
+                for input, storage in zip(fgraph.inputs, input_storage, strict=True)
             ],
             [
                 Container(output, storage, readonly=True)
-                for output, storage in zip(fgraph.outputs, output_storage)
+                for output, storage in zip(fgraph.outputs, output_storage, strict=True)
             ],
             thunks_py,
             order,
@@ -2021,10 +2006,10 @@ class _Maker(FunctionMaker):  # inheritance buys a few helper functions
         if outputs is None:
             return_none = True
             outputs = []
-        if not isinstance(outputs, (list, tuple)):
+        if not isinstance(outputs, list | tuple):
             unpack_single = True
             outputs = [outputs]
-        if not isinstance(inputs, (list, tuple)):
+        if not isinstance(inputs, list | tuple):
             inputs = [inputs]
 
         # Wrap them in In or Out instances if needed.
@@ -2137,7 +2122,9 @@ class _Maker(FunctionMaker):  # inheritance buys a few helper functions
 
         no_borrow = [
             output
-            for output, spec in zip(fgraph.outputs, outputs + additional_outputs)
+            for output, spec in zip(
+                fgraph.outputs, outputs + additional_outputs, strict=True
+            )
             if not spec.borrow
         ]
         if no_borrow:
@@ -2317,10 +2304,7 @@ class DebugMode(Mode):
             raise ValueError("DebugMode has to check at least one of c and py code")
 
     def __str__(self):
-        return "DebugMode(linker={}, optimizer={})".format(
-            self.provided_linker,
-            self.provided_optimizer,
-        )
+        return f"DebugMode(linker={self.provided_linker}, optimizer={self.provided_optimizer})"
 
 
 register_mode("DEBUG_MODE", DebugMode(optimizer="fast_run"))

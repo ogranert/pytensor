@@ -75,15 +75,18 @@ Optimizations associated with these BLAS Ops are in tensor.rewriting.blas
 
 """
 
+import functools
 import logging
 import os
+import shlex
 import time
+from pathlib import Path
 
 import numpy as np
 
 
 try:
-    import numpy.__config__  # noqa
+    import numpy.__config__
 except ImportError:
     pass
 
@@ -101,10 +104,9 @@ from pytensor.tensor import basic as ptb
 from pytensor.tensor.basic import expand_dims
 from pytensor.tensor.blas_headers import blas_header_text, blas_header_version
 from pytensor.tensor.elemwise import DimShuffle
-from pytensor.tensor.math import add, mul, neg, sub
+from pytensor.tensor.math import add, mul, neg, sub, variadic_add
 from pytensor.tensor.shape import shape_padright, specify_broadcastable
 from pytensor.tensor.type import DenseTensorType, TensorType, integer_dtypes, tensor
-from pytensor.utils import memoize
 
 
 _logger = logging.getLogger("pytensor.tensor.blas")
@@ -137,27 +139,27 @@ except ImportError as e:
             "PyTensor flag blas__ldflags is empty. "
             "Falling back on slower implementations for "
             "dot(matrix, vector), dot(vector, matrix) and "
-            f"dot(vector, vector) ({str(e)})"
+            f"dot(vector, vector) ({e!s})"
         )
 
 
 # If check_init_y() == True we need to initialize y when beta == 0.
 def check_init_y():
     if check_init_y._result is None:
-        if not have_fblas:
+        if not have_fblas:  # pragma: no cover
             check_init_y._result = False
-
-        y = float("NaN") * np.ones((2,))
-        x = np.ones((2,))
-        A = np.ones((2, 2))
-        gemv = _blas_gemv_fns[y.dtype]
-        gemv(1.0, A.T, x, 0.0, y, overwrite_y=True, trans=True)
-        check_init_y._result = np.isnan(y).any()
+        else:
+            y = float("NaN") * np.ones((2,))
+            x = np.ones((2,))
+            A = np.ones((2, 2))
+            gemv = _blas_gemv_fns[y.dtype]
+            gemv(1.0, A.T, x, 0.0, y, overwrite_y=True, trans=True)
+            check_init_y._result = np.isnan(y).any()
 
     return check_init_y._result
 
 
-check_init_y._result = None
+check_init_y._result = None  # type: ignore
 
 
 class Gemv(Op):
@@ -180,9 +182,9 @@ class Gemv(Op):
 
     def __str__(self):
         if self.inplace:
-            return "%s{inplace}" % self.__class__.__name__
+            return f"{self.__class__.__name__}{{inplace}}"
         else:
-            return "%s{no_inplace}" % self.__class__.__name__
+            return f"{self.__class__.__name__}{{no_inplace}}"
 
     def make_node(self, y, alpha, A, x, beta):
         y = ptb.as_tensor_variable(y)
@@ -279,9 +281,9 @@ class Ger(Op):
 
     def __str__(self):
         if self.destructive:
-            return "%s{destructive}" % self.__class__.__name__
+            return f"{self.__class__.__name__}{{destructive}}"
         else:
-            return "%s{non-destructive}" % self.__class__.__name__
+            return f"{self.__class__.__name__}{{non-destructive}}"
 
     def make_node(self, A, alpha, x, y):
         A = ptb.as_tensor_variable(A)
@@ -365,8 +367,10 @@ def ldflags(libs=True, flags=False, libs_dir=False, include_dir=False):
     )
 
 
-@memoize
-def _ldflags(ldflags_str, libs, flags, libs_dir, include_dir):
+@functools.cache
+def _ldflags(
+    ldflags_str: str, libs: bool, flags: bool, libs_dir: bool, include_dir: bool
+) -> list[str]:
     """Extract list of compilation flags from a string.
 
     Depending on the options, different type of flags will be kept.
@@ -394,7 +398,7 @@ def _ldflags(ldflags_str, libs, flags, libs_dir, include_dir):
     rval = []
     if libs_dir:
         found_dyn = False
-        dirs = [x[2:] for x in ldflags_str.split() if x.startswith("-L")]
+        dirs = [x[2:] for x in shlex.split(ldflags_str) if x.startswith("-L")]
         l = _ldflags(
             ldflags_str=ldflags_str,
             libs=True,
@@ -407,6 +411,9 @@ def _ldflags(ldflags_str, libs, flags, libs_dir, include_dir):
                 if f.endswith(".so") or f.endswith(".dylib") or f.endswith(".dll"):
                     if any(f.find(ll) >= 0 for ll in l):
                         found_dyn = True
+        # Special treatment of clang framework. Specifically for MacOS Accelerate
+        if "-framework" in l and "Accelerate" in l:
+            found_dyn = True
         if not found_dyn and dirs:
             _logger.warning(
                 "We did not find a dynamic library in the "
@@ -414,7 +421,12 @@ def _ldflags(ldflags_str, libs, flags, libs_dir, include_dir):
                 "ATLAS, make sure to compile it with dynamics library."
             )
 
-    for t in ldflags_str.split():
+    split_flags = shlex.split(ldflags_str)
+    skip = False
+    for pos, t in enumerate(split_flags):
+        if skip:
+            skip = False
+            continue
         # Remove extra quote.
         if (t.startswith("'") and t.endswith("'")) or (
             t.startswith('"') and t.endswith('"')
@@ -422,11 +434,27 @@ def _ldflags(ldflags_str, libs, flags, libs_dir, include_dir):
             t = t[1:-1]
 
         try:
-            t0, t1, t2 = t[0:3]
-            assert t0 == "-"
+            t0, t1 = t[0], t[1]
+            assert t0 == "-" or Path(t).exists()
         except Exception:
             raise ValueError(f'invalid token "{t}" in ldflags_str: "{ldflags_str}"')
-        if libs_dir and t1 == "L":
+        if t == "-framework":
+            skip = True
+            # Special treatment of clang framework. Specifically for MacOS Accelerate
+            # The clang framework implicitly adds: header dirs, libraries, and library dirs.
+            # If we choose to always return these flags, we run into a huge deal amount of
+            # incompatibilities. For this reason, we only return the framework if libs are
+            # requested.
+            if (
+                libs
+                and len(split_flags) >= pos
+                and split_flags[pos + 1] == "Accelerate"
+            ):
+                # We only add the Accelerate framework, but in the future we could extend it to
+                # other frameworks
+                rval.append(t)
+                rval.append(split_flags[pos + 1])
+        elif libs_dir and t1 == "L":
             rval.append(t[2:])
         elif include_dir and t1 == "I":
             raise ValueError(
@@ -435,7 +463,6 @@ def _ldflags(ldflags_str, libs, flags, libs_dir, include_dir):
                 " is not wanted.",
                 t,
             )
-            rval.append(t[2:])
         elif libs and t1 == "l":  # example -lmkl
             rval.append(t[2:])
         elif flags and t1 not in ("L", "I", "l"):  # example -openmp
@@ -767,10 +794,7 @@ class GemmRelated(COp):
 
     def build_gemm_call(self):
         if hasattr(self, "inplace"):
-            setup_z_Nz_Sz = "if(%(params)s->inplace){{{}}}else{{{}}}".format(
-                self.setup_z_Nz_Sz_inplace,
-                self.setup_z_Nz_Sz_outplace,
-            )
+            setup_z_Nz_Sz = f"if(%(params)s->inplace){{{self.setup_z_Nz_Sz_inplace}}}else{{{self.setup_z_Nz_Sz_outplace}}}"
         else:
             setup_z_Nz_Sz = self.setup_z_Nz_Sz
 
@@ -1111,7 +1135,7 @@ class Gemm(GemmRelated):
     def c_code_cache_version(self):
         gv = self.build_gemm_version()
         if gv:
-            return (7,) + gv
+            return (7, *gv)
         else:
             return gv
 
@@ -1401,11 +1425,7 @@ def _gemm_from_factored_list(fgraph, lst):
                     item_to_var(input) for k, input in enumerate(lst) if k not in (i, j)
                 ]
                 add_inputs.extend(gemm_of_sM_list)
-                if len(add_inputs) > 1:
-                    rval = [add(*add_inputs)]
-                else:
-                    rval = add_inputs
-                # print "RETURNING GEMM THING", rval
+                rval = [variadic_add(*add_inputs)]
                 return rval, old_dot22
 
 
@@ -1478,7 +1498,7 @@ class Dot22(GemmRelated):
         except ValueError as e:
             # The error raised by numpy has no shape information, we mean to
             # add that
-            e.args = e.args + (x.shape, y.shape)
+            e.args = (*e.args, x.shape, y.shape)
             raise
 
     def infer_shape(self, fgraph, node, input_shapes):
@@ -1530,7 +1550,7 @@ class Dot22(GemmRelated):
     def c_code_cache_version(self):
         gv = self.build_gemm_version()
         if gv:
-            return (2,) + gv
+            return (2, *gv)
         else:
             return gv
 
@@ -1581,7 +1601,7 @@ class Dot22Scalar(GemmRelated):
         except ValueError as e:
             # The error raised by numpy has no shape information, we
             # mean to add that
-            e.args = e.args + (x.shape, y.shape)
+            e.args = (*e.args, x.shape, y.shape)
             raise
 
     def infer_shape(self, fgraph, node, input_shapes):
@@ -1628,7 +1648,7 @@ class Dot22Scalar(GemmRelated):
     def c_code_cache_version(self):
         gv = self.build_gemm_version()
         if gv:
-            return (2,) + gv
+            return (2, *gv)
         else:
             return gv
 
@@ -1693,7 +1713,7 @@ class BatchedDot(COp):
         if x.shape[0] != y.shape[0]:
             raise TypeError(
                 f"Inputs [{', '.join(map(str, inp))}] must have the"
-                f" same size in axis 0, but have sizes [{', '.join([str(i.shape[0]) for i in inp])}]."
+                f" same size in axis 0, but have sizes [{', '.join(str(i.shape[0]) for i in inp)}]."
             )
 
         z[0] = np.matmul(x, y)
@@ -1808,20 +1828,12 @@ class BatchedDot(COp):
             strides = f"PyArray_STRIDES({var})"
             if ndim == 1:
                 return f"{strides}[0] == type_size"
-            return " && ".join(
-                [
-                    " && ".join(
-                        "{strides}[{i}] > 0 && {strides}[{i}] % type_size == 0".format(
-                            strides=strides, i=i
-                        )
-                        for i in range(1, ndim)
-                    ),
-                    "(%s)"
-                    % " || ".join(
-                        f"{strides}[{i}] == type_size" for i in range(1, ndim)
-                    ),
-                ]
+            ands = " && ".join(
+                f"{strides}[{i}] > 0 && {strides}[{i}] % type_size == 0"
+                for i in range(1, ndim)
             )
+            ors = " || ".join(f"{strides}[{i}] == type_size" for i in range(1, ndim))
+            return f"{ands} && ({ors})"
 
         x_ndim, y_ndim, z_ndim = (
             node.inputs[0].ndim,
@@ -1837,107 +1849,100 @@ class BatchedDot(COp):
         ]
 
         z_shape_correct = " && ".join(
-            "PyArray_DIMS(%s)[%i] == %s" % (_z, i, dim) for i, dim in enumerate(z_dims)
+            f"PyArray_DIMS({_z})[{i}] == {dim}" for i, dim in enumerate(z_dims)
         )
         z_shape = ", ".join(z_dims)
         z_contiguous = contiguous(_z, z_ndim)
-        allocate = (
-            """
-            if (NULL == %(_z)s || !(%(z_shape_correct)s)  || !(%(z_contiguous)s))
-            {
-                npy_intp dims[%(z_ndim)s] = {%(z_shape)s};
-                Py_XDECREF(%(_z)s);
-                %(_z)s = (PyArrayObject*)PyArray_SimpleNew(
-                    %(z_ndim)s, dims, PyArray_TYPE(%(_x)s));
-                if(!%(_z)s) {
+        allocate = f"""
+            if (NULL == {_z} || !({z_shape_correct})  || !({z_contiguous}))
+            {{
+                npy_intp dims[{z_ndim}] = {{{z_shape}}};
+                Py_XDECREF({_z});
+                {_z} = (PyArrayObject*)PyArray_SimpleNew(
+                    {z_ndim}, dims, PyArray_TYPE({_x}));
+                if(!{_z}) {{
                     PyErr_SetString(PyExc_MemoryError,
                                     "failed to alloc BatchedDot output");
-                    %(fail)s
-                }
-            }
+                    {fail}
+                }}
+            }}
         """
-            % locals()
-        )
 
         # code to reallocate inputs contiguously if necessary
         contiguate = []
         for var, ndim in [(_x, x_ndim), (_y, y_ndim)]:
             _contiguous = contiguous(var, ndim)
             contiguate.append(
-                """
-                if (!(%(_contiguous)s)) {
-                    PyArrayObject * _copy = (PyArrayObject *) PyArray_Copy(%(var)s);
+                f"""
+                if (!({_contiguous})) {{
+                    PyArrayObject * _copy = (PyArrayObject *) PyArray_Copy({var});
                     if (!_copy)
-                        %(fail)s
-                    Py_XDECREF(%(var)s);
-                    %(var)s = _copy;
-                }
+                        {fail}
+                    Py_XDECREF({var});
+                    {var} = _copy;
+                }}
             """
-                % locals()
             )
         contiguate = "\n".join(contiguate)
 
-        return (
-            """
-        int type_num = PyArray_DESCR(%(_x)s)->type_num;
-        int type_size = PyArray_DESCR(%(_x)s)->elsize; // in bytes
+        return f"""
+        int type_num = PyArray_DESCR({_x})->type_num;
+        int type_size = PyArray_DESCR({_x})->elsize; // in bytes
 
-        if (PyArray_NDIM(%(_x)s) != 3) {
+        if (PyArray_NDIM({_x}) != 3) {{
             PyErr_Format(PyExc_NotImplementedError,
-                         "rank(x) != 3. rank(x) is %%d.",
-                         PyArray_NDIM(%(_x)s));
-            %(fail)s;
-        }
-        if (PyArray_NDIM(%(_y)s) != 3) {
+                         "rank(x) != 3. rank(x) is %d.",
+                         PyArray_NDIM({_x}));
+            {fail};
+        }}
+        if (PyArray_NDIM({_y}) != 3) {{
             PyErr_Format(PyExc_NotImplementedError,
-                         "rank(y) != 3. rank(y) is %%d.",
-                         PyArray_NDIM(%(_y)s));
-            %(fail)s;
-        }
-        if (%(_z)s && PyArray_NDIM(%(_z)s) != 3) {
+                         "rank(y) != 3. rank(y) is %d.",
+                         PyArray_NDIM({_y}));
+            {fail};
+        }}
+        if ({_z} && PyArray_NDIM({_z}) != 3) {{
             PyErr_Format(PyExc_NotImplementedError,
-                         "rank(z) != 3. rank(z) is %%d.",
-                         PyArray_NDIM(%(_z)s));
-            %(fail)s;
-        }
+                         "rank(z) != 3. rank(z) is %d.",
+                         PyArray_NDIM({_z}));
+            {fail};
+        }}
 
         // allocate output
-        %(allocate)s
+        {allocate}
         // reallocate any noncontiguous arrays or arrays with invalid strides
-        %(contiguate)s
+        {contiguate}
 
-        if ((PyArray_DESCR(%(_x)s)->type_num != NPY_DOUBLE)
-            && (PyArray_DESCR(%(_x)s)->type_num != NPY_FLOAT))
-        {PyErr_SetString(PyExc_NotImplementedError, "type(x) is not double or float"); %(fail)s;}
+        if ((PyArray_DESCR({_x})->type_num != NPY_DOUBLE)
+            && (PyArray_DESCR({_x})->type_num != NPY_FLOAT))
+        {{PyErr_SetString(PyExc_NotImplementedError, "type(x) is not double or float"); {fail};}}
 
-        if ((PyArray_DESCR(%(_y)s)->type_num != NPY_DOUBLE)
-            && (PyArray_DESCR(%(_y)s)->type_num != NPY_FLOAT))
-        {PyErr_SetString(PyExc_NotImplementedError, "type(y) is not double or float"); %(fail)s;}
+        if ((PyArray_DESCR({_y})->type_num != NPY_DOUBLE)
+            && (PyArray_DESCR({_y})->type_num != NPY_FLOAT))
+        {{PyErr_SetString(PyExc_NotImplementedError, "type(y) is not double or float"); {fail};}}
 
-        if ((PyArray_DESCR(%(_z)s)->type_num != NPY_DOUBLE)
-            && (PyArray_DESCR(%(_z)s)->type_num != NPY_FLOAT))
-        {PyErr_SetString(PyExc_NotImplementedError, "type(z) is not double or float"); %(fail)s;}
+        if ((PyArray_DESCR({_z})->type_num != NPY_DOUBLE)
+            && (PyArray_DESCR({_z})->type_num != NPY_FLOAT))
+        {{PyErr_SetString(PyExc_NotImplementedError, "type(z) is not double or float"); {fail};}}
 
-        if ((PyArray_DESCR(%(_x)s)->type_num != PyArray_DESCR(%(_y)s)->type_num)
-            ||(PyArray_DESCR(%(_x)s)->type_num != PyArray_DESCR(%(_z)s)->type_num))
-        { PyErr_SetString(PyExc_NotImplementedError, "type(x), type(y), type(z) are not all the same"); %(fail)s; }
+        if ((PyArray_DESCR({_x})->type_num != PyArray_DESCR({_y})->type_num)
+            ||(PyArray_DESCR({_x})->type_num != PyArray_DESCR({_z})->type_num))
+        {{ PyErr_SetString(PyExc_NotImplementedError, "type(x), type(y), type(z) are not all the same"); {fail}; }}
 
         switch (type_num)
-        {
+        {{
             case NPY_FLOAT:
-            if (batch_gemm<float>(sgemm_, type_size, %(_x)s, %(_y)s, %(_z)s)) {
-                %(fail)s;
-            }
+            if (batch_gemm<float>(sgemm_, type_size, {_x}, {_y}, {_z})) {{
+                {fail};
+            }}
             break;
             case NPY_DOUBLE:
-            if (batch_gemm<double>(dgemm_, type_size, %(_x)s, %(_y)s, %(_z)s)) {
-                %(fail)s;
-            }
+            if (batch_gemm<double>(dgemm_, type_size, {_x}, {_y}, {_z})) {{
+                {fail};
+            }}
             break;
-        }
+        }}
         """
-            % locals()
-        )
 
     def c_code_cache_version(self):
         from pytensor.tensor.blas_headers import blas_header_version

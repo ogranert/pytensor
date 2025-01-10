@@ -98,15 +98,12 @@ class Generic(CType, Singleton):
         """
 
     def c_sync(self, name, sub):
-        return (
-            """
-        assert(py_%(name)s->ob_refcnt > 1);
-        Py_DECREF(py_%(name)s);
-        py_%(name)s = %(name)s ? %(name)s : Py_None;
-        Py_INCREF(py_%(name)s);
+        return f"""
+        assert(py_{name}->ob_refcnt > 1);
+        Py_DECREF(py_{name});
+        py_{name} = {name} ? {name} : Py_None;
+        Py_INCREF(py_{name});
         """
-            % locals()
-        )
 
     def c_code_cache_version(self):
         return (1,)
@@ -193,50 +190,47 @@ class CDataType(CType[D]):
         return data
 
     def c_declare(self, name, sub, check_input=True):
-        return """
-        %(ctype)s %(name)s;
-        """ % dict(
-            ctype=self.ctype, name=name
-        )
+        return f"""
+        {self.ctype} {name};
+        """
 
     def c_init(self, name, sub):
         return f"{name} = NULL;"
 
     def c_extract(self, name, sub, check_input=True, **kwargs):
-        return """
-  %(name)s = (%(ctype)s)PyCapsule_GetPointer(py_%(name)s, NULL);
-  if (%(name)s == NULL) %(fail)s
-        """ % dict(
-            name=name, ctype=self.ctype, fail=sub["fail"]
-        )
+        fail = sub["fail"]
+        return f"""
+  {name} = ({self.ctype})PyCapsule_GetPointer(py_{name}, NULL);
+  if ({name} == NULL) {fail}
+        """
 
     def c_sync(self, name, sub):
         freefunc = self.freefunc
         if freefunc is None:
             freefunc = "NULL"
-        s = """
-Py_XDECREF(py_%(name)s);
-if (%(name)s == NULL) {
-  py_%(name)s = Py_None;
-  Py_INCREF(py_%(name)s);
-} else {
-  py_%(name)s = PyCapsule_New((void *)%(name)s, NULL,
+        s = f"""
+Py_XDECREF(py_{name});
+if ({name} == NULL) {{
+  py_{name} = Py_None;
+  Py_INCREF(py_{name});
+}} else {{
+  py_{name} = PyCapsule_New((void *){name}, NULL,
                               _capsule_destructor);
-  if (py_%(name)s != NULL) {
-    if (PyCapsule_SetContext(py_%(name)s, (void *)%(freefunc)s) != 0) {
+  if (py_{name} != NULL) {{
+    if (PyCapsule_SetContext(py_{name}, (void *){freefunc}) != 0) {{
       /* This won't trigger a call to freefunc since it could not be
          set. The error case below will do it. */
-      Py_DECREF(py_%(name)s);
+      Py_DECREF(py_{name});
       /* Signal the error */
-      py_%(name)s = NULL;
-    }
-  }
-}"""
+      py_{name} = NULL;
+    }}
+  }}
+}}"""
         if self.freefunc is not None:
-            s += """
-if (py_%(name)s == NULL) { %(freefunc)s(%(name)s); }
+            s += f"""
+if (py_{name} == NULL) {{ {freefunc}({name}); }}
 """
-        return s % dict(name=name, freefunc=freefunc)
+        return s
 
     def c_cleanup(self, name, sub):
         # No need to do anything here since the CObject/Capsule will
@@ -274,7 +268,7 @@ void _capsule_destructor(PyObject *o) {
     def c_code_cache_version(self):
         v = (3,)
         if self.version is not None:
-            v = v + (self.version,)
+            v = (*v, self.version)
         return v
 
     def __str__(self):
@@ -324,7 +318,7 @@ class EnumType(CType, dict):
     .. code-block:: python
 
         enum = EnumType(CONSTANT_1=1, CONSTANT_2=2.5, CONSTANT_3=False, CONSTANT_4=True)
-        print (enum.CONSTANT_1, enum.CONSTANT_2, enum.CONSTANT_3, enum.CONSTANT_4)
+        print(enum.CONSTANT_1, enum.CONSTANT_2, enum.CONSTANT_3, enum.CONSTANT_4)
         # will print 1 2.5 0 1
 
     In C code:
@@ -340,7 +334,7 @@ class EnumType(CType, dict):
 
     .. code-block:: python
 
-        enum = EnumType(CONSTANT_1=0, CONSTANT_2=1, CONSTANT_3=2, ctype='size_t')
+        enum = EnumType(CONSTANT_1=0, CONSTANT_2=1, CONSTANT_3=2, ctype="size_t")
         # In C code, the Op param will then be a ``size_t``.
 
     .. note::
@@ -355,8 +349,9 @@ class EnumType(CType, dict):
 
         .. code-block:: python
 
-            enum = EnumType(CONSTANT_1=0, CONSTANT_2=1, CONSTANT_3=2,
-                            ctype='size_t', cname='MyEnumName')
+            enum = EnumType(
+                CONSTANT_1=0, CONSTANT_2=1, CONSTANT_3=2, ctype="size_t", cname="MyEnumName"
+            )
 
     **Example with aliases**
 
@@ -365,7 +360,7 @@ class EnumType(CType, dict):
 
     To give an alias to a constant in the EnumType constructor, use the following key-value syntax::
 
-        constant_name=(constant_alias, constant_value)
+        constant_name = (constant_alias, constant_value)
 
     You can then retrieve a constant from an alias with method ``EnumType.fromalias()``.
 
@@ -378,23 +373,23 @@ class EnumType(CType, dict):
         from pytensor.link.c.type import EnumType
 
         # You can remark that constant 'C' does not have an alias.
-        enum = EnumType(A=('alpha', 1), B=('beta', 2), C=3, D=('delta', 4))
+        enum = EnumType(A=("alpha", 1), B=("beta", 2), C=3, D=("delta", 4))
 
         # Constants are all directly available by name.
         print(enum.A, enum.B, enum.C, enum.D)
 
         # But we can also now get some constants by alias.
-        a = enum.fromalias('alpha')
-        b = enum.fromalias('beta')
-        d = enum.fromalias('delta')
+        a = enum.fromalias("alpha")
+        b = enum.fromalias("beta")
+        d = enum.fromalias("delta")
 
         # If method fromalias() receives an unknown alias,
         # it will looks for a constant with this alias
         # as exact constant name.
-        c = enum.fromalias('C') # will get enum.C
+        c = enum.fromalias("C")  # will get enum.C
 
         # An alias defined in an EnumType will be correctly converted with non-strict filtering.
-        value = enum.filter('delta', strict=False)
+        value = enum.filter("delta", strict=False)
         # value now contains enum.D, ie. 4.
 
     .. note::
@@ -427,7 +422,7 @@ class EnumType(CType, dict):
                     "Only capital letters, underscores and digits "
                     "are allowed."
                 )
-            if isinstance(kwargs[k], (list, tuple)):
+            if isinstance(kwargs[k], list | tuple):
                 if len(kwargs[k]) != 2:
                     raise TypeError(
                         f"{type(self).__name__}: when using a tuple to define a constant, your tuple should contain 2 values: "
@@ -451,7 +446,7 @@ class EnumType(CType, dict):
                 kwargs[k] = value
             if isinstance(kwargs[k], bool):
                 kwargs[k] = int(kwargs[k])
-            elif not isinstance(kwargs[k], (int, float)):
+            elif not isinstance(kwargs[k], int | float):
                 raise TypeError(
                     f'{type(self).__name__}: constant "{k}": expected integer or floating value, got "{type(kwargs[k]).__name__}".'
                 )
@@ -479,19 +474,14 @@ class EnumType(CType, dict):
         """
         Return the sorted tuple of all aliases in this enumeration.
         """
-        return tuple(sorted(self.aliases.keys()))
+        return tuple(sorted(self.aliases))
 
     def __repr__(self):
         names_to_aliases = {constant_name: "" for constant_name in self}
         for alias in self.aliases:
             names_to_aliases[self.aliases[alias]] = f"({alias})"
-        return "{}<{}>({})".format(
-            type(self).__name__,
-            self.ctype,
-            ", ".join(
-                f"{k}{names_to_aliases[k]}:{self[k]}" for k in sorted(self.keys())
-            ),
-        )
+        args = ", ".join(f"{k}{names_to_aliases[k]}:{self[k]}" for k in sorted(self))
+        return f"{type(self).__name__}<{self.ctype}>({args})"
 
     def __getattr__(self, key):
         if key in self:
@@ -512,14 +502,17 @@ class EnumType(CType, dict):
     def __hash__(self):
         # All values are Python basic types, then easy to hash.
         return hash(
-            (type(self), self.ctype)
-            + tuple((k, self[k]) for k in sorted(self.keys()))
-            + tuple((a, self.aliases[a]) for a in sorted(self.aliases.keys()))
+            (
+                type(self),
+                self.ctype,
+                *sorted(self.items()),
+                *sorted(self.aliases.items()),
+            )
         )
 
     def __eq__(self, other):
         return (
-            type(self) == type(other)
+            type(self) is type(other)
             and self.ctype == other.ctype
             and len(self) == len(other)
             and len(self.aliases) == len(other.aliases)
@@ -581,42 +574,36 @@ class EnumType(CType, dict):
         This C function may be useful to retrieve some runtime information.
         It is available in C code when pytensor flag ``config.cmodule__debug`` is set to ``True``.
         """
-        return """
+        cases = "".join(
+            f"""
+                   case {name}: sprintf(out, "{name}"); break;
+                   """
+            for name in self
+        )
+        return f"""
         #ifdef DEBUG
-        int pytensor_enum_to_string_%(cname)s(%(ctype)s in, char* out) {
+        int pytensor_enum_to_string_{self.cname}({self.ctype} in, char* out) {{
             int ret = 0;
-            switch(in) {
-                %(cases)s
+            switch(in) {{
+                {cases}
                 default:
-                    PyErr_SetString(PyExc_ValueError, "%(classname)s:  unknown enum value.");
+                    PyErr_SetString(PyExc_ValueError, "{type(self).__name__}:  unknown enum value.");
                     ret = -1;
                     break;
-            }
+            }}
             return ret;
-        }
+        }}
         #endif
-        """ % dict(
-            cname=self.cname,
-            ctype=self.ctype,
-            classname=type(self).__name__,
-            cases="".join(
-                """
-                   case %(name)s: sprintf(out, "%(name)s"); break;
-                   """
-                % dict(name=name)
-                for name in self
-            ),
-        )
+        """
 
     def c_support_code(self, **kwargs):
         return (
             self.pyint_compat_code
             + "".join(
-                """
-            #define %s %s
+                f"""
+            #define {k} {self[k]!s}
             """
-                % (k, str(self[k]))
-                for k in sorted(self.keys())
+                for k in sorted(self)
             )
             + self.c_to_string()
         )
@@ -631,18 +618,17 @@ class EnumType(CType, dict):
         return ""
 
     def c_extract(self, name, sub, check_input=True, **kwargs):
-        return """
-        if (PyInt_Check(py_%(name)s)) {
-            %(name)s = (%(ctype)s)PyInt_AsLong(py_%(name)s);
-        } else {
-            %(name)s = (%(ctype)s)PyFloat_AsDouble(py_%(name)s);
-        }
-        if (PyErr_Occurred()) {
-            %(fail)s
-        }
-        """ % dict(
-            ctype=self.ctype, name=name, fail=sub["fail"]
-        )
+        fail = sub["fail"]
+        return f"""
+        if (PyInt_Check(py_{name})) {{
+            {name} = ({self.ctype})PyInt_AsLong(py_{name});
+        }} else {{
+            {name} = ({self.ctype})PyFloat_AsDouble(py_{name});
+        }}
+        if (PyErr_Occurred()) {{
+            {fail}
+        }}
+        """
 
     def c_code_cache_version(self):
         return (2, self.ctype, self.cname, tuple(self.items()))
@@ -663,14 +649,24 @@ class EnumList(EnumType):
 
     Example::
 
-        enum = EnumList('CONSTANT_1', 'CONSTANT_2', 'CONSTANT_3', 'CONSTANT_4', 'CONSTANT_5')
-        print (enum.CONSTANT_1, enum.CONSTANT_2, enum.CONSTANT_3, enum.CONSTANT_4, enum.CONSTANT_5)
+        enum = EnumList(
+            "CONSTANT_1", "CONSTANT_2", "CONSTANT_3", "CONSTANT_4", "CONSTANT_5"
+        )
+        print(
+            enum.CONSTANT_1,
+            enum.CONSTANT_2,
+            enum.CONSTANT_3,
+            enum.CONSTANT_4,
+            enum.CONSTANT_5,
+        )
         # will print: 0 1 2 3 4
 
     Like :class:`EnumType`, you can also define the C type and a C name for the op param.
     Default C type is ``int``::
 
-        enum = EnumList('CONSTANT_1', 'CONSTANT_2', 'CONSTANT_3', 'CONSTANT_4', ctype='unsigned int')
+        enum = EnumList(
+            "CONSTANT_1", "CONSTANT_2", "CONSTANT_3", "CONSTANT_4", ctype="unsigned int"
+        )
 
     Like :class:`EnumType`, you can also add an alias to a constant, by replacing the only constant name
     (e.g. ``'CONSTANT_NAME'``) by a couple with constant name first and constant alias second
@@ -678,7 +674,7 @@ class EnumList(EnumType):
 
     .. code-block:: python
 
-        enum = EnumList(('A', 'alpha'), ('B', 'beta'), 'C', 'D', 'E', 'F', ('G', 'gamma'))
+        enum = EnumList(("A", "alpha"), ("B", "beta"), "C", "D", "E", "F", ("G", "gamma"))
 
     See test class :class:`tests.graph.test_types.TestOpEnumList` for a working example.
 
@@ -693,7 +689,7 @@ class EnumList(EnumType):
         cname = kwargs.pop("cname", None)
 
         for arg_rank, arg in enumerate(args):
-            if isinstance(arg, (list, tuple)):
+            if isinstance(arg, list | tuple):
                 if len(arg) != 2:
                     raise TypeError(
                         f"{type(self).__name__}: when using a tuple to define a constant, your tuple should contain 2 values: "
@@ -742,7 +738,9 @@ class CEnumType(EnumList):
 
     .. code-block:: python
 
-        enum = CEnumType('CONSTANT_CNAME_1', 'CONSTANT_CNAME_2', 'CONSTANT_CNAME_3', ctype='long')
+        enum = CEnumType(
+            "CONSTANT_CNAME_1", "CONSTANT_CNAME_2", "CONSTANT_CNAME_3", ctype="long"
+        )
 
     Like :class:`EnumList`, you can also add an alias to a constant, with same syntax as in :class:`EnumList`.
 
@@ -762,25 +760,22 @@ class CEnumType(EnumList):
         swapped_dict = {v: k for (k, v) in self.items()}
         # swapped_dict's keys are integers.
 
-        return """
-        switch(PyInt_AsLong(py_%(name)s)) {
-            %(cases)s
+        fail = sub["fail"]
+        cases = "".join(
+            f"""
+           case {i}: {name} = {swapped_dict[i]}; break;
+           """
+            for i in sorted(swapped_dict)
+        )
+        return f"""
+        switch(PyInt_AsLong(py_{name})) {{
+            {cases}
             default:
                 PyErr_SetString(PyExc_ValueError, "CEnumType: invalid value to map to C constants.");
-                {%(fail)s}
+                {{{fail}}}
                 break;
-        }
-        """ % dict(
-            name=name,
-            cases="".join(
-                """
-                   case %(i)d: %(name)s = %(constant_cname)s; break;
-                   """
-                % dict(i=i, name=name, constant_cname=swapped_dict[i])
-                for i in sorted(swapped_dict.keys())
-            ),
-            fail=sub["fail"],
-        )
+        }}
+        """
 
     def c_code_cache_version(self):
         return (1, super().c_code_cache_version())

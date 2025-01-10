@@ -1,3 +1,4 @@
+import re
 from copy import copy
 
 import numpy as np
@@ -438,13 +439,13 @@ class TestTensorInstanceMethods:
         idx = [0]
         y = 5
 
-        assert equal_computations([x.set(idx, y)], [set_subtensor(x[idx], y)])
-        assert equal_computations([x.inc(idx, y)], [inc_subtensor(x[idx], y)])
+        assert equal_computations([x[:, idx].set(y)], [set_subtensor(x[:, idx], y)])
+        assert equal_computations([x[:, idx].inc(y)], [inc_subtensor(x[:, idx], y)])
 
     def test_set_item_error(self):
         x = matrix("x")
 
-        msg = "Use the output of `set` or `add` instead."
+        msg = re.escape("Use the output of `x[idx].set` or `x[idx].inc` instead.")
         with pytest.raises(TypeError, match=msg):
             x[0] = 5
         with pytest.raises(TypeError, match=msg):

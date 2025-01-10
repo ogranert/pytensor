@@ -14,7 +14,6 @@ from pytensor.configdefaults import config
 from pytensor.gradient import GradientError
 from pytensor.graph.basic import Apply, Constant, applys_between
 from pytensor.graph.op import Op
-from pytensor.misc.safe_asarray import _asarray
 from pytensor.sparse import (
     CSC,
     CSM,
@@ -51,6 +50,7 @@ from pytensor.sparse import (
     add_s_s_data,
     as_sparse_or_tensor_variable,
     as_sparse_variable,
+    block_diag,
     cast,
     clean,
     construct_sparse_from_list,
@@ -202,7 +202,7 @@ def sparse_random_inputs(
     assert 0 <= p <= 1
     assert len(shape) == 2
     assert out_dtype in sparse.all_dtypes
-    assert gap is None or isinstance(gap, (tuple, list))
+    assert gap is None or isinstance(gap, tuple | list)
     if gap is not None and out_dtype.startswith("u"):
         assert gap[0] >= 0
 
@@ -258,7 +258,7 @@ def sparse_random_inputs(
     # PyTensor don't like ulonglong type_num
     dtype = np.dtype(out_dtype)  # Convert into dtype object.
     if data[0].dtype.num != dtype.num and dtype.str == data[0].dtype.str:
-        data[0].data = _asarray(data[0].data, out_dtype)
+        data[0].data = np.asarray(data[0].data, out_dtype)
     assert data[0].dtype.num == dtype.num
     return (variable, data)
 
@@ -326,15 +326,15 @@ def verify_grad_sparse(op, pt, structured=False, *args, **kwargs):
             dpt.append(p)
             iconv.append(conv_none)
     output = op(*[as_sparse_or_tensor_variable(p) for p in pt])
-    if isinstance(output, (list, tuple)):
-        raise NotImplementedError("verify_grad can't deal with " "multiple outputs")
+    if isinstance(output, list | tuple):
+        raise NotImplementedError("verify_grad can't deal with multiple outputs")
     if _is_sparse_variable(output):
         oconv = DenseFromSparse(structured=structured)
     else:
         oconv = conv_none
 
     def conv_op(*inputs):
-        ipt = [conv(i) for i, conv in zip(inputs, iconv)]
+        ipt = [conv(i) for i, conv in zip(inputs, iconv, strict=True)]
         out = op(*ipt)
         return oconv(out)
 
@@ -347,7 +347,7 @@ class TestVerifyGradSparse:
             self.structured = structured
 
         def __eq__(self, other):
-            return (type(self) == type(other)) and self.structured == other.structured
+            return (type(self) is type(other)) and self.structured == other.structured
 
         def __hash__(self):
             return hash(type(self)) ^ hash(self.structured)
@@ -1585,7 +1585,7 @@ class TestDots(utt.InferShapeTester):
                 assert np.all(f_a(vx, vy) == f_b(vx, vy))
                 topo = f_a.maker.fgraph.toposort()
                 assert not any(
-                    isinstance(node.op, (Dot, Usmm, UsmmCscDense)) for node in topo
+                    isinstance(node.op, Dot | Usmm | UsmmCscDense) for node in topo
                 )
 
     def test_int32_dtype(self):
@@ -1783,13 +1783,14 @@ class TestUsmm:
                     )
                     == len(topo) - 5
                 )
-                new_topo = []
-                for node in topo:
+                new_topo = [
+                    node
+                    for node in topo
                     if not (
                         isinstance(node.op, Elemwise)
                         and isinstance(node.op.scalar_op, pytensor.scalar.basic.Cast)
-                    ):
-                        new_topo.append(node)
+                    )
+                ]
                 topo = new_topo
                 assert len(topo) == 5, topo
                 # Usmm is tested at the same time in debugmode
@@ -1860,7 +1861,7 @@ class TestUsmm:
             assert all(f_shape(a_data, x_data, y_data) == f_b_out.shape)
             topo = f_shape.maker.fgraph.toposort()
             assert not any(
-                isinstance(node.op, (Dot, Usmm, UsmmCscDense)) for node in topo
+                isinstance(node.op, Dot | Usmm | UsmmCscDense) for node in topo
             )
 
 
@@ -1911,7 +1912,7 @@ def test_may_share_memory():
     b = sp.sparse.csc_matrix(sp.sparse.eye(4, 3))
 
     def as_ar(a):
-        return _asarray(a, dtype="int32")
+        return np.asarray(a, dtype="int32")
 
     for a_, b_, rep in [
         (a, a, True),
@@ -2191,7 +2192,7 @@ class TestEnsureSortedIndices(utt.InferShapeTester):
 
     def test_op(self):
         for format in sparse.sparse_formats:
-            for shape in zip(range(5, 9), range(3, 7)[::-1]):
+            for shape in zip(range(5, 9), range(3, 7)[::-1], strict=True):
                 variable, data = sparse_random_inputs(format, shape=shape)
 
                 f = pytensor.function(variable, self.op(*variable))
@@ -2202,7 +2203,7 @@ class TestEnsureSortedIndices(utt.InferShapeTester):
 
     def test_infer_shape(self):
         for format in sparse.sparse_formats:
-            for shape in zip(range(5, 9), range(3, 7)[::-1]):
+            for shape in zip(range(5, 9), range(3, 7)[::-1], strict=True):
                 variable, data = sparse_random_inputs(format, shape=shape)
                 self._compile_and_check(
                     variable, [self.op(*variable)], data, self.op_class
@@ -2210,7 +2211,7 @@ class TestEnsureSortedIndices(utt.InferShapeTester):
 
     def test_grad(self):
         for format in sparse.sparse_formats:
-            for shape in zip(range(5, 9), range(3, 7)[::-1]):
+            for shape in zip(range(5, 9), range(3, 7)[::-1], strict=True):
                 variable, data = sparse_random_inputs(format, shape=shape)
                 verify_grad_sparse(self.op, data, structured=False)
 
@@ -2222,7 +2223,7 @@ class TestClean(utt.InferShapeTester):
 
     def test_op(self):
         for format in sparse.sparse_formats:
-            for shape in zip(range(5, 9), range(3, 7)[::-1]):
+            for shape in zip(range(5, 9), range(3, 7)[::-1], strict=True):
                 variable, data = sparse_random_inputs(format, shape=shape)
 
                 data[0][0, 0] = data[0][1, 1] = 0
@@ -2241,7 +2242,7 @@ class TestClean(utt.InferShapeTester):
 
     def test_grad(self):
         for format in sparse.sparse_formats:
-            for shape in zip(range(5, 9), range(3, 7)[::-1]):
+            for shape in zip(range(5, 9), range(3, 7)[::-1], strict=True):
                 variable, data = sparse_random_inputs(format, shape=shape)
                 verify_grad_sparse(self.op, data, structured=False)
 
@@ -2273,7 +2274,7 @@ class TestRemove0(utt.InferShapeTester):
                     unsorted_indices=unsor,
                 )
                 assert 0 in mat.data or not zero
-                assert not mat.has_sorted_indices or not unsor
+                assert not (mat.has_sorted_indices and unsor)
 
                 # the In thingy has to be there because pytensor has as rule not
                 # to optimize inputs
@@ -3007,7 +3008,7 @@ def test_hstack_vstack():
     blocks = [make_block(dtype) for dtype in dtypes]
 
     for stack_dimension, stack_function in enumerate((sparse.vstack, sparse.hstack)):
-        for to_dtype in (None,) + dtypes:
+        for to_dtype in (None, *dtypes):
             stacked_blocks = stack_function(blocks, dtype=to_dtype)
             expected_dtype = get_expected_dtype(blocks, to_dtype)
             assert stacked_blocks.dtype == expected_dtype
@@ -3389,3 +3390,21 @@ class TestSamplingDot(utt.InferShapeTester):
 )
 class TestSharedOptions:
     pass
+
+
+@pytest.mark.parametrize("format", ["csc", "csr"], ids=["csc", "csr"])
+@pytest.mark.parametrize("sparse_input", [True, False], ids=["sparse", "dense"])
+def test_block_diagonal(format, sparse_input):
+    from scipy import sparse as sp_sparse
+
+    f_array = sp_sparse.csr_matrix if sparse_input else np.array
+    A = f_array([[1, 2], [3, 4]]).astype(config.floatX)
+    B = f_array([[5, 6], [7, 8]]).astype(config.floatX)
+
+    result = block_diag(A, B, format=format)
+    assert result.owner.op._props_dict() == {"n_inputs": 2, "format": format}
+
+    sp_result = sp_sparse.block_diag([A, B], format=format)
+
+    assert isinstance(result.eval(), type(sp_result))
+    np.testing.assert_allclose(result.eval().toarray(), sp_result.toarray())

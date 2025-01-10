@@ -13,7 +13,7 @@ is a global operation with a scalar condition.
 
 from collections.abc import Sequence
 from copy import deepcopy
-from typing import TYPE_CHECKING, Any, Optional, Union
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
@@ -78,7 +78,7 @@ class IfElse(_NoPythonOp):
         self.name = name
 
     def __eq__(self, other):
-        if type(self) != type(other):
+        if type(self) is not type(other):
             return False
         if self.as_view != other.as_view:
             return False
@@ -108,7 +108,7 @@ class IfElse(_NoPythonOp):
         # of that ifelse are packed back into shape tuples.
         new_ts_inputs = []
         for ts_shape in ts_shapes:
-            if isinstance(ts_shape, (list, tuple)):
+            if isinstance(ts_shape, list | tuple):
                 new_ts_inputs += list(ts_shape)
             else:
                 # It can be None for generic objects
@@ -116,7 +116,7 @@ class IfElse(_NoPythonOp):
 
         new_fs_inputs = []
         for fs_shape in fs_shapes:
-            if isinstance(fs_shape, (list, tuple)):
+            if isinstance(fs_shape, list | tuple):
                 new_fs_inputs += list(fs_shape)
             else:
                 # It can be None for generic objects
@@ -170,7 +170,9 @@ class IfElse(_NoPythonOp):
         output_vars = []
         new_inputs_true_branch = []
         new_inputs_false_branch = []
-        for input_t, input_f in zip(inputs_true_branch, inputs_false_branch):
+        for input_t, input_f in zip(
+            inputs_true_branch, inputs_false_branch, strict=True
+        ):
             if not isinstance(input_t, Variable):
                 input_t = as_symbolic(input_t)
             if not isinstance(input_f, Variable):
@@ -207,7 +209,9 @@ class IfElse(_NoPythonOp):
                 # allowed to have distinct shapes from either branch
                 new_shape = tuple(
                     s_t if s_t == s_f else None
-                    for s_t, s_f in zip(input_t.type.shape, input_f.type.shape)
+                    for s_t, s_f in zip(
+                        input_t.type.shape, input_f.type.shape, strict=True
+                    )
                 )
                 # TODO FIXME: The presence of this keyword is a strong
                 # assumption.  Find something that's guaranteed by the/a
@@ -227,7 +231,7 @@ class IfElse(_NoPythonOp):
 
         return Apply(
             self,
-            [condition] + new_inputs_true_branch + new_inputs_false_branch,
+            [condition, *new_inputs_true_branch, *new_inputs_false_branch],
             output_vars,
         )
 
@@ -273,13 +277,13 @@ class IfElse(_NoPythonOp):
         # `condition` does affect the elements of the output so it is connected.
         # For the sake of making the gradient convenient we assume that
         # condition + epsilon always triggers the same branch as condition
-        condition_grad = condition.zeros_like().astype(config.floatX)
+        condition_grad = condition.zeros_like(dtype=config.floatX)
 
-        return (
-            [condition_grad]
-            + if_true_op(*inputs_true_grad, return_list=True)
-            + if_false_op(*inputs_false_grad, return_list=True)
-        )
+        return [
+            condition_grad,
+            *if_true_op(*inputs_true_grad, return_list=True),
+            *if_false_op(*inputs_false_grad, return_list=True),
+        ]
 
     def make_thunk(self, node, storage_map, compute_map, no_recycling, impl=None):
         cond = node.inputs[0]
@@ -301,13 +305,14 @@ class IfElse(_NoPythonOp):
                     if len(ls) > 0:
                         return ls
                     else:
-                        for out, t in zip(outputs, input_true_branch):
+                        # strict=False because we are in a hot loop
+                        for out, t in zip(outputs, input_true_branch, strict=False):
                             compute_map[out][0] = 1
                             val = storage_map[t][0]
                             if self.as_view:
                                 storage_map[out][0] = val
                             # Work around broken numpy deepcopy
-                            elif isinstance(val, (np.ndarray, np.memmap)):
+                            elif isinstance(val, np.ndarray | np.memmap):
                                 storage_map[out][0] = val.copy()
                             else:
                                 storage_map[out][0] = deepcopy(val)
@@ -321,13 +326,14 @@ class IfElse(_NoPythonOp):
                     if len(ls) > 0:
                         return ls
                     else:
-                        for out, f in zip(outputs, inputs_false_branch):
+                        # strict=False because we are in a hot loop
+                        for out, f in zip(outputs, inputs_false_branch, strict=False):
                             compute_map[out][0] = 1
                             # can't view both outputs unless destroyhandler
                             # improves
                             # Work around broken numpy deepcopy
                             val = storage_map[f][0]
-                            if isinstance(val, (np.ndarray, np.memmap)):
+                            if isinstance(val, np.ndarray | np.memmap):
                                 storage_map[out][0] = val.copy()
                             else:
                                 storage_map[out][0] = deepcopy(val)
@@ -341,10 +347,10 @@ class IfElse(_NoPythonOp):
 
 def ifelse(
     condition: "TensorLike",
-    then_branch: Union[Any, Sequence[Any]],
-    else_branch: Union[Any, Sequence[Any]],
-    name: Optional[str] = None,
-) -> Union[Variable, Sequence[Variable]]:
+    then_branch: Any | Sequence[Any],
+    else_branch: Any | Sequence[Any],
+    name: str | None = None,
+) -> Variable | Sequence[Variable]:
     """Construct a graph for an ``if`` statement.
 
     Parameters
@@ -379,12 +385,12 @@ def ifelse(
     """
 
     rval_type = None
-    if isinstance(then_branch, (list, tuple)):
+    if isinstance(then_branch, list | tuple):
         rval_type = type(then_branch)
     else:
         then_branch = [then_branch]
 
-    if not isinstance(else_branch, (list, tuple)):
+    if not isinstance(else_branch, list | tuple):
         else_branch = [else_branch]
 
     if len(then_branch) != len(else_branch):
@@ -397,7 +403,7 @@ def ifelse(
 
     new_ifelse = IfElse(n_outs=len(then_branch), as_view=False, name=name)
 
-    ins = [condition] + list(then_branch) + list(else_branch)
+    ins = [condition, *then_branch, *else_branch]
     rval = new_ifelse(*ins, return_list=True)
 
     if rval_type is None:
@@ -477,7 +483,8 @@ acceptable_ops = (
     Reshape,
     Unbroadcast,
     pt.math.Dot,
-    pt.math.MaxAndArgmax,
+    pt.math.Max,
+    pt.math.Argmax,
     pt.subtensor.Subtensor,
     pt.subtensor.IncSubtensor,
     pt.basic.Alloc,
@@ -611,7 +618,7 @@ class CondMerge(GraphRewriter):
                 mn_fs = merging_node.inputs[1:][merging_node.op.n_outs :]
                 pl_ts = proposal.inputs[1:][: proposal.op.n_outs]
                 pl_fs = proposal.inputs[1:][proposal.op.n_outs :]
-                new_ins = [merging_node.inputs[0]] + mn_ts + pl_ts + mn_fs + pl_fs
+                new_ins = [merging_node.inputs[0], *mn_ts, *pl_ts, *mn_fs, *pl_fs]
                 mn_name = "?"
                 if merging_node.op.name:
                     mn_name = merging_node.op.name
@@ -628,15 +635,15 @@ class CondMerge(GraphRewriter):
                 new_outs = new_ifelse(*new_ins, return_list=True)
                 new_outs = [clone_replace(x) for x in new_outs]
                 old_outs = []
-                if not isinstance(merging_node.outputs, (list, tuple)):
+                if not isinstance(merging_node.outputs, list | tuple):
                     old_outs += [merging_node.outputs]
                 else:
                     old_outs += merging_node.outputs
-                if not isinstance(proposal.outputs, (list, tuple)):
+                if not isinstance(proposal.outputs, list | tuple):
                     old_outs += [proposal.outputs]
                 else:
                     old_outs += proposal.outputs
-                pairs = list(zip(old_outs, new_outs))
+                pairs = list(zip(old_outs, new_outs, strict=True))
                 fgraph.replace_all_validate(pairs, reason="cond_merge")
 
 
@@ -673,7 +680,7 @@ def cond_remove_identical(fgraph, node):
 
     new_ifelse = IfElse(n_outs=len(nw_ts), as_view=op.as_view, name=op.name)
 
-    new_ins = [node.inputs[0]] + nw_ts + nw_fs
+    new_ins = [node.inputs[0], *nw_ts, *nw_fs]
     new_outs = new_ifelse(*new_ins, return_list=True)
 
     rval = []
@@ -711,7 +718,7 @@ def cond_merge_random_op(fgraph, main_node):
             mn_fs = merging_node.inputs[1:][merging_node.op.n_outs :]
             pl_ts = proposal.inputs[1:][: proposal.op.n_outs]
             pl_fs = proposal.inputs[1:][proposal.op.n_outs :]
-            new_ins = [merging_node.inputs[0]] + mn_ts + pl_ts + mn_fs + pl_fs
+            new_ins = [merging_node.inputs[0], *mn_ts, *pl_ts, *mn_fs, *pl_fs]
             mn_name = "?"
             if merging_node.op.name:
                 mn_name = merging_node.op.name
@@ -727,15 +734,15 @@ def cond_merge_random_op(fgraph, main_node):
             )
             new_outs = new_ifelse(*new_ins, return_list=True)
             old_outs = []
-            if not isinstance(merging_node.outputs, (list, tuple)):
+            if not isinstance(merging_node.outputs, list | tuple):
                 old_outs += [merging_node.outputs]
             else:
                 old_outs += merging_node.outputs
-            if not isinstance(proposal.outputs, (list, tuple)):
+            if not isinstance(proposal.outputs, list | tuple):
                 old_outs += [proposal.outputs]
             else:
                 old_outs += proposal.outputs
-            pairs = list(zip(old_outs, new_outs))
+            pairs = list(zip(old_outs, new_outs, strict=True))
             main_outs = clone_replace(main_node.outputs, replace=pairs)
             return main_outs
 

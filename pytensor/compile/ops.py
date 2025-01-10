@@ -246,17 +246,17 @@ class FromFunctionOp(Op):
             self.infer_shape = self._infer_shape
 
     def __eq__(self, other):
-        return type(self) == type(other) and self.__fn == other.__fn
+        return type(self) is type(other) and self.__fn == other.__fn
 
     def __hash__(self):
         return hash(type(self)) ^ hash(self.__fn)
 
     def __str__(self):
-        return "FromFunctionOp{%s}" % self.__fn.__name__
+        return f"FromFunctionOp{{{self.__fn.__name__}}}"
 
     def perform(self, node, inputs, outputs):
         outs = self.__fn(*inputs)
-        if not isinstance(outs, (list, tuple)):
+        if not isinstance(outs, list | tuple):
             outs = (outs,)
         assert len(outs) == len(outputs)
         for i in range(len(outs)):
@@ -308,11 +308,11 @@ def as_op(itypes, otypes, infer_shape=None):
         return numpy.dot(a, b)
 
     """
-    if not isinstance(itypes, (list, tuple)):
+    if not isinstance(itypes, list | tuple):
         itypes = [itypes]
     if not all(isinstance(t, CType) for t in itypes):
         raise TypeError("itypes has to be a list of PyTensor types")
-    if not isinstance(otypes, (list, tuple)):
+    if not isinstance(otypes, list | tuple):
         otypes = [otypes]
     if not all(isinstance(t, CType) for t in otypes):
         raise TypeError("otypes has to be a list of PyTensor types")

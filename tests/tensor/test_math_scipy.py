@@ -3,7 +3,7 @@ import warnings
 import numpy as np
 import pytest
 
-from pytensor.gradient import verify_grad
+from pytensor.gradient import NullTypeGradError, verify_grad
 from pytensor.scalar import ScalarLoop
 from pytensor.tensor.elemwise import Elemwise
 
@@ -12,14 +12,13 @@ scipy = pytest.importorskip("scipy")
 
 from functools import partial
 
-import scipy.special
-import scipy.stats
+from scipy import special, stats
 
 from pytensor import function, grad
 from pytensor import tensor as pt
 from pytensor.compile.mode import get_default_mode
 from pytensor.configdefaults import config
-from pytensor.tensor import gammaincc, inplace, vector
+from pytensor.tensor import gammaincc, inplace, kv, kve, vector
 from tests import unittest_tools as utt
 from tests.tensor.utils import (
     _good_broadcast_unary_chi2sf,
@@ -45,40 +44,43 @@ mode_no_scipy = get_default_mode()
 
 
 def scipy_special_gammau(k, x):
-    return scipy.special.gammaincc(k, x) * scipy.special.gamma(k)
+    return special.gammaincc(k, x) * special.gamma(k)
 
 
 def scipy_special_gammal(k, x):
-    return scipy.special.gammainc(k, x) * scipy.special.gamma(k)
+    return special.gammainc(k, x) * special.gamma(k)
 
 
 # Precomputing the result is brittle(it have been broken!)
 # As if we do any modification to random number here,
 # The input random number will change and the output!
-expected_erf = scipy.special.erf
-expected_erfc = scipy.special.erfc
-expected_erfinv = scipy.special.erfinv
-expected_erfcinv = scipy.special.erfcinv
-expected_owenst = scipy.special.owens_t
-expected_gamma = scipy.special.gamma
-expected_gammaln = scipy.special.gammaln
-expected_psi = scipy.special.psi
-expected_tri_gamma = partial(scipy.special.polygamma, 1)
-expected_chi2sf = scipy.stats.chi2.sf
-expected_gammainc = scipy.special.gammainc
-expected_gammaincc = scipy.special.gammaincc
+expected_erf = special.erf
+expected_erfc = special.erfc
+expected_erfinv = special.erfinv
+expected_erfcinv = special.erfcinv
+expected_owenst = special.owens_t
+expected_gamma = special.gamma
+expected_gammaln = special.gammaln
+expected_psi = special.psi
+expected_tri_gamma = partial(special.polygamma, 1)
+expected_chi2sf = stats.chi2.sf
+expected_gammainc = special.gammainc
+expected_gammaincc = special.gammaincc
 expected_gammau = scipy_special_gammau
 expected_gammal = scipy_special_gammal
-expected_j0 = scipy.special.j0
-expected_j1 = scipy.special.j1
-expected_jv = scipy.special.jv
-expected_i0 = scipy.special.i0
-expected_i1 = scipy.special.i1
-expected_iv = scipy.special.iv
-expected_ive = scipy.special.ive
-expected_erfcx = scipy.special.erfcx
-expected_sigmoid = scipy.special.expit
-expected_hyp2f1 = scipy.special.hyp2f1
+expected_gammaincinv = special.gammaincinv
+expected_gammainccinv = special.gammainccinv
+expected_j0 = special.j0
+expected_j1 = special.j1
+expected_jv = special.jv
+expected_i0 = special.i0
+expected_i1 = special.i1
+expected_iv = special.iv
+expected_ive = special.ive
+expected_erfcx = special.erfcx
+expected_sigmoid = special.expit
+expected_hyp2f1 = special.hyp2f1
+expected_betaincinv = special.betaincinv
 
 TestErfBroadcast = makeBroadcastTester(
     op=pt.erf,
@@ -485,6 +487,49 @@ TestGammaLInplaceBroadcast = makeBroadcastTester(
 )
 
 rng = np.random.default_rng(seed=utt.fetch_seed())
+_good_broadcast_binary_gamma = dict(
+    normal=(
+        random_ranged(0, 100, (2, 3), rng=rng),
+        random_ranged(0, 1, (2, 3), rng=rng),
+    ),
+    empty=(np.asarray([], dtype=config.floatX), np.asarray([], dtype=config.floatX)),
+)
+
+TestGammaIncInvBroadcast = makeBroadcastTester(
+    op=pt.gammaincinv,
+    expected=expected_gammaincinv,
+    good=_good_broadcast_binary_gamma,
+    eps=2e-8,
+    mode=mode_no_scipy,
+)
+
+TestGammaIncInvInplaceBroadcast = makeBroadcastTester(
+    op=inplace.gammaincinv_inplace,
+    expected=expected_gammaincinv,
+    good=_good_broadcast_binary_gamma,
+    eps=2e-8,
+    mode=mode_no_scipy,
+    inplace=True,
+)
+
+TestGammaInccInvBroadcast = makeBroadcastTester(
+    op=pt.gammainccinv,
+    expected=expected_gammainccinv,
+    good=_good_broadcast_binary_gamma,
+    eps=2e-8,
+    mode=mode_no_scipy,
+)
+
+TestGammaInccInvInplaceBroadcast = makeBroadcastTester(
+    op=inplace.gammainccinv_inplace,
+    expected=expected_gammainccinv,
+    good=_good_broadcast_binary_gamma,
+    eps=2e-8,
+    mode=mode_no_scipy,
+    inplace=True,
+)
+
+rng = np.random.default_rng(seed=utt.fetch_seed())
 _good_broadcast_unary_bessel = dict(
     normal=(random_ranged(-10, 10, (2, 3), rng=rng),),
     empty=(np.asarray([], dtype=config.floatX),),
@@ -791,14 +836,14 @@ _good_broadcast_ternary_betainc = dict(
 
 TestBetaincBroadcast = makeBroadcastTester(
     op=pt.betainc,
-    expected=scipy.special.betainc,
+    expected=special.betainc,
     good=_good_broadcast_ternary_betainc,
     grad=_good_broadcast_ternary_betainc,
 )
 
 TestBetaincInplaceBroadcast = makeBroadcastTester(
     op=inplace.betainc_inplace,
-    expected=scipy.special.betainc,
+    expected=special.betainc,
     good=_good_broadcast_ternary_betainc,
     grad=_good_broadcast_ternary_betainc,
     inplace=True,
@@ -879,6 +924,27 @@ class TestBetaIncGrad:
                 f_grad(test_a, test_b, test_z), [expected_dda, expected_ddb]
             )
 
+
+_good_broadcast_ternary_betaincinv = dict(
+    normal=(
+        random_ranged(0, 1000, (2, 3)),
+        random_ranged(0, 1000, (2, 3)),
+        random_ranged(0, 1, (2, 3)),
+    ),
+)
+
+TestBetaincinvBroadcast = makeBroadcastTester(
+    op=pt.betaincinv,
+    expected=special.betaincinv,
+    good=_good_broadcast_ternary_betaincinv,
+)
+
+TestBetaincinvInplaceBroadcast = makeBroadcastTester(
+    op=inplace.betaincinv_inplace,
+    expected=special.betaincinv,
+    good=_good_broadcast_ternary_betaincinv,
+    inplace=True,
+)
 
 _good_broadcast_quaternary_hyp2f1 = dict(
     normal=(
@@ -1130,3 +1196,37 @@ class TestHyp2F1Grad:
             [dd for i, dd in enumerate(expected_dds) if i in wrt],
             rtol=rtol,
         )
+
+
+def test_kve():
+    rng = np.random.default_rng(3772)
+    v = vector("v")
+    x = vector("x")
+
+    out = kve(v[:, None], x[None, :])
+    test_v = np.array([-3.7, 4, 4.5, 5], dtype=v.type.dtype)
+    test_x = np.linspace(0, 1005, 10, dtype=x.type.dtype)
+
+    np.testing.assert_allclose(
+        out.eval({v: test_v, x: test_x}),
+        scipy.special.kve(test_v[:, None], test_x[None, :]),
+    )
+
+    with pytest.raises(NullTypeGradError):
+        grad(out.sum(), v)
+
+    verify_grad(lambda x: kv(4.5, x), [test_x + 0.5], rng=rng)
+
+
+def test_kv():
+    v = vector("v")
+    x = vector("x")
+
+    out = kv(v[:, None], x[None, :])
+    test_v = np.array([-3.7, 4, 4.5, 5], dtype=v.type.dtype)
+    test_x = np.linspace(0, 512, 10, dtype=x.type.dtype)
+
+    np.testing.assert_allclose(
+        out.eval({v: test_v, x: test_x}),
+        scipy.special.kv(test_v[:, None], test_x[None, :]),
+    )

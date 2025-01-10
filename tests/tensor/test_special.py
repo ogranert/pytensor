@@ -1,22 +1,29 @@
 import numpy as np
 import pytest
+from scipy.special import beta as scipy_beta
 from scipy.special import factorial as scipy_factorial
 from scipy.special import log_softmax as scipy_log_softmax
+from scipy.special import logit as scipy_logit
 from scipy.special import poch as scipy_poch
 from scipy.special import softmax as scipy_softmax
 
 from pytensor.compile.function import function
 from pytensor.configdefaults import config
+from pytensor.graph.replace import vectorize_node
+from pytensor.tensor.blockwise import Blockwise
 from pytensor.tensor.special import (
     LogSoftmax,
     Softmax,
     SoftmaxGrad,
+    beta,
+    betaln,
     factorial,
     log_softmax,
+    logit,
     poch,
     softmax,
 )
-from pytensor.tensor.type import matrix, tensor3, tensor4, vector, vectors
+from pytensor.tensor.type import matrix, tensor, tensor3, tensor4, vector, vectors
 from tests import unittest_tools as utt
 from tests.tensor.utils import random_ranged
 
@@ -147,6 +154,34 @@ class TestSoftmaxGrad(utt.InferShapeTester):
             SoftmaxGrad(-4)(*x)
 
 
+@pytest.mark.parametrize(
+    "core_axis, batch_axis",
+    [
+        (None, (1, 2, 3, 4)),
+        (0, (1,)),
+    ],
+)
+@pytest.mark.parametrize(
+    "op, constructor", [(Softmax, softmax), (LogSoftmax, log_softmax)]
+)
+def test_vectorize_softmax(op, constructor, core_axis, batch_axis):
+    x = tensor(shape=(5, 5, 5, 5))
+    batch_x = tensor(shape=(3, 5, 5, 5, 5))
+
+    node = constructor(x, axis=core_axis).owner
+    assert isinstance(node.op, op)
+
+    new_node = vectorize_node(node, batch_x)
+    if len(batch_axis) == 1:
+        assert isinstance(new_node.op, op)
+        assert (new_node.op.axis,) == batch_axis
+    else:
+        assert isinstance(new_node.op, Blockwise) and isinstance(
+            new_node.op.core_op, op
+        )
+        assert new_node.op.core_op.axis == core_axis
+
+
 def test_poch():
     _z, _m = vectors("z", "m")
     actual_fn = function([_z, _m], poch(_z, _m))
@@ -168,6 +203,44 @@ def test_factorial(n):
     n = random_ranged(0, 5, (2,))
     actual = actual_fn(n)
     expected = scipy_factorial(n)
+    np.testing.assert_allclose(
+        actual, expected, rtol=1e-7 if config.floatX == "float64" else 1e-5
+    )
+
+
+def test_logit():
+    x = vector("x")
+    actual_fn = function([x], logit(x), allow_input_downcast=True)
+
+    x_test = np.linspace(0, 1)
+    actual = actual_fn(x_test)
+    expected = scipy_logit(x_test)
+    np.testing.assert_allclose(
+        actual, expected, rtol=1e-7 if config.floatX == "float64" else 1e-5
+    )
+
+
+def test_beta():
+    _a, _b = vectors("a", "b")
+    actual_fn = function([_a, _b], beta(_a, _b))
+
+    a = random_ranged(0, 5, (2,))
+    b = random_ranged(0, 5, (2,))
+    actual = actual_fn(a, b)
+    expected = scipy_beta(a, b)
+    np.testing.assert_allclose(
+        actual, expected, rtol=1e-7 if config.floatX == "float64" else 1e-5
+    )
+
+
+def test_betaln():
+    _a, _b = vectors("a", "b")
+    actual_fn = function([_a, _b], betaln(_a, _b))
+
+    a = random_ranged(0, 5, (2,))
+    b = random_ranged(0, 5, (2,))
+    actual = np.exp(actual_fn(a, b))
+    expected = scipy_beta(a, b)
     np.testing.assert_allclose(
         actual, expected, rtol=1e-7 if config.floatX == "float64" else 1e-5
     )

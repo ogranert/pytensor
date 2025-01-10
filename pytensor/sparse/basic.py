@@ -7,6 +7,8 @@ http://www-users.cs.umn.edu/~saad/software/SPARSKIT/paper.ps
 TODO: Automatic methods for determining best sparse format?
 
 """
+
+from typing import Literal
 from warnings import warn
 
 import numpy as np
@@ -22,18 +24,25 @@ from pytensor.graph.basic import Apply, Constant, Variable
 from pytensor.graph.op import Op
 from pytensor.link.c.op import COp
 from pytensor.link.c.type import generic
-from pytensor.misc.safe_asarray import _asarray
 from pytensor.sparse.type import SparseTensorType, _is_sparse
 from pytensor.sparse.utils import hash_from_sparse
 from pytensor.tensor import basic as ptb
 from pytensor.tensor.basic import Split
-from pytensor.tensor.math import _conj
-from pytensor.tensor.math import add as pt_add
-from pytensor.tensor.math import arcsin, arcsinh, arctan, arctanh, ceil, deg2rad
-from pytensor.tensor.math import dot as pt_dot
-from pytensor.tensor.math import exp, expm1, floor, log, log1p, maximum, minimum
-from pytensor.tensor.math import pow as pt_pow
 from pytensor.tensor.math import (
+    _conj,
+    arcsin,
+    arcsinh,
+    arctan,
+    arctanh,
+    ceil,
+    deg2rad,
+    exp,
+    expm1,
+    floor,
+    log,
+    log1p,
+    maximum,
+    minimum,
     rad2deg,
     round_half_to_even,
     sigmoid,
@@ -46,11 +55,14 @@ from pytensor.tensor.math import (
     tanh,
     trunc,
 )
+from pytensor.tensor.math import add as pt_add
+from pytensor.tensor.math import dot as pt_dot
+from pytensor.tensor.math import pow as pt_pow
 from pytensor.tensor.shape import shape, specify_broadcastable
-from pytensor.tensor.type import TensorType
+from pytensor.tensor.slinalg import BaseBlockDiagonal, _largest_common_dtype
+from pytensor.tensor.type import TensorType, iscalar, ivector, scalar, tensor, vector
 from pytensor.tensor.type import continuous_dtypes as tensor_continuous_dtypes
 from pytensor.tensor.type import discrete_dtypes as tensor_discrete_dtypes
-from pytensor.tensor.type import iscalar, ivector, scalar, tensor, vector
 from pytensor.tensor.variable import (
     TensorConstant,
     TensorVariable,
@@ -59,7 +71,6 @@ from pytensor.tensor.variable import (
 
 
 sparse_formats = ["csc", "csr"]
-
 
 """
 Types of sparse matrices to use for testing.
@@ -123,7 +134,7 @@ def _is_dense(x):
         L{numpy.ndarray}).
 
     """
-    if not isinstance(x, (scipy.sparse.spmatrix, np.ndarray)):
+    if not isinstance(x, scipy.sparse.spmatrix | np.ndarray):
         raise NotImplementedError(
             "this function should only be called on "
             "sparse.scipy.sparse.spmatrix or "
@@ -182,7 +193,6 @@ def as_sparse_variable(x, name=None, ndim=None, **kwargs):
 
 
 as_sparse = as_sparse_variable
-
 
 as_sparse_or_tensor_variable = as_symbolic
 
@@ -451,7 +461,7 @@ class SparseConstantSignature(tuple):
         return (
             a == x
             and (b.dtype == y.dtype)
-            and (type(b) == type(y))
+            and (type(b) is type(y))
             and (b.shape == y.shape)
             and (abs(b - y).sum() < 1e-6 * b.nnz)
         )
@@ -468,7 +478,7 @@ class SparseConstantSignature(tuple):
         return hash_from_sparse(d)
 
 
-class SparseConstant(TensorConstant, _sparse_py_operators):
+class SparseConstant(SparseVariable, TensorConstant):
     format = property(lambda self: self.type.format)
 
     def signature(self):
@@ -476,13 +486,7 @@ class SparseConstant(TensorConstant, _sparse_py_operators):
         return SparseConstantSignature((self.type, self.data))
 
     def __str__(self):
-        return "{}{{{},{},shape={},nnz={}}}".format(
-            self.__class__.__name__,
-            self.format,
-            self.dtype,
-            self.data.shape,
-            self.data.nnz,
-        )
+        return f"{self.__class__.__name__}{{{self.format},{self.dtype},shape={self.data.shape},nnz={self.data.nnz}}}"
 
     def __repr__(self):
         return str(self)
@@ -519,7 +523,7 @@ csc_fmatrix = SparseTensorType(format="csc", dtype="float32")
 csr_fmatrix = SparseTensorType(format="csr", dtype="float32")
 bsr_fmatrix = SparseTensorType(format="bsr", dtype="float32")
 
-all_dtypes = list(SparseTensorType.dtype_specs_map.keys())
+all_dtypes = list(SparseTensorType.dtype_specs_map)
 complex_dtypes = [t for t in all_dtypes if t[:7] == "complex"]
 float_dtypes = [t for t in all_dtypes if t[:5] == "float"]
 int_dtypes = [t for t in all_dtypes if t[:3] == "int"]
@@ -590,11 +594,11 @@ class CSMProperties(Op):
         (csm,) = inputs
         out[0][0] = csm.data
         if str(csm.data.dtype) == "int32":
-            out[0][0] = _asarray(out[0][0], dtype="int32")
+            out[0][0] = np.asarray(out[0][0], dtype="int32")
         # backport
-        out[1][0] = _asarray(csm.indices, dtype="int32")
-        out[2][0] = _asarray(csm.indptr, dtype="int32")
-        out[3][0] = _asarray(csm.shape, dtype="int32")
+        out[1][0] = np.asarray(csm.indices, dtype="int32")
+        out[2][0] = np.asarray(csm.indptr, dtype="int32")
+        out[3][0] = np.asarray(csm.shape, dtype="int32")
 
     def grad(self, inputs, g):
         # g[1:] is all integers, so their Jacobian in this op
@@ -693,17 +697,17 @@ class CSM(Op):
 
         if not isinstance(indices, Variable):
             indices_ = np.asarray(indices)
-            indices_32 = _asarray(indices, dtype="int32")
+            indices_32 = np.asarray(indices, dtype="int32")
             assert (indices_ == indices_32).all()
             indices = indices_32
         if not isinstance(indptr, Variable):
             indptr_ = np.asarray(indptr)
-            indptr_32 = _asarray(indptr, dtype="int32")
+            indptr_32 = np.asarray(indptr, dtype="int32")
             assert (indptr_ == indptr_32).all()
             indptr = indptr_32
         if not isinstance(shape, Variable):
             shape_ = np.asarray(shape)
-            shape_32 = _asarray(shape, dtype="int32")
+            shape_32 = np.asarray(shape, dtype="int32")
             assert (shape_ == shape_32).all()
             shape = shape_32
 
@@ -1377,8 +1381,8 @@ class GetItem2d(Op):
                 isinstance(ind, Variable) and getattr(ind, "ndim", -1) == 0
             ) or np.isscalar(ind):
                 raise NotImplementedError(
-                    "PyTensor has no sparse vector"
-                    + "Use X[a:b, c:d], X[a:b, c:c+1] or X[a:b] instead."
+                    "PyTensor has no sparse vector. "
+                    "Use X[a:b, c:d], X[a:b, c:c+1] or X[a:b] instead."
                 )
             else:
                 raise ValueError(
@@ -1456,7 +1460,7 @@ class GetItemScalar(Op):
         (x, ind1, ind2) = inputs
         (out,) = outputs
         assert _is_sparse(x)
-        out[0] = _asarray(x[ind1, ind2], x.dtype)
+        out[0] = np.asarray(x[ind1, ind2], x.dtype)
 
 
 get_item_scalar = GetItemScalar()
@@ -1800,7 +1804,7 @@ class SpSum(Op):
         return r
 
     def __str__(self):
-        return f"{self.__class__.__name__ }{{axis={self.axis}}}"
+        return f"{self.__class__.__name__}{{axis={self.axis}}}"
 
 
 def sp_sum(x, axis=None, sparse_grad=False):
@@ -2137,7 +2141,7 @@ class AddSD(Op):
 
         # The asarray is needed as in some case, this return a
         # numpy.matrixlib.defmatrix.matrix object and not an ndarray.
-        out[0] = _asarray(x + y, dtype=node.outputs[0].type.dtype)
+        out[0] = np.asarray(x + y, dtype=node.outputs[0].type.dtype)
 
     def grad(self, inputs, gout):
         (x, y) = inputs
@@ -2775,18 +2779,13 @@ class GreaterEqualSD(__ComparisonOpSD):
 
 greater_equal_s_d = GreaterEqualSD()
 
-
 eq = __ComparisonSwitch(equal_s_s, equal_s_d, equal_s_d)
-
 
 neq = __ComparisonSwitch(not_equal_s_s, not_equal_s_d, not_equal_s_d)
 
-
 lt = __ComparisonSwitch(less_than_s_s, less_than_s_d, greater_than_s_d)
 
-
 gt = __ComparisonSwitch(greater_than_s_s, greater_than_s_d, less_than_s_d)
-
 
 le = __ComparisonSwitch(less_equal_s_s, less_equal_s_d, greater_equal_s_d)
 
@@ -2849,7 +2848,7 @@ class HStack(Op):
             else:
                 return None
 
-        return [choose(c, d) for c, d in zip(is_continuous, derivative)]
+        return [choose(c, d) for c, d in zip(is_continuous, derivative, strict=True)]
 
     def infer_shape(self, fgraph, node, ins_shapes):
         def _get(l):
@@ -2928,7 +2927,7 @@ class VStack(HStack):
             else:
                 return None
 
-        return [choose(c, d) for c, d in zip(is_continuous, derivative)]
+        return [choose(c, d) for c, d in zip(is_continuous, derivative, strict=True)]
 
     def infer_shape(self, fgraph, node, ins_shapes):
         def _get(l):
@@ -2992,7 +2991,7 @@ class Remove0(Op):
         l = []
         if self.inplace:
             l.append("inplace")
-        return f"{self.__class__.__name__ }{{{', '.join(l)}}}"
+        return f"{self.__class__.__name__}{{{', '.join(l)}}}"
 
     def make_node(self, x):
         """
@@ -3291,6 +3290,7 @@ class TrueDot(Op):
     # Simplify code by splitting into DotSS and DotSD.
 
     __props__ = ()
+
     # The grad_preserves_dense attribute doesn't change the
     # execution behavior.  To let the optimizer merge nodes with
     # different values of this attribute we shouldn't compare it
@@ -3496,7 +3496,7 @@ class StructuredDot(Op):
 
         # The cast is needed as otherwise we hit the bug mentioned into
         # _asarray function documentation.
-        out[0] = _asarray(variable, str(variable.dtype))
+        out[0] = np.asarray(variable, str(variable.dtype))
 
     def grad(self, inputs, gout):
         # a is sparse, b is dense, g_out is dense
@@ -3616,81 +3616,80 @@ class StructuredDotGradCSC(COp):
         if node.inputs[3].type.dtype in ("complex64", "complex128"):
             raise NotImplementedError("Complex types are not supported for g_ab")
 
-        return """
-        if (PyArray_NDIM(%(_d)s) != 2) {PyErr_SetString(PyExc_NotImplementedError, "rank(d) != 2"); %(fail)s;}
-        if (PyArray_NDIM(%(_g)s) != 2) {PyErr_SetString(PyExc_NotImplementedError, "rank(g) != 2"); %(fail)s;}
-        if (PyArray_NDIM(%(_indices)s) != 1) {PyErr_SetString(PyExc_NotImplementedError, "rank(indices) != 1"); %(fail)s;}
-        if (PyArray_NDIM(%(_indptr)s) != 1) {PyErr_SetString(PyExc_NotImplementedError, "rank(indptr) != 1"); %(fail)s;}
+        fail = sub["fail"]
+        return f"""
+        if (PyArray_NDIM({_d}) != 2) {{PyErr_SetString(PyExc_NotImplementedError, "rank(d) != 2"); {fail};}}
+        if (PyArray_NDIM({_g}) != 2) {{PyErr_SetString(PyExc_NotImplementedError, "rank(g) != 2"); {fail};}}
+        if (PyArray_NDIM({_indices}) != 1) {{PyErr_SetString(PyExc_NotImplementedError, "rank(indices) != 1"); {fail};}}
+        if (PyArray_NDIM({_indptr}) != 1) {{PyErr_SetString(PyExc_NotImplementedError, "rank(indptr) != 1"); {fail};}}
 
-        if( PyArray_TYPE(%(_indices)s) != NPY_INT32) {
-        PyErr_SetString(PyExc_NotImplementedError, "C"); %(fail)s;}
+        if( PyArray_TYPE({_indices}) != NPY_INT32) {{
+        PyErr_SetString(PyExc_NotImplementedError, "C"); {fail};}}
 
-        if( PyArray_TYPE(%(_indptr)s) != NPY_INT32)
-        {PyErr_SetString(PyExc_NotImplementedError, "D"); %(fail)s;}
+        if( PyArray_TYPE({_indptr}) != NPY_INT32)
+        {{PyErr_SetString(PyExc_NotImplementedError, "D"); {fail};}}
 
-        if( PyArray_DIMS(%(_d)s)[1] != PyArray_DIMS(%(_g)s)[1])
-        {PyErr_SetString(PyExc_NotImplementedError, "d and g have different numbers of columns"); %(fail)s;}
+        if( PyArray_DIMS({_d})[1] != PyArray_DIMS({_g})[1])
+        {{PyErr_SetString(PyExc_NotImplementedError, "d and g have different numbers of columns"); {fail};}}
 
-        if (!%(_zout)s
-            || (PyArray_DIMS(%(_zout)s)[0] != PyArray_DIMS(%(_indices)s)[0]))
-        {
-            Py_XDECREF(%(_zout)s);
-            %(_zout)s = (PyArrayObject*) PyArray_SimpleNew(1, PyArray_DIMS(%(_indices)s), PyArray_TYPE(%(_g)s));
-        }
+        if (!{_zout}
+            || (PyArray_DIMS({_zout})[0] != PyArray_DIMS({_indices})[0]))
+        {{
+            Py_XDECREF({_zout});
+            {_zout} = (PyArrayObject*) PyArray_SimpleNew(1, PyArray_DIMS({_indices}), PyArray_TYPE({_g}));
+        }}
 
-        {   //makes it compile even though labels jump over variable definitions.
-            npy_intp nnz = PyArray_DIMS(%(_indices)s)[0];
-            npy_intp N =  PyArray_DIMS(%(_indptr)s)[0]-1; //TODO: error checking with this
+        {{   //makes it compile even though labels jump over variable definitions.
+            npy_intp nnz = PyArray_DIMS({_indices})[0];
+            npy_intp N =  PyArray_DIMS({_indptr})[0]-1; //TODO: error checking with this
 
-            npy_intp Sindices = PyArray_STRIDES(%(_indices)s)[0]/PyArray_DESCR(%(_indices)s)->elsize;
-            npy_intp Sindptr = PyArray_STRIDES(%(_indptr)s)[0]/PyArray_DESCR(%(_indptr)s)->elsize;
+            npy_intp Sindices = PyArray_STRIDES({_indices})[0]/PyArray_DESCR({_indices})->elsize;
+            npy_intp Sindptr = PyArray_STRIDES({_indptr})[0]/PyArray_DESCR({_indptr})->elsize;
 
-            const npy_intp Sd1 = PyArray_STRIDES(%(_d)s)[1]/PyArray_DESCR(%(_d)s)->elsize;
-            const npy_intp Sg1 = PyArray_STRIDES(%(_g)s)[1]/PyArray_DESCR(%(_g)s)->elsize;
+            const npy_intp Sd1 = PyArray_STRIDES({_d})[1]/PyArray_DESCR({_d})->elsize;
+            const npy_intp Sg1 = PyArray_STRIDES({_g})[1]/PyArray_DESCR({_g})->elsize;
 
-            const npy_intp K = PyArray_DIMS(%(_d)s)[1];
+            const npy_intp K = PyArray_DIMS({_d})[1];
 
-            const npy_int32 * __restrict__ indptr = (npy_int32 *)PyArray_DATA(%(_indptr)s);
-            const npy_int32 * __restrict__ indices = (npy_int32 *)PyArray_DATA(%(_indices)s);
+            const npy_int32 * __restrict__ indptr = (npy_int32 *)PyArray_DATA({_indptr});
+            const npy_int32 * __restrict__ indices = (npy_int32 *)PyArray_DATA({_indices});
 
             // loop over columns
             for (npy_int32 j = 0; j < N; ++j)
-            {
+            {{
                 // extract j-th row of dense matrix
-                const dtype_%(_d)s* __restrict__ d_row = (dtype_%(_d)s*)(PyArray_BYTES(%(_d)s) + PyArray_STRIDES(%(_d)s)[0] * j);
-                if(j >= PyArray_DIMS(%(_d)s)[0]) {PyErr_SetString(PyExc_NotImplementedError, "G"); %(fail)s;}
+                const dtype_{_d}* __restrict__ d_row = (dtype_{_d}*)(PyArray_BYTES({_d}) + PyArray_STRIDES({_d})[0] * j);
+                if(j >= PyArray_DIMS({_d})[0]) {{PyErr_SetString(PyExc_NotImplementedError, "G"); {fail};}}
 
                 // for each non-null value in the sparse column
                 for (npy_int32 i_idx = indptr[j * Sindptr]; i_idx < indptr[(j+1) * Sindptr]; ++i_idx)
-                {
+                {{
                     // extract row index of non-null value
                     npy_int32 i = indices[i_idx * Sindices];
 
                     // extract corresponding row in gradient
-                    const dtype_%(_g)s* __restrict__ g_row = (dtype_%(_g)s*)(PyArray_BYTES(%(_g)s) + PyArray_STRIDES(%(_g)s)[0] * i);
+                    const dtype_{_g}* __restrict__ g_row = (dtype_{_g}*)(PyArray_BYTES({_g}) + PyArray_STRIDES({_g})[0] * i);
                     double ip = 0.0;
 
                     // make sure that row index is not bigger than actual number of rows
                     // Note: wouldn't the above operation fail if that were the case ?
                     //       when would this ever be true anyway ?
-                    if (i >= PyArray_DIMS(%(_g)s)[0])
-                    {PyErr_SetString(PyExc_NotImplementedError, "H"); %(fail)s;}
+                    if (i >= PyArray_DIMS({_g})[0])
+                    {{PyErr_SetString(PyExc_NotImplementedError, "H"); {fail};}}
 
                     // perform dot product of dense and sparse rows
                     for(int k = 0; k < K; ++k)
-                    {
+                    {{
                         ip += d_row[k * Sd1] * g_row[k*Sg1];
-                    }
+                    }}
 
                     // write resulting gradient to sparse output
-                    ((dtype_%(_zout)s* __restrict__)(PyArray_BYTES(%(_zout)s) + i_idx * PyArray_STRIDES(%(_zout)s)[0]))[0] = ip;
-                }
-            }
-        }
+                    ((dtype_{_zout}* __restrict__)(PyArray_BYTES({_zout}) + i_idx * PyArray_STRIDES({_zout})[0]))[0] = ip;
+                }}
+            }}
+        }}
 
-        """ % dict(
-            locals(), **sub
-        )
+        """
 
     def infer_shape(self, fgraph, node, shapes):
         return [shapes[0]]
@@ -3751,82 +3750,81 @@ class StructuredDotGradCSR(COp):
         if node.inputs[3].type.dtype in ("complex64", "complex128"):
             raise NotImplementedError("Complex types are not supported for g_ab")
 
-        return """
-        if (PyArray_NDIM(%(_d)s) != 2) {PyErr_SetString(PyExc_NotImplementedError, "rank(d) != 2"); %(fail)s;}
-        if (PyArray_NDIM(%(_g)s) != 2) {PyErr_SetString(PyExc_NotImplementedError, "rank(g) != 2"); %(fail)s;}
-        if (PyArray_NDIM(%(_indices)s) != 1) {PyErr_SetString(PyExc_NotImplementedError, "rank(indices) != 1"); %(fail)s;}
-        if (PyArray_NDIM(%(_indptr)s) != 1) {PyErr_SetString(PyExc_NotImplementedError, "rank(indptr) != 1"); %(fail)s;}
+        fail = sub["fail"]
+        return f"""
+        if (PyArray_NDIM({_d}) != 2) {{PyErr_SetString(PyExc_NotImplementedError, "rank(d) != 2"); {fail};}}
+        if (PyArray_NDIM({_g}) != 2) {{PyErr_SetString(PyExc_NotImplementedError, "rank(g) != 2"); {fail};}}
+        if (PyArray_NDIM({_indices}) != 1) {{PyErr_SetString(PyExc_NotImplementedError, "rank(indices) != 1"); {fail};}}
+        if (PyArray_NDIM({_indptr}) != 1) {{PyErr_SetString(PyExc_NotImplementedError, "rank(indptr) != 1"); {fail};}}
 
-        if( PyArray_TYPE(%(_indices)s) != NPY_INT32) {
-        PyErr_SetString(PyExc_NotImplementedError, "C"); %(fail)s;}
+        if( PyArray_TYPE({_indices}) != NPY_INT32) {{
+        PyErr_SetString(PyExc_NotImplementedError, "C"); {fail};}}
 
-        if( PyArray_TYPE(%(_indptr)s) != NPY_INT32)
-        {PyErr_SetString(PyExc_NotImplementedError, "D"); %(fail)s;}
+        if( PyArray_TYPE({_indptr}) != NPY_INT32)
+        {{PyErr_SetString(PyExc_NotImplementedError, "D"); {fail};}}
 
-        if( PyArray_DIMS(%(_d)s)[1] != PyArray_DIMS(%(_g)s)[1])
-        {PyErr_SetString(PyExc_NotImplementedError, "d and g have different numbers of columns"); %(fail)s;}
+        if( PyArray_DIMS({_d})[1] != PyArray_DIMS({_g})[1])
+        {{PyErr_SetString(PyExc_NotImplementedError, "d and g have different numbers of columns"); {fail};}}
 
-        if (!%(_zout)s
-            || (PyArray_DIMS(%(_zout)s)[0] != PyArray_DIMS(%(_indices)s)[0]))
-        {
-            Py_XDECREF(%(_zout)s);
-            %(_zout)s = (PyArrayObject*) PyArray_SimpleNew(1, PyArray_DIMS(%(_indices)s), PyArray_TYPE(%(_g)s));
-        }
+        if (!{_zout}
+            || (PyArray_DIMS({_zout})[0] != PyArray_DIMS({_indices})[0]))
+        {{
+            Py_XDECREF({_zout});
+            {_zout} = (PyArrayObject*) PyArray_SimpleNew(1, PyArray_DIMS({_indices}), PyArray_TYPE({_g}));
+        }}
 
-        {   //makes it compile even though labels jump over variable definitions.
-            npy_intp nnz = PyArray_DIMS(%(_indices)s)[0];
+        {{   //makes it compile even though labels jump over variable definitions.
+            npy_intp nnz = PyArray_DIMS({_indices})[0];
             // extract number of rows
-            npy_intp N =  PyArray_DIMS(%(_indptr)s)[0]-1; //TODO: error checking with this
+            npy_intp N =  PyArray_DIMS({_indptr})[0]-1; //TODO: error checking with this
 
-            npy_intp Sindices = PyArray_STRIDES(%(_indices)s)[0]/PyArray_DESCR(%(_indices)s)->elsize;
-            npy_intp Sindptr = PyArray_STRIDES(%(_indptr)s)[0]/PyArray_DESCR(%(_indptr)s)->elsize;
+            npy_intp Sindices = PyArray_STRIDES({_indices})[0]/PyArray_DESCR({_indices})->elsize;
+            npy_intp Sindptr = PyArray_STRIDES({_indptr})[0]/PyArray_DESCR({_indptr})->elsize;
 
-            const npy_intp Sd1 = PyArray_STRIDES(%(_d)s)[1]/PyArray_DESCR(%(_d)s)->elsize;
-            const npy_intp Sg1 = PyArray_STRIDES(%(_g)s)[1]/PyArray_DESCR(%(_g)s)->elsize;
+            const npy_intp Sd1 = PyArray_STRIDES({_d})[1]/PyArray_DESCR({_d})->elsize;
+            const npy_intp Sg1 = PyArray_STRIDES({_g})[1]/PyArray_DESCR({_g})->elsize;
 
-            const npy_intp K = PyArray_DIMS(%(_d)s)[1];
+            const npy_intp K = PyArray_DIMS({_d})[1];
 
-            const npy_int32 * __restrict__ indptr = (npy_int32 *)PyArray_DATA(%(_indptr)s);
-            const npy_int32 * __restrict__ indices = (npy_int32 *)PyArray_DATA(%(_indices)s);
+            const npy_int32 * __restrict__ indptr = (npy_int32 *)PyArray_DATA({_indptr});
+            const npy_int32 * __restrict__ indices = (npy_int32 *)PyArray_DATA({_indices});
 
             // loop over columns of sparse matrix
             for (npy_int32 i = 0; i < N; ++i)
-            {
+            {{
                 // for each non-null value in the sparse row
                 for (npy_int32 j_idx = indptr[i * Sindptr]; j_idx < indptr[(i+1) * Sindptr]; ++j_idx)
-                {
+                {{
                     // extract column index of non-null value
                     npy_int32 j = indices[j_idx * Sindices];
 
                     // extract j-th row of dense matrix
-                    const dtype_%(_d)s* __restrict__ d_row = (dtype_%(_d)s*)(PyArray_BYTES(%(_d)s) + PyArray_STRIDES(%(_d)s)[0] * j);
-                    if(j >= PyArray_DIMS(%(_d)s)[0]) {PyErr_SetString(PyExc_NotImplementedError, "G"); %(fail)s;}
+                    const dtype_{_d}* __restrict__ d_row = (dtype_{_d}*)(PyArray_BYTES({_d}) + PyArray_STRIDES({_d})[0] * j);
+                    if(j >= PyArray_DIMS({_d})[0]) {{PyErr_SetString(PyExc_NotImplementedError, "G"); {fail};}}
 
                     // extract corresponding row in gradient
-                    const dtype_%(_g)s* __restrict__ g_row = (dtype_%(_g)s*)(PyArray_BYTES(%(_g)s) + PyArray_STRIDES(%(_g)s)[0] * i);
+                    const dtype_{_g}* __restrict__ g_row = (dtype_{_g}*)(PyArray_BYTES({_g}) + PyArray_STRIDES({_g})[0] * i);
                     double ip = 0.0;
 
                     // make sure that row index is not bigger than actual number of rows
                     // Note: wouldn't the above operation fail if that were the case ?
                     //       when would this ever be true anyway ?
-                    if (i >= PyArray_DIMS(%(_g)s)[0])
-                    {PyErr_SetString(PyExc_NotImplementedError, "H"); %(fail)s;}
+                    if (i >= PyArray_DIMS({_g})[0])
+                    {{PyErr_SetString(PyExc_NotImplementedError, "H"); {fail};}}
 
                     // perform dot product of dense and sparse rows
                     for(int k = 0; k < K; ++k)
-                    {
+                    {{
                         ip += d_row[k * Sd1] * g_row[k*Sg1];
-                    }
+                    }}
 
                     // write resulting gradient to sparse output
-                    ((dtype_%(_zout)s* __restrict__)(PyArray_BYTES(%(_zout)s) + j_idx * PyArray_STRIDES(%(_zout)s)[0]))[0] = ip;
-                }
-            }
-        }
+                    ((dtype_{_zout}* __restrict__)(PyArray_BYTES({_zout}) + j_idx * PyArray_STRIDES({_zout})[0]))[0] = ip;
+                }}
+            }}
+        }}
 
-        """ % dict(
-            locals(), **sub
-        )
+        """
 
     def infer_shape(self, fgraph, node, shapes):
         return [shapes[0]]
@@ -4013,7 +4011,7 @@ class Dot(Op):
         if x_is_sparse and y_is_sparse:
             rval = rval.toarray()
 
-        out[0] = _asarray(rval, dtype=node.outputs[0].dtype)
+        out[0] = np.asarray(rval, dtype=node.outputs[0].dtype)
 
     def grad(self, inputs, gout):
         (x, y) = inputs
@@ -4260,3 +4258,88 @@ class ConstructSparseFromList(Op):
 
 
 construct_sparse_from_list = ConstructSparseFromList()
+
+
+class SparseBlockDiagonal(BaseBlockDiagonal):
+    __props__ = (
+        "n_inputs",
+        "format",
+    )
+
+    def __init__(self, n_inputs: int, format: Literal["csc", "csr"] = "csc"):
+        super().__init__(n_inputs)
+        self.format = format
+
+    def make_node(self, *matrices):
+        matrices = self._validate_and_prepare_inputs(
+            matrices, as_sparse_or_tensor_variable
+        )
+        dtype = _largest_common_dtype(matrices)
+        out_type = matrix(format=self.format, dtype=dtype)
+
+        return Apply(self, matrices, [out_type])
+
+    def perform(self, node, inputs, output_storage, params=None):
+        dtype = node.outputs[0].type.dtype
+        output_storage[0][0] = scipy.sparse.block_diag(
+            inputs, format=self.format
+        ).astype(dtype)
+
+
+def block_diag(*matrices: TensorVariable, format: Literal["csc", "csr"] = "csc"):
+    r"""
+    Construct a block diagonal matrix from a sequence of input matrices.
+
+    Given the inputs `A`, `B` and `C`, the output will have these arrays arranged on the diagonal:
+
+    [[A, 0, 0],
+     [0, B, 0],
+     [0, 0, C]]
+
+    Parameters
+    ----------
+    A, B, C ... : tensors
+        Input tensors to form the block diagonal matrix. last two dimensions of the inputs will be used, and all
+        inputs should have at least 2 dimensins.
+
+        Note that the input matrices need not be sparse themselves, and will be automatically converted to the
+        requested format if they are not.
+
+    format: str, optional
+        The format of the output sparse matrix. One of 'csr' or 'csc'. Default is 'csr'. Ignored if sparse=False.
+
+    Returns
+    -------
+    out: sparse matrix tensor
+        Symbolic sparse matrix in the specified format.
+
+    Examples
+    --------
+    Create a sparse block diagonal matrix from two sparse 2x2 matrices:
+
+    .. testcode::
+        import numpy as np
+        from pytensor.sparse import block_diag
+        from scipy.sparse import csr_matrix
+
+        A = csr_matrix([[1, 2], [3, 4]])
+        B = csr_matrix([[5, 6], [7, 8]])
+        result_sparse = block_diag(A, B, format='csr')
+
+        print(result_sparse)
+        print(result_sparse.toarray().eval())
+
+    .. testoutput::
+
+        SparseVariable{csr,int64}
+        [[1 2 0 0]
+         [3 4 0 0]
+         [0 0 5 6]
+         [0 0 7 8]]
+
+    """
+    if len(matrices) == 1:
+        return matrices
+
+    _sparse_block_diagonal = SparseBlockDiagonal(n_inputs=len(matrices), format=format)
+    return _sparse_block_diagonal(*matrices)

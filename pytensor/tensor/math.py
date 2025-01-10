@@ -1,21 +1,23 @@
 import builtins
 import warnings
+from collections.abc import Sequence
+from textwrap import dedent
 from typing import TYPE_CHECKING, Optional
 
 import numpy as np
+from numpy.core.numeric import normalize_axis_tuple
 
 from pytensor import config, printing
 from pytensor import scalar as ps
-from pytensor.gradient import DisconnectedType
 from pytensor.graph.basic import Apply, Variable
 from pytensor.graph.op import Op
 from pytensor.graph.replace import _vectorize_node
 from pytensor.link.c.op import COp
 from pytensor.link.c.params_type import ParamsType
-from pytensor.link.c.type import Generic
-from pytensor.misc.safe_asarray import _asarray
 from pytensor.printing import pprint
+from pytensor.raise_op import Assert
 from pytensor.scalar.basic import BinaryScalarOp
+from pytensor.tensor import TensorLike
 from pytensor.tensor.basic import (
     alloc,
     arange,
@@ -23,11 +25,17 @@ from pytensor.tensor.basic import (
     cast,
     concatenate,
     constant,
+    expand_dims,
     stack,
     switch,
 )
 from pytensor.tensor.blockwise import Blockwise, vectorize_node_fallback
-from pytensor.tensor.elemwise import CAReduce, DimShuffle, Elemwise, scalar_elemwise
+from pytensor.tensor.elemwise import (
+    CAReduce,
+    Elemwise,
+    get_normalized_batch_axes,
+    scalar_elemwise,
+)
 from pytensor.tensor.shape import shape, specify_broadcastable
 from pytensor.tensor.type import (
     DenseTensorType,
@@ -35,13 +43,14 @@ from pytensor.tensor.type import (
     continuous_dtypes,
     discrete_dtypes,
     int_dtypes,
-    integer_dtypes,
     tensor,
     uint_dtypes,
 )
-from pytensor.tensor.type_other import NoneConst
-from pytensor.tensor.utils import as_list
-from pytensor.tensor.variable import TensorConstant, _tensor_py_operators
+from pytensor.tensor.utils import as_list, normalize_reduce_axis
+from pytensor.tensor.variable import (
+    TensorVariable,
+    _tensor_py_operators,
+)
 
 
 if TYPE_CHECKING:
@@ -93,6 +102,14 @@ else:
     float64_atol = 1e-8
 
 
+def __getattr__(name):
+    if name == "MaxAndArgmax":
+        raise AttributeError(
+            "The class `MaxandArgmax` has been deprecated. Call `Max` and `Argmax` seperately as an alternative."
+        )
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 def _get_atol_rtol(a, b):
     tiny = ("float16",)
     narrow = ("float32", "complex64")
@@ -120,215 +137,6 @@ def _allclose(a, b, rtol=None, atol=None):
     return np.allclose(a, b, atol=atol_, rtol=rtol_)
 
 
-class MaxAndArgmax(COp):
-    """
-    Calculate the max and argmax over a given axis or over all axes.
-
-    """
-
-    nin = 2  # tensor, axis
-    nout = 2  # max val, max idx
-    E_axis = "invalid axis"
-    params_type = Generic()
-    __props__ = ("axis",)
-    _f16_ok = True
-
-    def __init__(self, axis):
-        assert isinstance(axis, list)
-        self.axis = tuple(axis)
-
-    def get_params(self, node):
-        return self.axis
-
-    def make_node(self, x):
-        x = as_tensor_variable(x)
-
-        # Keep the original shapes for axes on which we do not perform the max/argmax.
-        all_axes = set(self.axis)
-        inputs = [x]
-        out_shape = tuple(s for i, s in enumerate(x.type.shape) if i not in all_axes)
-        outputs = [
-            tensor(dtype=x.type.dtype, shape=out_shape, name="max"),
-            tensor(dtype="int64", shape=out_shape, name="argmax"),
-        ]
-        return Apply(self, inputs, outputs)
-
-    def perform(self, node, inp, outs):
-        x = inp[0]
-        axes = self.axis
-        max, max_idx = outs
-        if axes is None:
-            axes = tuple(range(x.ndim))
-        else:
-            axes = tuple(int(ax) for ax in axes)
-        max[0] = _asarray(np.max(x, axes), dtype=node.outputs[0].dtype)
-        # Numpy does not support multiple axes for argmax
-        # Work around
-        keep_axes = np.array([i for i in range(x.ndim) if i not in axes], dtype="int64")
-        # Not-reduced axes in front
-        transposed_x = np.transpose(x, np.concatenate((keep_axes, axes)))
-        kept_shape = transposed_x.shape[: len(keep_axes)]
-        reduced_shape = transposed_x.shape[len(keep_axes) :]
-
-        # Numpy.prod returns 1.0 when arg is empty, so we cast it to int64
-        # Otherwise reshape would complain citing float arg
-        new_shape = kept_shape + (np.prod(reduced_shape, dtype="int64"),)
-        reshaped_x = transposed_x.reshape(new_shape)
-
-        max_idx[0] = _asarray(np.argmax(reshaped_x, axis=-1), dtype="int64")
-
-    def c_code(self, node, name, inp, out, sub):
-        if len(self.axis) != 1 and len(self.axis) != node.inputs[0].ndim:
-            raise NotImplementedError(
-                "NumPy C-API can compute max and argmax only for 1 axis or for all axes."
-            )
-        x = inp[0]
-        axis = sub["params"]
-        max, argmax = out
-        fail = sub["fail"]
-        ret = """
-        #if PY_MAJOR_VERSION >= 3
-            #ifndef PyInt_AS_LONG
-                #define PyInt_AS_LONG PyLong_AS_LONG
-            #endif
-        #endif
-
-        int axis;
-
-        if (PyTuple_GET_SIZE(%(axis)s) == PyArray_NDIM(%(x)s)) {
-            axis = NPY_MAXDIMS;
-        } else if(PyTuple_GET_SIZE(%(axis)s) == 1) {
-            PyObject* axis_object = PyTuple_GET_ITEM(%(axis)s, 0);
-            axis = (int)PyInt_AS_LONG(axis_object);
-            if (axis > PyArray_NDIM(%(x)s)-1 || axis < -PyArray_NDIM(%(x)s)) {
-                PyErr_SetString(PyExc_ValueError,
-                "MaxAndArgmax: bad axis argument");
-                %(fail)s
-            }
-        } else {
-            PyErr_SetString(PyExc_NotImplementedError,
-            "MaxAndArgmax: NumPy C-API can compute max and argmax only for 1 axis or for all axes.");
-            %(fail)s
-        }
-
-        Py_CLEAR(%(max)s);
-        Py_CLEAR(%(argmax)s);//todo pass them as out parameter.
-
-        %(max)s = (PyArrayObject*)PyArray_Max(%(x)s, axis, NULL);
-        if (%(max)s == NULL) {
-            %(fail)s;
-        }
-        if (!PyArray_CheckExact(%(max)s)) {
-            %(max)s = (PyArrayObject*)PyArray_FromAny((PyObject*)%(max)s, NULL, 0, 0, NPY_ARRAY_ENSUREARRAY, NULL);
-            if(%(max)s == NULL){
-                %(fail)s;
-            }
-        }
-
-        %(argmax)s = (PyArrayObject*)PyArray_ArgMax(%(x)s, axis, NULL);
-        if (%(argmax)s == NULL) {
-            Py_CLEAR(%(max)s);
-            %(fail)s;
-        }
-        if (!PyArray_CheckExact(%(argmax)s)) {
-            %(argmax)s = (PyArrayObject*)PyArray_FromAny((PyObject*)%(argmax)s, NULL, 0, 0, NPY_ARRAY_ENSUREARRAY, NULL);
-            if(%(argmax)s == NULL){
-                %(fail)s;
-            }
-        }
-        if (PyArray_TYPE(%(argmax)s) != NPY_INT64) {
-            PyObject * tmp = PyArray_Cast(%(argmax)s, NPY_INT64);
-            if (NULL == tmp){
-                %(fail)s;
-            }
-            Py_DECREF(%(argmax)s);
-            %(argmax)s = (PyArrayObject*)tmp;
-        }
-        """
-        return ret % locals()
-
-    def c_code_cache_version(self):
-        return (5,)
-
-    def infer_shape(self, fgraph, node, shapes):
-        ishape = shapes[0]
-        rval = tuple(
-            ishape[i]
-            for (i, b) in enumerate(node.inputs[0].type.broadcastable)
-            if i not in self.axis
-        )
-        return [rval, rval]
-
-    def R_op(self, inputs, eval_points):
-        if eval_points[0] is None:
-            return [None, None]
-        if len(self.axis) != 1:
-            raise ValueError("R_op supported for arg_max only for one axis!")
-        if self.axis[0] > 1:
-            raise ValueError("R_op supported for arg_max only when axis is 0 or 1")
-        if inputs[0].ndim != 2:
-            raise ValueError("R_op supported for arg_max only when input is a matrix")
-        max_vals, max_pos = self.make_node(*inputs).outputs
-        if self.axis[0] == 0:
-            return [eval_points[0][max_pos, arange(eval_points[0].shape[1])], None]
-        else:
-            return [eval_points[0][arange(eval_points[0].shape[0]), max_pos], None]
-
-    def grad(self, inp, grads):
-        # The strict sense mathematical gradient of the maximum function is
-        # not calculated here for it is not defined at every point where some
-        # coordinates are identical. However, since the latter set has null
-        # Lebesgue measure, the result may be interpreted as weak gradient.
-
-        # @note: This function should work correctly for L{vector}s.
-        # (x, y), (gz, gw)
-        # gz*dz/dx + gw*dw/dx, gz*dz/dy + gw*dw/dy
-        # gMax * dMax/dx + gArgMax * dArgMax/dx,
-        # gMax * dMax/daxis + gArgMax * dArgMax/daxis
-        # g_max has one less dimension than x, so you need to complete
-        # g_max to x's shape when axis=0 the broadcasting mechanism
-        # does it automatically
-        x = inp[0]
-        axis = as_tensor_variable(self.axis)
-        g_max, g_max_idx = grads
-
-        g_max_disconnected = isinstance(g_max.type, DisconnectedType)
-        g_max_idx_disconnected = isinstance(g_max_idx.type, DisconnectedType)
-
-        # if the op is totally disconnected, so are its inputs
-        if g_max_disconnected and g_max_idx_disconnected:
-            return [DisconnectedType()(), DisconnectedType()()]
-
-        # if the max is disconnected but the argmax is not,
-        # the gradient on its inputs is zero
-        if g_max_disconnected:
-            return [x.zeros_like()]
-        if NoneConst.equals(axis):
-            axis_ = list(range(x.ndim))
-        else:
-            axis_ = axis
-        xmax = max(x, axis_)
-
-        # Raise the g_max and xmax to the same number of dim as the input.
-        pattern = []
-        out_dim = 0
-        if NoneConst.equals(axis):
-            # We are taking the max/argmax over all dimensions.
-            axis = None
-        for i in range(x.ndim):
-            if axis is None or i in axis.data:
-                pattern.append("x")
-            else:
-                pattern.append(out_dim)
-                out_dim += 1
-        g_max_pad = DimShuffle(g_max.broadcastable, pattern)(g_max)
-        xmax_pad = DimShuffle(xmax.broadcastable, pattern)(xmax)
-
-        # Set the grad to the correct position.
-        g_x = eq(xmax_pad, x) * g_max_pad
-        return (g_x,)
-
-
 class Argmax(COp):
     """
     Calculate the argmax over a given axis or over all axes.
@@ -344,8 +152,8 @@ class Argmax(COp):
 
     def __init__(self, axis):
         if axis is not None:
-            axis = tuple(axis)
-        self.axis = tuple(axis)
+            axis = tuple(sorted(axis))
+        self.axis = axis
 
     def get_params(self, node):
         if self.axis is not None and len(self.axis) == 1:
@@ -355,7 +163,7 @@ class Argmax(COp):
             c_axis = np.int64(-1)
         return self.params_type.get_params(c_axis=c_axis)
 
-    def make_node(self, x, axis=None):
+    def make_node(self, x):
         x = as_tensor_variable(x)
         if self.axis is None:
             all_axes = list(range(x.ndim))
@@ -381,18 +189,19 @@ class Argmax(COp):
         (max_idx,) = outs
         if axes is None:
             axes = tuple(range(x.ndim))
-
         # Numpy does not support multiple axes for argmax
         # Work around
         keep_axes = np.array([i for i in range(x.ndim) if i not in axes], dtype="int64")
         # Not-reduced axes in front
-        transposed_x = np.transpose(x, np.concatenate((keep_axes, axes)))
+        transposed_x = np.transpose(
+            x, np.concatenate((keep_axes, np.asarray(axes, dtype="int64")))
+        )
         kept_shape = transposed_x.shape[: len(keep_axes)]
         reduced_shape = transposed_x.shape[len(keep_axes) :]
-        new_shape = kept_shape + (np.prod(reduced_shape),)
+        new_shape = (*kept_shape, np.prod(reduced_shape, dtype="int64"))
         reshaped_x = transposed_x.reshape(new_shape)
 
-        max_idx[0] = _asarray(np.argmax(reshaped_x, axis=-1), dtype="int64")
+        max_idx[0] = np.asarray(np.argmax(reshaped_x, axis=-1), dtype="int64")
 
     def c_code(self, node, name, inp, out, sub):
         (x,) = inp
@@ -402,67 +211,110 @@ class Argmax(COp):
         if self.axis is None:
             axis_code = "axis = NPY_MAXDIMS;"
         else:
-            if len(self.axis) > 1:
+            if len(self.axis) != 1:
                 raise NotImplementedError()
             # params is only used here for now
-            axis_code = (
-                """
-            axis = %(params)s->c_axis;
-            if(axis > PyArray_NDIM(%(x)s)-1 || axis < -PyArray_NDIM(%(x)s)){
+            axis_code = f"""
+            axis = {params}->c_axis;
+            if(axis > PyArray_NDIM({x})-1 || axis < -PyArray_NDIM({x})){{
                 PyErr_SetString(PyExc_ValueError,
                 "Argmax, bad axis argument");
-                %(fail)s
-            }
+                {fail}
+            }}
             """
-                % locals()
-            )
-        ret = """
+        return f"""
         int axis;
 
-        Py_CLEAR(%(argmax)s);//todo pass them as out parameter.
-        %(axis_code)s
+        Py_CLEAR({argmax});//todo pass them as out parameter.
+        {axis_code}
 
-        %(argmax)s = (PyArrayObject*)PyArray_ArgMax(%(x)s, axis, NULL);
-        if(%(argmax)s == NULL){
-            %(fail)s;
-        }
-        if(!PyArray_CheckExact(%(argmax)s)){
-            %(argmax)s = (PyArrayObject*)PyArray_FromAny((PyObject*)%(argmax)s, NULL, 0, 0, NPY_ARRAY_ENSUREARRAY, NULL);
-            if(%(argmax)s == NULL){
-                %(fail)s;
-            }
-        }
-        if(PyArray_TYPE(%(argmax)s) != NPY_INT64){
-            PyObject * tmp = PyArray_Cast(%(argmax)s, NPY_INT64);
-            if (NULL == tmp){
-                %(fail)s;
-            }
-            Py_DECREF(%(argmax)s);
-            %(argmax)s = (PyArrayObject*)tmp;
-        }
+        {argmax} = (PyArrayObject*)PyArray_ArgMax({x}, axis, NULL);
+        if({argmax} == NULL){{
+            {fail};
+        }}
+        if(!PyArray_CheckExact({argmax})){{
+            {argmax} = (PyArrayObject*)PyArray_FromAny((PyObject*){argmax}, NULL, 0, 0, NPY_ARRAY_ENSUREARRAY, NULL);
+            if({argmax} == NULL){{
+                {fail};
+            }}
+        }}
+        if(PyArray_TYPE({argmax}) != NPY_INT64){{
+            PyObject * tmp = PyArray_Cast({argmax}, NPY_INT64);
+            if (NULL == tmp){{
+                {fail};
+            }}
+            Py_DECREF({argmax});
+            {argmax} = (PyArrayObject*)tmp;
+        }}
         """
-        return ret % locals()
 
     def c_code_cache_version(self):
-        return (1,)
+        return (2,)
 
     def infer_shape(self, fgraph, node, shapes):
         (ishape,) = shapes
         if self.axis is None:
             return [()]
         rval = tuple(
-            [
-                ishape[i]
-                for (i, b) in enumerate(node.inputs[0].type.broadcastable)
-                if i not in self.axis
-            ]
+            ishape[i]
+            for (i, b) in enumerate(node.inputs[0].type.broadcastable)
+            if i not in self.axis
         )
         return [rval]
+
+    def R_op(self, inputs, eval_points):
+        raise ValueError("Argmax is non-diifferentiable")
 
     def grad(self, inp, grads):
         (x,) = inp
 
         return [x.zeros_like()]
+
+
+def argmax(x: TensorLike, axis=None, keepdims: bool = False):
+    """
+    Returns indices of maximum elements obtained by iterating over given axis.
+
+    When axis is None (the default value), the argmax is performed
+    over the flattened tensor.
+
+    Parameters
+    ----------
+    x: TensorLike
+        Array on which to compute argmax
+    axis:
+        Axis along which to compute argmax. Unlike numpy multiple partial axis are supported.
+    keepdims : bool
+        If this is set to True, the axes which are reduced are left in
+        the result as dimensions with size one. With this option, the result
+        will broadcast correctly against the original tensor.
+
+    Returns
+    -------
+    TensorVariable
+        TensorVariable representing the argmax operation
+
+    """
+    x = as_tensor_variable(x)
+    axis = normalize_reduce_axis(axis, ndim=x.type.ndim)
+    out = Argmax(axis)(x)
+
+    if keepdims:
+        out = makeKeepDims(x, out, axis)
+
+    return out
+
+
+@_vectorize_node.register(Argmax)
+def vectorize_argmax_node(op, node, batch_x):
+    core_ndim = node.inputs[0].type.ndim
+    batch_ndim = batch_x.type.ndim - core_ndim
+
+    if not batch_ndim:
+        return node.op.make_node(batch_x)
+
+    batch_axes = get_normalized_batch_axes(op.axis, core_ndim, batch_ndim)
+    return type(op)(axis=batch_axes).make_node(batch_x)
 
 
 def makeKeepDims(x, y, axis):
@@ -473,85 +325,9 @@ def makeKeepDims(x, y, axis):
 
     """
     x = as_tensor_variable(x)
-    y = as_tensor_variable(y)
-
     if axis is None:
         axis = list(range(x.type.ndim))
-    elif isinstance(axis, (int, np.integer)):
-        axis = [axis]
-    elif isinstance(axis, np.ndarray) and axis.ndim == 0:
-        axis = [int(axis)]
-    else:
-        axis = [int(a) for a in axis]
-    newaxis = []
-    for a in axis:
-        if not isinstance(a, int):
-            raise ValueError("keepdims option can be used only with constant axis")
-        if a < 0:
-            a += x.type.ndim
-        newaxis.append(a)
-    i = 0
-    new_dims = []
-    for j, _ in enumerate(x.type.broadcastable):
-        if j in newaxis:
-            new_dims.append("x")
-        else:
-            new_dims.append(i)
-            i += 1
-    return DimShuffle(y.type.broadcastable, new_dims)(y)
-
-
-def check_and_normalize_axes(x, axis):
-    """Check axes, normalize and convert them to a Python list of integers.
-
-    Parameters
-    ----------
-    x: TensorVariable
-    axis: int, tuple or list of integers
-
-    Returns
-    -------
-    axis: list of integers
-        Return an empty list if argument is None.
-
-    """
-    x = as_tensor_variable(x)
-    if axis is None:
-        axis = []
-    elif isinstance(axis, (int, np.integer)) or (
-        isinstance(axis, np.ndarray) and axis.ndim == 0
-    ):
-        axis = [int(axis)]
-    elif isinstance(axis, (tuple, list, np.ndarray)):
-        axis = [int(i) for i in axis]
-    elif isinstance(axis, Variable):
-        if NoneConst.equals(axis):
-            axis = []
-        elif not isinstance(axis, TensorConstant):
-            raise TypeError(f"Computation needs a constant axis. Got {axis}")
-        else:
-            assert axis.dtype in integer_dtypes
-            if isinstance(axis.data, (int, np.integer)) or (
-                isinstance(axis.data, np.ndarray) and axis.data.ndim == 0
-            ):
-                axis = [int(axis.data)]
-            elif isinstance(axis.data, (list, np.ndarray)):
-                axis = [int(i) for i in axis.data]
-    else:
-        raise TypeError(
-            f"Axis must be an integer, tuple, list of integers or a TensorVariable. Got {axis}"
-        )
-    if len(axis) > 0:
-        for i in range(len(axis)):
-            if axis[i] < 0:
-                axis[i] += x.type.ndim
-            if axis[i] < 0 or axis[i] >= x.type.ndim:
-                raise ValueError(
-                    f"Computation needs a valid axis number for {int(x.type.ndim)}-D tensor. Got {int(axis[i])}"
-                )
-        axis = list(set(axis))
-        axis.sort()
-    return axis
+    return expand_dims(y, axis)
 
 
 def max_and_argmax(a, axis=None, keepdims=False):
@@ -571,17 +347,11 @@ def max_and_argmax(a, axis=None, keepdims=False):
 
     """
     # Check axis and convert it to a Python list of integers.
-    # Axis will be used as an op param of MaxAndArgmax.
-    a = as_tensor_variable(a)
-    axis = check_and_normalize_axes(a, axis)
-    if len(axis) == 0:
-        axis = list(range(a.type.ndim))
-    out, argout = MaxAndArgmax(axis)(a)
-
-    if keepdims:
-        out = makeKeepDims(a, out, axis)
-        argout = makeKeepDims(a, argout, axis)
-    return [out, argout]
+    # Axis will be used as an op param of Max and Argmax.
+    return [
+        max(a, axis=axis, keepdims=keepdims),
+        argmax(a, axis=axis, keepdims=keepdims),
+    ]
 
 
 class FixedOpCAReduce(CAReduce):
@@ -590,12 +360,14 @@ class FixedOpCAReduce(CAReduce):
 
 
 class NonZeroDimsCAReduce(FixedOpCAReduce):
-    def _c_all(self, node, name, inames, onames, sub):
-        decl, checks, alloc, loop, end = super()._c_all(node, name, inames, onames, sub)
+    def _c_all(self, node, name, input_names, output_names, sub):
+        setup, alloc, loop, cast = super()._c_all(
+            node, name, input_names, output_names, sub
+        )
 
         # We add an additional check for zero-sized dimensions (This seems like
         # something that could enabled in `elemwise_cgen.make_checks`.)
-        iname = inames[0]
+        [iname] = input_names
 
         axis = self.axis
         if axis is None:
@@ -607,17 +379,19 @@ class NonZeroDimsCAReduce(FixedOpCAReduce):
 
         pattern_ = str(pattern)[1:-1]
 
-        decl += f"""int tosum[]={{{pattern_}}};"""
-        alloc += f"""
-                for(int i=0;i<PyArray_NDIM({iname});i++){{
-                    if(PyArray_DIMS({iname})[i]==0 && tosum[i]){{
-                        PyErr_Format(PyExc_ValueError,
-                            "Input of CAReduce{{{node.op.scalar_op}}} has zero-size on axis %%d",i);
-                        {sub["fail"]};
-                    }}
+        setup = f"int tosum[]={{{pattern_}}};" + setup
+        alloc += dedent(
+            f"""
+            for(int i=0;i<PyArray_NDIM({iname});i++){{
+                if(PyArray_DIMS({iname})[i]==0 && tosum[i]){{
+                    PyErr_Format(PyExc_ValueError,
+                        "Input of CAReduce{{{node.op.scalar_op}}} has zero-size on axis %%d",i);
+                    {sub["fail"]};
                 }}
-                """
-        return decl, checks, alloc, loop, end
+            }}
+            """
+        )
+        return setup, alloc, loop, cast
 
 
 class Max(NonZeroDimsCAReduce):
@@ -629,6 +403,48 @@ class Max(NonZeroDimsCAReduce):
     def clone(self, **kwargs):
         axis = kwargs.get("axis", self.axis)
         return type(self)(axis=axis)
+
+    def L_op(self, inputs, outputs, grads):
+        # The strict sense mathematical gradient of the maximum function is
+        # not calculated here for it is not defined at every point where some
+        # coordinates are identical. However, since the latter set has null
+        # Lebesgue measure, the result may be interpreted as weak gradient.
+
+        # @note: This function should work correctly for L{vector}s.
+        # (x, y), (gz, gw)
+        # gz*dz/dx + gw*dw/dx, gz*dz/dy + gw*dw/dy
+        # gMax * dMax/dx + gArgMax * dArgMax/dx,
+        # gMax * dMax/daxis + gArgMax * dArgMax/daxis
+        # g_max has one less dimension than x, so you need to complete
+        # g_max to x's shape when axis=0 the broadcasting mechanism
+        # does it automatically
+        [x] = inputs
+        [out] = outputs
+        [g_out] = grads
+
+        axis = tuple(range(x.ndim)) if self.axis is None else self.axis
+        out_pad = expand_dims(out, axis)
+        g_out_pad = expand_dims(g_out, axis)
+
+        # Set the grad to the correct position.
+        g_x = eq(out_pad, x) * g_out_pad
+        return (g_x,)
+
+    def R_op(self, inputs, eval_points):
+        if eval_points[0] is None:
+            return [None, None]
+        if len(self.axis) != 1:
+            raise ValueError("R_op supported for max only for one axis!")
+        if self.axis[0] > 1:
+            raise ValueError("R_op supported for max only when axis is 0 or 1")
+        if inputs[0].ndim != 2:
+            raise ValueError("R_op supported for max only when input is a matrix")
+        max_pos = Argmax(self.axis).make_node(*inputs).outputs
+        # print(eval_points[0].eval())
+        if self.axis[0] == 0:
+            return [eval_points[0][max_pos, arange(eval_points[0].shape[1])], None]
+        else:
+            return [eval_points[0][arange(eval_points[0].shape[0]), max_pos], None]
 
 
 class Min(NonZeroDimsCAReduce):
@@ -661,49 +477,11 @@ def max(x, axis=None, keepdims=False):
     We return an error as numpy when we reduce a dim with a shape of 0.
 
     """
-
-    # We have a choice of implementing this call with the
-    # CAReduce op or the MaxAndArgmax op.
-
-    # MaxAndArgmax supports grad and Rop, so we prefer to use that.
-    # CAReduce is faster, but optimizations will replace MaxAndArgmax[0]
-    # with CAReduce at compile time, so at this stage the important
-    # thing is supporting all user interface features, not speed.
-    # Some cases can be implemented only with CAReduce.
-
-    # We thus prefer to use MaxAndArgmax, if possible. It does not
-    # support all axis arguments, so we may need to fall back to CAReduce.
-
-    try:
-        out = max_and_argmax(x, axis)[0]
-    except Exception:
-        out = Max(axis)(x)
+    out = Max(axis=axis)(x)
 
     if keepdims:
         out = makeKeepDims(x, out, axis)
     return out
-
-
-def argmax(x, axis=None, keepdims=False):
-    """
-    Returns indices of maximum elements obtained by iterating over given axis.
-
-    When axis is None (the default value), the argmax is performed
-    over the flattened tensor.
-
-    Parameters
-    ----------
-    keepdims : bool
-        If this is set to True, the axes which are reduced are left in
-        the result as dimensions with size one. With this option, the result
-        will broadcast correctly against the original tensor.
-
-    """
-    argout = max_and_argmax(x, axis)[1]
-
-    if keepdims:
-        argout = makeKeepDims(x, argout, axis)
-    return argout
 
 
 def min(x, axis=None, keepdims=False):
@@ -791,6 +569,22 @@ def largest(*args):
         return switch(a > b, a, b)
     else:
         return max(stack(args), axis=0)
+
+
+def isposinf(x):
+    """
+    Return if the input variable has positive infinity element
+
+    """
+    return eq(x, np.inf)
+
+
+def isneginf(x):
+    """
+    Return if the input variable has negative infinity element
+
+    """
+    return eq(x, -np.inf)
 
 
 @scalar_elemwise
@@ -935,34 +729,34 @@ def isclose(a, b, rtol=1.0e-5, atol=1.0e-8, equal_nan=False):
     --------
     >>> import pytensor
     >>> import numpy as np
-    >>> a = _asarray([1e10, 1e-7], dtype="float64")
-    >>> b = _asarray([1.00001e10, 1e-8], dtype="float64")
+    >>> a = np.array([1e10, 1e-7], dtype="float64")
+    >>> b = np.array([1.00001e10, 1e-8], dtype="float64")
     >>> pytensor.tensor.isclose(a, b).eval()
-    array([1, 0], dtype=int8)
-    >>> a = _asarray([1e10, 1e-8], dtype="float64")
-    >>> b = _asarray([1.00001e10, 1e-9], dtype="float64")
+    array([ True, False])
+    >>> a = np.array([1e10, 1e-8], dtype="float64")
+    >>> b = np.array([1.00001e10, 1e-9], dtype="float64")
     >>> pytensor.tensor.isclose(a, b).eval()
-    array([1, 1], dtype=int8)
-    >>> a = _asarray([1e10, 1e-8], dtype="float64")
-    >>> b = _asarray([1.0001e10, 1e-9], dtype="float64")
+    array([ True,  True])
+    >>> a = np.array([1e10, 1e-8], dtype="float64")
+    >>> b = np.array([1.0001e10, 1e-9], dtype="float64")
     >>> pytensor.tensor.isclose(a, b).eval()
-    array([0, 1], dtype=int8)
-    >>> a = _asarray([1.0, np.nan], dtype="float64")
-    >>> b = _asarray([1.0, np.nan], dtype="float64")
+    array([False,  True])
+    >>> a = np.array([1.0, np.nan], dtype="float64")
+    >>> b = np.array([1.0, np.nan], dtype="float64")
     >>> pytensor.tensor.isclose(a, b).eval()
-    array([1, 0], dtype==int8)
-    >>> a = _asarray([1.0, np.nan], dtype="float64")
-    >>> b = _asarray([1.0, np.nan], dtype="float64")
+    array([ True, False])
+    >>> a = np.array([1.0, np.nan], dtype="float64")
+    >>> b = np.array([1.0, np.nan], dtype="float64")
     >>> pytensor.tensor.isclose(a, b, equal_nan=True).eval()
-    array([1, 1], dtype==int8)
-    >>> a = _asarray([1.0, np.inf], dtype="float64")
-    >>> b = _asarray([1.0, -np.inf], dtype="float64")
+    array([ True,  True])
+    >>> a = np.array([1.0, np.inf], dtype="float64")
+    >>> b = np.array([1.0, -np.inf], dtype="float64")
     >>> pytensor.tensor.isclose(a, b).eval()
-    array([1, 0], dtype==int8)
-    >>> a = _asarray([1.0, np.inf], dtype="float64")
-    >>> b = _asarray([1.0, np.inf], dtype="float64")
+    array([ True, False])
+    >>> a = np.array([1.0, np.inf], dtype="float64")
+    >>> b = np.array([1.0, np.inf], dtype="float64")
     >>> pytensor.tensor.isclose(a, b).eval()
-    array([1, 1], dtype==int8)
+    array([ True,  True])
 
     """
     # close will be an int8 array of 1 where within tolerance
@@ -1386,6 +1180,16 @@ def gammal(k, x):
 
 
 @scalar_elemwise
+def gammaincinv(k, x):
+    """Inverse to the regularized lower incomplete gamma function"""
+
+
+@scalar_elemwise
+def gammainccinv(k, x):
+    """Inverse of the regularized upper incomplete gamma function"""
+
+
+@scalar_elemwise
 def hyp2f1(a, b, c, z):
     """Gaussian hypergeometric function."""
 
@@ -1426,6 +1230,16 @@ def ive(v, x):
 
 
 @scalar_elemwise
+def kve(v, x):
+    """Exponentially scaled modified Bessel function of the second kind of real order v."""
+
+
+def kv(v, x):
+    """Modified Bessel function of the second kind of real order v."""
+    return kve(v, x) * exp(-x)
+
+
+@scalar_elemwise
 def sigmoid(x):
     """Logistic sigmoid function (1 / (1 + exp(-x)), also known as expit or inverse logit"""
 
@@ -1449,6 +1263,11 @@ def log1mexp(x):
 @scalar_elemwise
 def betainc(a, b, x):
     """Regularized incomplete beta function"""
+
+
+@scalar_elemwise
+def betaincinv(a, b, x):
+    """Inverse of the regularized incomplete beta function"""
 
 
 @scalar_elemwise
@@ -1497,62 +1316,7 @@ def complex_from_polar(abs, angle):
     """Return complex-valued tensor from polar coordinate specification."""
 
 
-class Mean(FixedOpCAReduce):
-    __props__ = ("axis",)
-    nfunc_spec = ("mean", 1, 1)
-
-    def __init__(self, axis=None):
-        super().__init__(ps.mean, axis)
-        assert self.axis is None or len(self.axis) == 1
-
-    def __str__(self):
-        if self.axis is not None:
-            return "Mean{%s}" % (", ".join(str(x) for x in self.axis))
-        else:
-            return "Mean"
-
-    def _output_dtype(self, idtype):
-        # we want to protect against overflow
-        return "float64"
-
-    def perform(self, node, inp, out):
-        (input,) = inp
-        (output,) = out
-        if self.axis is None:
-            axis = None
-        else:
-            axis = self.axis[0]
-        # numpy.asarray is needed as otherwise we can end up with a
-        # numpy scalar.
-        output[0] = np.asarray(np.mean(input, dtype="float64", axis=axis))
-
-    def c_code(self, node, name, inames, onames, sub):
-        ret = super().c_code(node, name, inames, onames, sub)
-
-        if self.axis is not None:
-            return ret
-
-        # TODO: c_code perform support only axis is None
-        return (
-            ret
-            + f"""
-  *((double *)PyArray_DATA({onames[0]})) /= PyArray_SIZE({inames[0]});
-  """
-        )
-
-    def clone(self, **kwargs):
-        axis = kwargs.get("axis", self.axis)
-        return type(self)(axis=axis)
-
-
-# TODO: implement the grad. When done and tested, you can make this the default
-# version.
-#    def grad(self, (x,), (gout,)):
-#      import pdb;pdb.set_trace()
-#      return grad(mean(x, self.axis, op=False),[x])
-
-
-def mean(input, axis=None, dtype=None, op=False, keepdims=False, acc_dtype=None):
+def mean(input, axis=None, dtype=None, keepdims=False, acc_dtype=None):
     """
     Computes the mean value along the given axis(es) of a tensor `input`.
 
@@ -1577,25 +1341,6 @@ def mean(input, axis=None, dtype=None, op=False, keepdims=False, acc_dtype=None)
         be in a float type). If None, then we use the same rules as `sum()`.
     """
     input = as_tensor_variable(input)
-    if op:
-        if dtype not in (None, "float64"):
-            raise NotImplementedError(
-                "The Mean op does not support the dtype argument, "
-                "and will always use float64. If you want to specify "
-                "the dtype, call tensor.mean(..., op=False).",
-                dtype,
-            )
-        if acc_dtype not in (None, "float64"):
-            raise NotImplementedError(
-                "The Mean op does not support the acc_dtype argument, "
-                "and will always use float64. If you want to specify "
-                "acc_dtype, call tensor.mean(..., op=False).",
-                dtype,
-            )
-        out = Mean(axis)(input)
-        if keepdims:
-            out = makeKeepDims(input, out, axis)
-        return out
 
     if dtype is not None:
         # The summation will be done with the specified dtype.
@@ -1618,18 +1363,12 @@ def mean(input, axis=None, dtype=None, op=False, keepdims=False, acc_dtype=None)
     else:
         shp = cast(shp, "float64")
 
-    if axis is None:
-        axis = list(range(input.ndim))
-    elif isinstance(axis, (int, np.integer)):
-        axis = [axis]
-    elif isinstance(axis, np.ndarray) and axis.ndim == 0:
-        axis = [int(axis)]
-    else:
-        axis = [int(a) for a in axis]
-
-    # This sequential division will possibly be optimized by PyTensor:
-    for i in axis:
-        s = true_div(s, shp[i])
+    reduced_dims = (
+        shp
+        if axis is None
+        else [shp[i] for i in normalize_axis_tuple(axis, input.type.ndim)]
+    )
+    s /= variadic_mul(*reduced_dims).astype(shp.dtype)
 
     # This can happen when axis is an empty list/tuple
     if s.dtype != shp.dtype and s.dtype in discrete_dtypes:
@@ -1680,7 +1419,7 @@ def var(input, axis=None, ddof=0, keepdims=False, corrected=False):
     input_ndim = input.type.ndim
     if axis is None:
         axis = list(range(input_ndim))
-    elif isinstance(axis, (int, np.integer)):
+    elif isinstance(axis, int | np.integer):
         axis = [axis]
     elif isinstance(axis, np.ndarray) and axis.ndim == 0:
         axis = [int(axis)]
@@ -1762,6 +1501,48 @@ def std(input, axis=None, ddof=0, keepdims=False, corrected=False):
     return ret
 
 
+def median(x: TensorLike, axis=None) -> TensorVariable:
+    """
+    Computes the median along the given axis(es) of a tensor `input`.
+
+    Parameters
+    ----------
+    x: TensorVariable
+        The input tensor.
+    axis: None or int or (list of int) (see `Sum`)
+        Compute the median along this axis of the tensor.
+        None means all axes (like numpy).
+    """
+    from pytensor.ifelse import ifelse
+
+    x = as_tensor_variable(x)
+    x_ndim = x.type.ndim
+    if axis is None:
+        axis = list(range(x_ndim))
+    else:
+        axis = list(normalize_axis_tuple(axis, x_ndim))
+
+    non_axis = [i for i in range(x_ndim) if i not in axis]
+    non_axis_shape = [x.shape[i] for i in non_axis]
+
+    # Put axis at the end and unravel them
+    x_raveled = x.transpose(*non_axis, *axis)
+    if len(axis) > 1:
+        x_raveled = x_raveled.reshape((*non_axis_shape, -1))
+    raveled_size = x_raveled.shape[-1]
+    k = raveled_size // 2
+
+    # Sort the input tensor along the specified axis and pick median value
+    x_sorted = x_raveled.sort(axis=-1)
+    k_values = x_sorted[..., k]
+    km1_values = x_sorted[..., k - 1]
+
+    even_median = (k_values + km1_values) / 2.0
+    odd_median = k_values.astype(even_median.type.dtype)
+    even_k = eq(mod(raveled_size, 2), 0)
+    return ifelse(even_k, even_median, odd_median, name="median")
+
+
 @scalar_elemwise(symbolname="scalar_maximum")
 def maximum(x, y):
     """elemwise maximum. See max for the maximum in one tensor"""
@@ -1785,6 +1566,15 @@ def add(a, *other_terms):
     # see decorator for function body
 
 
+def variadic_add(*args):
+    """Add that accepts arbitrary number of inputs, including zero or one."""
+    if not args:
+        return constant(0)
+    if len(args) == 1:
+        return args[0]
+    return add(*args)
+
+
 @scalar_elemwise
 def sub(a, b):
     """elementwise subtraction"""
@@ -1795,6 +1585,15 @@ def sub(a, b):
 def mul(a, *other_terms):
     """elementwise multiplication"""
     # see decorator for function body
+
+
+def variadic_mul(*args):
+    """Mul that accepts arbitrary number of inputs, including zero or one."""
+    if not args:
+        return constant(1)
+    if len(args) == 1:
+        return args[0]
+    return mul(*args)
 
 
 @scalar_elemwise
@@ -2101,8 +1900,8 @@ def dense_dot(a, b):
     """
     a, b = as_tensor_variable(a), as_tensor_variable(b)
 
-    if not isinstance(a.type, DenseTensorType) or not isinstance(
-        b.type, DenseTensorType
+    if not (
+        isinstance(a.type, DenseTensorType) and isinstance(b.type, DenseTensorType)
     ):
         raise TypeError("The dense dot product is only supported for dense types")
 
@@ -2144,7 +1943,7 @@ def _tensordot_as_dot(a, b, axes, dot, batched):
     if not np.isscalar(axes) and len(axes) != 2:
         raise ValueError(
             "Axes should be an integer or a "
-            "list/tuple of len 2 ({axes} was provided)"
+            f"list/tuple of len 2 ({axes} was provided)"
         )
 
     # if 'axes' is a number of axes to multiply and sum over (trailing axes
@@ -2241,107 +2040,174 @@ def _tensordot_as_dot(a, b, axes, dot, batched):
         )
 
 
-def tensordot(a, b, axes=2):
+def tensordot(
+    a: TensorLike, b: TensorLike, axes: int | Sequence[Sequence[int]] = 2
+) -> TensorVariable:
     """
-    Compute a generalized dot product over provided axes.
+    Compute tensor dot product along specified axes.
 
-    Given two tensors a and b, tensordot computes a generalized dot product over
-    the provided axes. PyTensor's implementation reduces all expressions to
-    matrix or vector dot products and is based on code from Tijmen Tieleman's
-    gnumpy (http://www.cs.toronto.edu/~tijmen/gnumpy.html).
+    Implementation is mostly taken from numpy version 1.26.0
+
+    Given two tensors, `a` and `b`, and a sequence object containing
+    two sequence objects, ``(a_axes, b_axes)``, sum the products of
+    `a`'s and `b`'s elements (components) over the axes specified by
+    ``a_axes`` and ``b_axes``. The third argument can be a single non-negative
+    integer_like scalar, ``N``; if it is such, then the last ``N`` dimensions
+    of `a` and the first ``N`` dimensions of `b` are summed over.
 
     Parameters
     ----------
-    a: symbolic tensor
-        The first tensor variable.
-    b: symbolic tensor
-        The second tensor variable
-    axes: int or array-like of length 2
-        If an integer, the number of axes to sum over.
-        If an array, it must have two array elements containing the axes
-        to sum over in each tensor.
+    a, b : tensor_like
+        Tensors to "dot".
 
-        Note that the default value of 2 is not guaranteed to work
-        for all values of a and b, and an error will be raised if
-        that is the case. The reason for keeping the default is to
-        maintain the same signature as numpy's tensordot function
-        (and np.tensordot raises analogous errors for non-compatible
-        inputs).
-
-        If an integer i, it is converted to an array containing
-        the last i dimensions of the first tensor and the first
-        i dimensions of the second tensor:
-            axes = [list(range(a.ndim - i, b.ndim)), list(range(i))]
-
-        If an array, its two elements must contain compatible axes
-        of the two tensors. For example, [[1, 2], [2, 0]] means sum
-        over the 2nd and 3rd axes of a and the 3rd and 1st axes of b.
-        (Remember axes are zero-indexed!) The 2nd axis of a and the
-        3rd axis of b must have the same shape; the same is true for
-        the 3rd axis of a and the 1st axis of b.
+    axes : int or (2,) array_like
+        * integer_like
+          If an int N, sum over the last N axes of `a` and the first N axes
+          of `b` in order. The sizes of the corresponding axes must match.
+        * (2,) array_like
+          Or, a list of axes to be summed over, first sequence applying to `a`,
+          second to `b`. Both elements array_like must be of the same length.
 
     Returns
     -------
-    symbolic tensor
-        A tensor with shape equal to the concatenation of a's shape
-        (less any dimensions that were summed over) and b's shape
-        (less any dimensions that were summed over).
+    output : TensorVariable
+        The tensor dot product of the input.
+        Its shape will be equal to the concatenation of `a` and `b` shapes
+        (ignoring the dimensions that were summed over given in ``a_axes``
+        and ``b_axes``)
 
     Examples
     --------
     It may be helpful to consider an example to see what tensordot does.
-    PyTensor's implementation is identical to NumPy's. Here a has shape (2, 3, 4)
-    and b has shape (5, 6, 4, 3). The axes to sum over are [[1, 2], [3, 2]] --
+    PyTensor's implementation is identical to NumPy's. Here ``a`` has shape (2, 3, 4)
+    and ``b`` has shape (5, 6, 4, 3). The axes to sum over are [[1, 2], [3, 2]] --
     note that a.shape[1] == b.shape[3] and a.shape[2] == b.shape[2]; these axes
     are compatible. The resulting tensor will have shape (2, 5, 6) -- the
     dimensions that are not being summed:
 
-    >>> a = np.random.random((2,3,4))
-    >>> b = np.random.random((5,6,4,3))
+    >>> a = np.random.random((2, 3, 4))
+    >>> b = np.random.random((5, 6, 4, 3))
 
     #tensordot
-    >>> c = np.tensordot(a, b, [[1,2],[3,2]])
+    >>> c = np.tensordot(a, b, [[1, 2], [3, 2]])
 
     #loop replicating tensordot
     >>> a0, a1, a2 = a.shape
     >>> b0, b1, _, _ = b.shape
-    >>> cloop = np.zeros((a0,b0,b1))
+    >>> cloop = np.zeros((a0, b0, b1))
 
     #loop over non-summed indices -- these exist
     #in the tensor product.
     >>> for i in range(a0):
     ...     for j in range(b0):
     ...         for k in range(b1):
-    ...             #loop over summed indices -- these don't exist
-    ...             #in the tensor product.
+    ...             # loop over summed indices -- these don't exist
+    ...             # in the tensor product.
     ...             for l in range(a1):
     ...                 for m in range(a2):
-    ...                     cloop[i,j,k] += a[i,l,m] * b[j,k,m,l]
+    ...                     cloop[i, j, k] += a[i, l, m] * b[j, k, m, l]
 
     >>> np.allclose(c, cloop)
-    true
+    True
 
     This specific implementation avoids a loop by transposing a and b such that
-    the summed axes of a are last and the summed axes of b are first. The
-    resulting arrays are reshaped to 2 dimensions (or left as vectors, if
-    appropriate) and a matrix or vector dot product is taken. The result is
-    reshaped back to the required output dimensions.
+    the summed axes of ``a`` are last and the summed axes of ``b`` are first. The
+    resulting arrays are reshaped to 2 dimensions and a matrix dot product is taken.
+    The result is reshaped back to the required output dimensions.
 
     In an extreme case, no axes may be specified. The resulting tensor
     will have shape equal to the concatenation of the shapes of a and b:
 
     >>> c = np.tensordot(a, b, 0)
     >>> print(a.shape)
-    (2,3,4)
+    (2, 3, 4)
     >>> print(b.shape)
-    (5,6,4,3)
+    (5, 6, 4, 3)
     >>> print(c.shape)
-    (2,3,4,5,6,4,3)
+    (2, 3, 4, 5, 6, 4, 3)
 
     See the documentation of numpy.tensordot for more examples.
 
     """
-    return _tensordot_as_dot(a, b, axes, dot=dot, batched=False)
+    try:
+        iter(axes)
+    except Exception:
+        axes_a = list(range(-axes, 0))
+        axes_b = list(range(0, axes))
+    else:
+        axes_a, axes_b = axes
+    try:
+        na = len(axes_a)
+        axes_a = list(axes_a)
+    except TypeError:
+        axes_a = [axes_a]
+        na = 1
+    try:
+        nb = len(axes_b)
+        axes_b = list(axes_b)
+    except TypeError:
+        axes_b = [axes_b]
+        nb = 1
+
+    a = as_tensor_variable(a)
+    b = as_tensor_variable(b)
+    runtime_shape_a = a.shape
+    bcast_a = a.broadcastable
+    static_shape_a = a.type.shape
+    ndim_a = a.ndim
+    runtime_shape_b = b.shape
+    bcast_b = b.broadcastable
+    static_shape_b = b.type.shape
+    ndim_b = b.ndim
+    if na != nb:
+        raise ValueError(
+            "The number of axes supplied for tensordot must be equal for each tensor. "
+            f"Got {na} and {nb} respectively."
+        )
+    axes_a = list(normalize_axis_tuple(axes_a, ndim_a))
+    axes_b = list(normalize_axis_tuple(axes_b, ndim_b))
+    must_assert_runtime = False
+    for k in range(na):
+        ax_a = axes_a[k]
+        ax_b = axes_b[k]
+        if (bcast_a[ax_a] != bcast_b[ax_b]) or (
+            static_shape_a[ax_a] is not None
+            and static_shape_b[ax_b] is not None
+            and static_shape_a[ax_a] != static_shape_b[ax_b]
+        ):
+            raise ValueError(
+                "Input arrays have inconsistent broadcastable pattern or type shape along the axes "
+                "that are to be reduced with tensordot."
+            )
+        elif static_shape_a[ax_a] is None or static_shape_b[ax_b] is None:
+            if must_assert_runtime:
+                a = Assert(
+                    "Input array shape along reduced axes of tensordot are not equal"
+                )(a, eq(a.shape[ax_a], b.shape[ax_b]))
+            must_assert_runtime = True
+
+    # Move the axes to sum over to the end of "a"
+    # and to the front of "b"
+    notin = [k for k in range(ndim_a) if k not in axes_a]
+    newaxes_a = notin + axes_a
+    N2 = 1
+    for axis in axes_a:
+        N2 *= runtime_shape_a[axis]
+    newshape_a = (-1, N2)
+    olda = [runtime_shape_a[axis] for axis in notin]
+
+    notin = [k for k in range(ndim_b) if k not in axes_b]
+    newaxes_b = axes_b + notin
+    N2 = 1
+    for axis in axes_b:
+        N2 *= runtime_shape_b[axis]
+    newshape_b = (N2, -1)
+    oldb = [runtime_shape_b[axis] for axis in notin]
+
+    at = a.transpose(newaxes_a).reshape(newshape_a)
+    bt = b.transpose(newaxes_b).reshape(newshape_b)
+    res = _dot(at, bt)
+    return res.reshape(olda + oldb)
 
 
 def outer(x, y):
@@ -2459,8 +2325,7 @@ class Sum(FixedOpCAReduce):
             else:
                 new_dims.append(i)
                 i += 1
-        ds_op = DimShuffle(gz.type.broadcastable, new_dims)
-        gx = Elemwise(ps.second)(x, ds_op(gz))
+        gx = Elemwise(ps.second)(x, gz.dimshuffle(new_dims))
         return [gx]
 
     def R_op(self, inputs, eval_points):
@@ -2727,10 +2592,7 @@ class MulWithoutZeros(BinaryScalarOp):
     def c_code(self, node, name, inp, out, sub):
         x, y = inp
         (z,) = out
-        return (
-            "%(z)s = ((%(x)s == 0) ? (%(y)s) : "
-            + "((%(y)s == 0) ? (%(x)s) : ((%(y)s)*(%(x)s))) );"
-        ) % locals()
+        return f"{z} = (({x} == 0) ? ({y}) : (({y} == 0) ? ({x}) : (({y})*({x}))) );"
 
     def c_code_cache_version(self):
         return (1,)
@@ -2933,12 +2795,70 @@ def matmul(x1: "ArrayLike", x2: "ArrayLike", dtype: Optional["DTypeLike"] = None
 
 
 @_vectorize_node.register(Dot)
-def vectorize_node_to_matmul(op, node, batched_x, batched_y):
+def vectorize_node_dot_to_matmul(op, node, batched_x, batched_y):
     old_x, old_y = node.inputs
     if old_x.type.ndim == 2 and old_y.type.ndim == 2:
+        # If original input is equivalent to a matrix-matrix product,
+        # return specialized Matmul Op to avoid unnecessary new Ops.
         return matmul(batched_x, batched_y).owner
     else:
         return vectorize_node_fallback(op, node, batched_x, batched_y)
+
+
+def nan_to_num(x, nan=0.0, posinf=None, neginf=None):
+    """
+    Replace NaN with zero and infinity with large finite numbers (default
+    behaviour) or with the numbers defined by the user using the `nan`,
+    `posinf` and/or `neginf` keywords.
+
+    NaN is replaced by zero or by the user defined value in
+    `nan` keyword, infinity is replaced by the largest finite floating point
+    values representable by ``x.dtype`` or by the user defined value in
+    `posinf` keyword and -infinity is replaced by the most negative finite
+    floating point values representable by ``x.dtype`` or by the user defined
+    value in `neginf` keyword.
+
+    Parameters
+    ----------
+    x : symbolic tensor
+        Input array.
+    nan
+        The value to replace NaN's with in the tensor (default = 0).
+    posinf
+        The value to replace +INF with in the tensor (default max
+        in range representable by ``x.dtype``).
+    neginf
+        The value to replace -INF with in the tensor (default min
+        in range representable by ``x.dtype``).
+
+    Returns
+    -------
+    out
+        The tensor with NaN's, +INF, and -INF replaced with the
+        specified and/or default substitutions.
+    """
+    # Replace NaN's with nan keyword
+    is_nan = isnan(x)
+    is_pos_inf = isposinf(x)
+    is_neg_inf = isneginf(x)
+
+    x = switch(is_nan, nan, x)
+
+    # Get max and min values representable by x.dtype
+    maxf = posinf
+    minf = neginf
+
+    # Specify the value to replace +INF and -INF with
+    if maxf is None:
+        maxf = np.finfo(x.real.dtype).max
+    if minf is None:
+        minf = np.finfo(x.real.dtype).min
+
+    # Replace +INF and -INF values
+    x = switch(is_pos_inf, maxf, x)
+    x = switch(is_neg_inf, minf, x)
+
+    return x
 
 
 # NumPy logical aliases
@@ -2979,6 +2899,8 @@ __all__ = [
     "not_equal",
     "isnan",
     "isinf",
+    "isposinf",
+    "isneginf",
     "allclose",
     "isclose",
     "and_",
@@ -3044,6 +2966,8 @@ __all__ = [
     "gammaincc",
     "gammau",
     "gammal",
+    "gammaincinv",
+    "gammainccinv",
     "j0",
     "j1",
     "jv",
@@ -3051,12 +2975,15 @@ __all__ = [
     "i1",
     "iv",
     "ive",
+    "kv",
+    "kve",
     "sigmoid",
     "expit",
     "softplus",
     "log1pexp",
     "log1mexp",
     "betainc",
+    "betaincinv",
     "real",
     "imag",
     "angle",
@@ -3067,6 +2994,7 @@ __all__ = [
     "sum",
     "prod",
     "mean",
+    "median",
     "var",
     "std",
     "std",
@@ -3094,4 +3022,5 @@ __all__ = [
     "logaddexp",
     "logsumexp",
     "hyp2f1",
+    "nan_to_num",
 ]

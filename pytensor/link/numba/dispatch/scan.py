@@ -1,5 +1,4 @@
 from textwrap import dedent, indent
-from typing import Optional
 
 import numpy as np
 from numba import types
@@ -20,7 +19,7 @@ from pytensor.tensor.type import TensorType
 def idx_to_str(
     array_name: str,
     offset: int,
-    size: Optional[str] = None,
+    size: str | None = None,
     idx_symbol: str = "i",
     allow_scalar=False,
 ) -> str:
@@ -59,7 +58,11 @@ def numba_funcify_Scan(op, node, **kwargs):
     # TODO: Not sure this is the right place to do this, should we have a rewrite that
     #  explicitly triggers the optimization of the inner graphs of Scan?
     #  The C-code defers it to the make_thunk phase
-    rewriter = op.mode_instance.excluding(*NUMBA._optimizer.exclude).optimizer
+    rewriter = (
+        op.mode_instance.including("numba")
+        .excluding(*NUMBA._optimizer.exclude)
+        .optimizer
+    )
     rewriter(op.fgraph)
 
     scan_inner_func = numba_basic.numba_njit(numba_funcify(op.fgraph))
@@ -67,7 +70,7 @@ def numba_funcify_Scan(op, node, **kwargs):
     outer_in_names_to_vars = {
         (f"outer_in_{i}" if i > 0 else "n_steps"): v for i, v in enumerate(node.inputs)
     }
-    outer_in_names = list(outer_in_names_to_vars.keys())
+    outer_in_names = list(outer_in_names_to_vars)
     outer_in_seqs_names = op.outer_seqs(outer_in_names)
     outer_in_mit_mot_names = op.outer_mitmot(outer_in_names)
     outer_in_mit_sot_names = op.outer_mitsot(outer_in_names)
@@ -119,8 +122,8 @@ def numba_funcify_Scan(op, node, **kwargs):
 
     def add_inner_in_expr(
         outer_in_name: str,
-        tap_offset: Optional[int],
-        storage_size_var: Optional[str],
+        tap_offset: int | None,
+        storage_size_var: str | None,
         vector_slice_opt: bool,
     ):
         """Construct an inner-input expression."""
@@ -160,10 +163,11 @@ def numba_funcify_Scan(op, node, **kwargs):
             op.info.mit_mot_in_slices
             + op.info.mit_sot_in_slices
             + op.info.sit_sot_in_slices,
+            strict=True,
         )
     )
-    inner_in_names_to_output_taps: dict[str, Optional[tuple[int, ...]]] = dict(
-        zip(outer_in_mit_mot_names, op.info.mit_mot_out_slices)
+    inner_in_names_to_output_taps: dict[str, tuple[int, ...] | None] = dict(
+        zip(outer_in_mit_mot_names, op.info.mit_mot_out_slices, strict=True)
     )
 
     # Inner-outputs consist of:
@@ -181,7 +185,7 @@ def numba_funcify_Scan(op, node, **kwargs):
     # rotation for initially truncated storage.
     output_storage_post_proc_stmts: list[str] = []
 
-    # In truncated storage situations (e.g. created by `save_mem_new_scan`),
+    # In truncated storage situations (e.g. created by `scan_save_mem`),
     # the taps and output storage overlap, instead of the standard situation in
     # which the output storage is large enough to contain both the initial taps
     # values and the output storage.  In this truncated case, we use the
@@ -265,15 +269,15 @@ def numba_funcify_Scan(op, node, **kwargs):
                 output_taps = inner_in_names_to_output_taps.get(
                     outer_in_name, [tap_storage_size]
                 )
-                for out_tap in output_taps:
-                    inner_out_to_outer_in_stmts.append(
-                        idx_to_str(
-                            storage_name,
-                            out_tap,
-                            size=storage_size_name,
-                            allow_scalar=True,
-                        )
+                inner_out_to_outer_in_stmts.extend(
+                    idx_to_str(
+                        storage_name,
+                        out_tap,
+                        size=storage_size_name,
+                        allow_scalar=True,
                     )
+                    for out_tap in output_taps
+                )
 
                 add_output_storage_post_proc_stmt(
                     storage_name, output_taps, storage_size_name
@@ -370,7 +374,8 @@ def numba_funcify_Scan(op, node, **kwargs):
     inner_out_post_processing_block = "\n".join(inner_out_post_processing_stmts)
 
     inner_out_to_outer_out_stmts = "\n".join(
-        [f"{s} = {d}" for s, d in zip(inner_out_to_outer_in_stmts, inner_output_names)]
+        f"{s} = {d}"
+        for s, d in zip(inner_out_to_outer_in_stmts, inner_output_names, strict=True)
     )
 
     scan_op_src = f"""

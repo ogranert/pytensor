@@ -1,6 +1,7 @@
 import os
 from copy import copy
 from itertools import combinations
+from pathlib import Path
 from tempfile import mkstemp
 
 import numpy as np
@@ -11,7 +12,6 @@ from pytensor import function, shared
 from pytensor.compile.mode import get_default_mode
 from pytensor.configdefaults import config
 from pytensor.graph.utils import MethodNotDefined
-from pytensor.misc.safe_asarray import _asarray
 from pytensor.tensor.type import (
     TensorType,
     complex_dtypes,
@@ -109,7 +109,7 @@ def eval_outputs(outputs, ops=(), mode=None):
     variables = f()
     if ops:
         assert any(isinstance(node.op, ops) for node in f.maker.fgraph.apply_nodes)
-    if isinstance(variables, (tuple, list)) and len(variables) == 1:
+    if isinstance(variables, tuple | list) and len(variables) == 1:
         return variables[0]
     return variables
 
@@ -314,7 +314,7 @@ def _numpy_true_div(x, y):
     out = np.true_divide(x, y)
     # Use floatX as the result of int / int
     if x.dtype in discrete_dtypes and y.dtype in discrete_dtypes:
-        out = _asarray(out, dtype=config.floatX)
+        out = np.asarray(out, dtype=config.floatX)
     return out
 
 
@@ -442,7 +442,7 @@ def makeTester(
             gc.collect()
             for f, fname in self.tmp_files:
                 os.close(f)
-                os.remove(fname)
+                Path(fname).unlink()
 
         @pytest.mark.skipif(skip, reason="Skipped")
         def test_good(self):
@@ -463,9 +463,9 @@ def makeTester(
                     node = safe_make_node(self.op, *inputrs)
                 except Exception as exc:
                     err_msg = (
-                        "Test %s::%s: Error occurred while"
-                        " making a node with inputs %s"
-                    ) % (self.op, testname, inputs)
+                        f"Test {self.op}::{testname}: Error occurred while"
+                        f" making a node with inputs {inputs}"
+                    )
                     exc.args += (err_msg,)
                     raise
 
@@ -473,8 +473,9 @@ def makeTester(
                     f = inplace_func(inputrs, node.outputs, mode=mode, name="test_good")
                 except Exception as exc:
                     err_msg = (
-                        "Test %s::%s: Error occurred while" " trying to make a Function"
-                    ) % (self.op, testname)
+                        f"Test {self.op}::{testname}: Error occurred while"
+                        " trying to make a Function"
+                    )
                     exc.args += (err_msg,)
                     raise
                 if isinstance(self.expected, dict) and testname in self.expected:
@@ -497,49 +498,39 @@ def makeTester(
                     variables = f(*inputs)
                 except Exception as exc:
                     err_msg = (
-                        "Test %s::%s: Error occurred while calling"
-                        " the Function on the inputs %s"
-                    ) % (self.op, testname, inputs)
+                        f"Test {self.op}::{testname}: Error occurred while calling"
+                        f" the Function on the inputs {inputs}"
+                    )
                     exc.args += (err_msg,)
                     raise
 
-                if not isinstance(expecteds, (list, tuple)):
+                if not isinstance(expecteds, list | tuple):
                     expecteds = (expecteds,)
 
-                for i, (variable, expected) in enumerate(zip(variables, expecteds)):
+                for i, (variable, expected, out_symbol) in enumerate(
+                    zip(variables, expecteds, node.outputs, strict=True)
+                ):
                     condition = (
-                        variable.dtype != expected.dtype
+                        variable.dtype != out_symbol.type.dtype
                         or variable.shape != expected.shape
                         or not np.allclose(variable, expected, atol=eps, rtol=eps)
                     )
                     assert not condition, (
-                        "Test %s::%s: Output %s gave the wrong"
-                        " value. With inputs %s, expected %s (dtype %s),"
-                        " got %s (dtype %s). eps=%f"
-                        " np.allclose returns %s %s"
-                    ) % (
-                        self.op,
-                        testname,
-                        i,
-                        inputs,
-                        expected,
-                        expected.dtype,
-                        variable,
-                        variable.dtype,
-                        eps,
-                        np.allclose(variable, expected, atol=eps, rtol=eps),
-                        np.allclose(variable, expected),
+                        f"Test {self.op}::{testname}: Output {i} gave the wrong"
+                        f" value. With inputs {inputs}, expected {expected} (dtype {out_symbol.type.dtype}),"
+                        f" got {variable} (dtype {variable.dtype}). eps={eps:f}"
+                        f" np.allclose returns {np.allclose(variable, expected, atol=eps, rtol=eps)} {np.allclose(variable, expected)}"
                     )
 
                 for description, check in self.checks.items():
                     assert check(inputs, variables), (
-                        "Test %s::%s: Failed check: %s (inputs"
-                        " were %s, outputs were %s)"
-                    ) % (self.op, testname, description, inputs, variables)
+                        f"Test {self.op}::{testname}: Failed check: {description} (inputs"
+                        f" were {inputs}, outputs were {variables})"
+                    )
 
         @pytest.mark.skipif(skip, reason="Skipped")
         def test_bad_build(self):
-            for testname, inputs in self.bad_build.items():
+            for inputs in self.bad_build.values():
                 inputs = [copy(input) for input in inputs]
                 inputrs = [shared(input) for input in inputs]
                 with pytest.raises(Exception):
@@ -557,9 +548,9 @@ def makeTester(
                     node = safe_make_node(self.op, *inputrs)
                 except Exception as exc:
                     err_msg = (
-                        "Test %s::%s: Error occurred while trying"
-                        " to make a node with inputs %s"
-                    ) % (self.op, testname, inputs)
+                        f"Test {self.op}::{testname}: Error occurred while trying"
+                        f" to make a node with inputs {inputs}"
+                    )
                     exc.args += (err_msg,)
                     raise
 
@@ -569,8 +560,9 @@ def makeTester(
                     )
                 except Exception as exc:
                     err_msg = (
-                        "Test %s::%s: Error occurred while trying" " to make a Function"
-                    ) % (self.op, testname)
+                        f"Test {self.op}::{testname}: Error occurred while trying"
+                        " to make a Function"
+                    )
                     exc.args += (err_msg,)
                     raise
 
@@ -595,10 +587,10 @@ def makeTester(
                     )
                 except Exception as exc:
                     err_msg = (
-                        "Test %s::%s: Error occurred while"
+                        f"Test {self.op}::{testname}: Error occurred while"
                         " computing the gradient on the following"
-                        " inputs: %s"
-                    ) % (self.op, testname, inputs)
+                        f" inputs: {inputs}"
+                    )
                     exc.args += (err_msg,)
                     raise
 
@@ -631,7 +623,7 @@ def makeTester(
                     # rounding error in that case.
                 else:
                     expecteds = self.expected(*inputs)
-                if not isinstance(expecteds, (list, tuple)):
+                if not isinstance(expecteds, list | tuple):
                     expecteds = (expecteds,)
 
                 out_grad_vars = []
@@ -677,7 +669,7 @@ def makeBroadcastTester(op, expected, checks=None, name=None, **kwargs):
         # For instance: sub_inplace -> SubInplace
         capitalize = True
     if capitalize:
-        name = "".join([x.capitalize() for x in name.split("_")])
+        name = "".join(x.capitalize() for x in name.split("_"))
     # Some tests specify a name that already ends with 'Tester', while in other
     # cases we need to add it manually.
     if not name.endswith("Tester"):

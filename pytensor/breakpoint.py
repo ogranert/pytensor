@@ -92,7 +92,7 @@ class PdbBreakpoint(Op):
             new_op.inp_types.append(monitored_vars[i].type)
 
         # Build the Apply node
-        inputs = [condition] + list(monitored_vars)
+        inputs = [condition, *monitored_vars]
         outputs = [inp.type() for inp in monitored_vars]
         return Apply(op=new_op, inputs=inputs, outputs=outputs)
 
@@ -105,7 +105,7 @@ class PdbBreakpoint(Op):
             except Exception:
                 raise ValueError(
                     "Some of the inputs to the PdbBreakpoint op "
-                    "'%s' could not be casted to NumPy arrays" % self.name
+                    f"'{self.name}' could not be casted to NumPy arrays"
                 )
 
             print("\n")
@@ -142,7 +142,7 @@ class PdbBreakpoint(Op):
                 output_storage[i][0] = inputs[i + 1]
 
     def grad(self, inputs, output_gradients):
-        return [DisconnectedType()()] + output_gradients
+        return [DisconnectedType()(), *output_gradients]
 
     def infer_shape(self, fgraph, inputs, input_shapes):
         # Return the shape of every input but the condition (first input)

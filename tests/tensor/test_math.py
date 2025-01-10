@@ -11,6 +11,7 @@ import scipy.special
 from numpy.testing import assert_array_equal
 from scipy.special import logsumexp as scipy_logsumexp
 
+import pytensor
 import pytensor.scalar as ps
 from pytensor.compile.debugmode import DebugMode
 from pytensor.compile.function import function
@@ -18,17 +19,19 @@ from pytensor.compile.mode import get_default_mode
 from pytensor.compile.sharedvalue import shared
 from pytensor.configdefaults import config
 from pytensor.gradient import NullTypeGradError, grad, numeric_grad
-from pytensor.graph.basic import Variable, applys_between
+from pytensor.graph.basic import Variable, ancestors, applys_between
 from pytensor.graph.fg import FunctionGraph
+from pytensor.graph.replace import vectorize_node
 from pytensor.link.c.basic import DualLinker
-from pytensor.misc.safe_asarray import _asarray
 from pytensor.printing import pprint
+from pytensor.raise_op import Assert
 from pytensor.tensor import blas, blas_c
 from pytensor.tensor.basic import (
     as_tensor_variable,
     constant,
     eye,
     get_underlying_scalar_constant_value,
+    ones,
     switch,
 )
 from pytensor.tensor.blas import Dot22
@@ -36,8 +39,7 @@ from pytensor.tensor.elemwise import CAReduce, Elemwise
 from pytensor.tensor.math import (
     Argmax,
     Dot,
-    MaxAndArgmax,
-    Mean,
+    Max,
     Prod,
     ProdWithoutZeros,
     Sum,
@@ -76,6 +78,8 @@ from pytensor.tensor.math import (
     isinf,
     isnan,
     isnan_,
+    isneginf,
+    isposinf,
     log,
     log1mexp,
     log1p,
@@ -88,10 +92,12 @@ from pytensor.tensor.math import (
     max_and_argmax,
     maximum,
     mean,
+    median,
     min,
     minimum,
     mod,
     mul,
+    nan_to_num,
     neg,
     neq,
     outer,
@@ -110,9 +116,14 @@ from pytensor.tensor.math import (
     sqr,
     sqrt,
     sub,
+    tan,
+    tanh,
+    tensordot,
+    true_div,
+    trunc,
+    var,
 )
 from pytensor.tensor.math import sum as pt_sum
-from pytensor.tensor.math import tan, tanh, tensordot, true_div, trunc, var
 from pytensor.tensor.type import (
     TensorType,
     complex_dtypes,
@@ -142,7 +153,6 @@ from pytensor.tensor.type import (
     vectors,
     zvector,
 )
-from pytensor.tensor.type_other import NoneConst
 from tests import unittest_tools as utt
 from tests.link.test_link import make_function
 from tests.tensor.utils import (
@@ -752,11 +762,13 @@ def test_isnan():
 
 class TestMaxAndArgmax:
     def setup_method(self):
-        MaxAndArgmax.debug = 0
+        Max.debug = 0
+        Argmax.debug = 0
 
-    def test_basic(self):
-        n = as_tensor_variable(5.0)
-        v, i = eval_outputs(max_and_argmax(n))
+    @pytest.mark.parametrize("empty_axis", [(), None])
+    def test_empty_axis_scalar(self, empty_axis):
+        n = as_tensor_variable(5)
+        v, i = eval_outputs(max_and_argmax(n, axis=empty_axis))
         assert v == 5.0
         assert i == 0
         assert i.dtype == "int64"
@@ -764,6 +776,29 @@ class TestMaxAndArgmax:
         assert len(v) == 0
         v = eval_outputs(max_and_argmax(n)[1].shape)
         assert len(v) == 0
+
+    def test_empty_axis_tensor(self):
+        x = np.random.normal(size=(2, 3, 5, 7))
+        axis = ()
+
+        non_axis = tuple(i for i in range(x.ndim) if i not in axis)
+        shape_axis = tuple(x.shape[dim] for dim in axis)
+        shape_non_axis = tuple(x.shape[dim] for dim in non_axis)
+        x_transposed = x.transpose(*axis, *non_axis)
+
+        x_axis_raveled = x_transposed.reshape(
+            np.prod(shape_axis, dtype=int), np.prod(shape_non_axis, dtype=int)
+        )
+        max_x = max_and_argmax(x, axis=axis)[0].eval()
+        argmax_x = max_and_argmax(x, axis=axis)[1].eval()
+
+        raveled_max = x_axis_raveled[
+            argmax_x.ravel(), np.arange(np.prod(shape_non_axis, dtype=int))
+        ]
+        indirect_max = raveled_max.reshape(shape_non_axis)
+
+        np.testing.assert_allclose(max_x, x.max(axis=axis))
+        np.testing.assert_allclose(indirect_max, x.max(axis=axis))
 
     def test_basic_1(self):
         n = as_tensor_variable([1, 2, 3, 2, -6])
@@ -783,8 +818,6 @@ class TestMaxAndArgmax:
             (None, None),
             ([0, 1], None),
             ([1, 0], None),
-            (NoneConst.clone(), None),
-            (constant(0), 0),
         ],
     )
     def test_basic_2(self, axis, np_axis):
@@ -813,8 +846,6 @@ class TestMaxAndArgmax:
             (None, None),
             ([0, 1], None),
             ([1, 0], None),
-            (NoneConst.clone(), None),
-            (constant(0), 0),
         ],
     )
     def test_basic_2_float16(self, axis, np_axis):
@@ -973,7 +1004,7 @@ class TestMaxAndArgmax:
             safe_verify_grad(lambda v: max_and_argmax(v, axis=[i])[1], [data])
 
         # Test grad with multiple axes
-        for i in [[0, 1], [0, 0]]:
+        for i in [[0, 1], [0, 2, 3]]:
             safe_verify_grad(lambda v: max_and_argmax(v, axis=i)[0], [data])
             safe_verify_grad(lambda v: max_and_argmax(v, axis=i)[1], [data])
 
@@ -1010,14 +1041,34 @@ class TestMaxAndArgmax:
         assert max_pt.eval() == 3
         assert argmax_pt.eval() == 2
 
+    @pytest.mark.parametrize(
+        "core_axis, batch_axis",
+        [
+            (None, (1, 2, 3, 4)),
+            (0, (1,)),
+            ((1, -1), (2, 4)),
+        ],
+    )
+    def test_vectorize(self, core_axis, batch_axis):
+        x = tensor(shape=(5, 5, 5, 5))
+        batch_x = tensor(shape=(3, 5, 5, 5, 5))
+
+        argmax_x = argmax(x, axis=core_axis)
+
+        arg_max_node = argmax_x.owner
+        new_node = vectorize_node(arg_max_node, batch_x)
+
+        assert isinstance(new_node.op, Argmax)
+        assert new_node.op.axis == batch_axis
+
 
 class TestArgminArgmax:
     def setup_method(self):
-        MaxAndArgmax.debug = 0
+        Argmax.debug = 0
 
     def test_scalar(self):
         for fct in [argmin, argmax]:
-            n = as_tensor_variable(5.0)
+            n = as_tensor_variable([5.0])
             i = eval_outputs(fct(n))
             assert i == 0
             v = eval_outputs(fct(n).shape)
@@ -1175,7 +1226,7 @@ class TestArgminArgmax:
 
 class TestMinMax:
     def setup_method(self):
-        MaxAndArgmax.debug = 0
+        Max.debug = 0
 
     def test_scalar(self):
         for fct in [max, min]:
@@ -1342,6 +1393,7 @@ class TestMinMax:
         # check_grad_max(data, eval_outputs(grad(max_and_argmax(n,
         # axis=1)[0], n)),axis=1)
 
+    @pytest.mark.xfail(reason="Fails due to #770")
     def test_uint(self):
         for dtype in ("uint8", "uint16", "uint32", "uint64"):
             itype = np.iinfo(dtype)
@@ -1367,8 +1419,16 @@ class TestMinMax:
         assert np.all(i)
 
 
+def test_MaxAndArgmax_deprecated():
+    with pytest.raises(
+        AttributeError,
+        match="The class `MaxandArgmax` has been deprecated. Call `Max` and `Argmax` seperately as an alternative.",
+    ):
+        pytensor.tensor.math.MaxAndArgmax
+
+
 rng = np.random.default_rng(seed=utt.fetch_seed())
-TestClip = makeTester(
+TestClip1 = makeTester(
     name="ClipTester",
     op=clip,
     expected=lambda x, y, z: np.clip(x, y, z),
@@ -1414,7 +1474,7 @@ TestClip = makeTester(
             np.array(2, dtype="uint16"),
             np.array(4, dtype="uint16"),
         ),
-    )
+    ),
     # I can't think of any way to make this fail at runtime
 )
 
@@ -1435,7 +1495,7 @@ TestBackwardsClip = makeTester(
 )
 
 
-class TestClip:
+class TestClip2:
     def test_complex_value(self):
         for dtype in ["complex64", "complex128"]:
             a = vector(dtype=dtype)
@@ -1741,8 +1801,8 @@ class TestBitwise:
         for dtype in self.dtype:
             x, y = vector(dtype=dtype), vector(dtype=dtype)
             fn = inplace_func([x, y], x | y)
-            l = _asarray([0, 0, 1, 1], dtype=dtype)
-            r = _asarray([0, 1, 0, 1], dtype=dtype)
+            l = np.asarray([0, 0, 1, 1], dtype=dtype)
+            r = np.asarray([0, 1, 0, 1], dtype=dtype)
             v = fn(l, r)
             assert np.all(v == operator.or_(l, r)), (l, r, v)
 
@@ -1750,8 +1810,8 @@ class TestBitwise:
         for dtype in self.dtype:
             x, y = vector(dtype=dtype), vector(dtype=dtype)
             fn = inplace_func([x, y], x ^ y)
-            l = _asarray([0, 0, 1, 1], dtype=dtype)
-            r = _asarray([0, 1, 0, 1], dtype=dtype)
+            l = np.asarray([0, 0, 1, 1], dtype=dtype)
+            r = np.asarray([0, 1, 0, 1], dtype=dtype)
             v = fn(l, r)
             assert np.all(v == operator.xor(l, r)), (l, r, v)
 
@@ -1759,8 +1819,8 @@ class TestBitwise:
         for dtype in self.dtype:
             x, y = vector(dtype=dtype), vector(dtype=dtype)
             fn = inplace_func([x, y], x & y)
-            l = _asarray([0, 0, 1, 1], dtype=dtype)
-            r = _asarray([0, 1, 0, 1], dtype=dtype)
+            l = np.asarray([0, 0, 1, 1], dtype=dtype)
+            r = np.asarray([0, 1, 0, 1], dtype=dtype)
             v = fn(l, r)
             assert np.all(v == operator.and_(l, r)), (l, r, v)
 
@@ -1775,7 +1835,7 @@ class TestBitwise:
                 [0, 1, 0, 1],
                 [-1, 2**16, 2**16 - 1],
             ]:
-                l = _asarray([0, 0, 1, 1], dtype=dtype)
+                l = np.asarray([0, 0, 1, 1], dtype=dtype)
                 v = fn(l)
                 assert np.all(v == ~l), (l, v)
 
@@ -1790,8 +1850,8 @@ class TestBitwise:
 class TestAdd:
     def test_complex_all_ops(self):
         for nbits in (64, 128):
-            a = shared(np.ones(3, dtype="complex%i" % nbits) + 0.5j)
-            b = shared(np.ones(3, dtype="complex%i" % nbits) + 1.5j)
+            a = shared(np.ones(3, dtype=f"complex{nbits}") + 0.5j)
+            b = shared(np.ones(3, dtype=f"complex{nbits}") + 1.5j)
             tests = (
                 ("+", lambda x, y: x + y),
                 ("-", lambda x, y: x - y),
@@ -2173,6 +2233,96 @@ class TestTensordot:
         zv = f(xv, yv)
         assert np.allclose(np.tensordot(xv, yv, axes=axes), zv)
 
+    def test_type_shape(self):
+        x = ones(shape=(7, 3, 2))
+        y = ones(
+            shape=(
+                10,
+                2,
+            )
+        )
+        xv = x.eval()
+        yv = y.eval()
+        sy = tensor("sy", shape=(None, 2))
+        axes = [[-1], [-1]]
+        z = tensordot(x, y, axes=axes)
+        sz = tensordot(x, sy, axes=axes)
+
+        assert (
+            len(
+                {
+                    node
+                    for node in ancestors([z])
+                    if node.owner and isinstance(node.owner.op, Assert)
+                }
+            )
+            == 0
+        )
+        assert z.type.shape == (7, 3, 10)
+        assert z.broadcastable == (False, False, False)
+        assert np.allclose(np.tensordot(xv, yv, axes=axes), z.eval())
+
+        assert (
+            len(
+                {
+                    node
+                    for node in ancestors([sz])
+                    if node.owner and isinstance(node.owner.op, Assert)
+                }
+            )
+            == 0
+        )
+        assert sz.type.shape == (7, 3, None)
+        assert z.broadcastable == (False, False, False)
+        assert np.allclose(np.tensordot(xv, yv, axes=axes), sz.eval({sy: yv}))
+
+        with pytest.raises(
+            ValueError,
+            match="Input arrays have inconsistent broadcastable pattern or type shape",
+        ):
+            tensordot(ones(shape=(7, 4)), ones(shape=(7, 4)), axes=1)
+
+    @pytest.mark.parametrize(
+        ["axes", "has_assert", "values", "expected_fail"],
+        [
+            ([[1], [2]], False, (np.ones((7, 3, 2)), np.ones((7, 2, 3))), False),
+            ([[0, 2], [0, 1]], True, (np.ones((7, 3, 2)), np.ones((7, 2, 3))), False),
+            ([[0], [0]], False, (np.ones((7, 3, 1)), np.ones((100, 1, 3))), True),
+            ([[1, 2], [1, 2]], True, (np.ones((7, 3, 2)), np.ones((7, 2, 3))), True),
+        ],
+    )
+    def test_shape_assert(self, axes, has_assert, values, expected_fail):
+        x = tensor(shape=(7, 3, None))
+        y = tensor(shape=(None, None, 3))
+
+        xv, yv = values
+        xv = xv.astype(x.dtype)
+        yv = yv.astype(x.dtype)
+
+        z = tensordot(x, y, axes=axes)
+
+        found_asserts = {
+            node
+            for node in ancestors([z])
+            if node.owner and isinstance(node.owner.op, Assert)
+        }
+        if has_assert:
+            assert found_asserts
+        else:
+            assert not found_asserts
+        if expected_fail:
+            if has_assert:
+                with pytest.raises(
+                    AssertionError,
+                    match="Input array shape along reduced axes of tensordot are not equal",
+                ):
+                    z.eval({x: xv, y: yv})
+            else:
+                with pytest.raises(ValueError):
+                    z.eval({x: xv, y: yv})
+        else:
+            assert np.allclose(np.tensordot(xv, yv, axes=axes), z.eval({x: xv, y: yv}))
+
 
 def test_smallest():
     x = dvector()
@@ -2310,8 +2460,8 @@ class TestArithmeticCast:
         with config.change_flags(cast_policy="numpy+floatX"):
             # We will test all meaningful combinations of
             # scalar and array operations.
-            pytensor_args = list(map(eval, [f"pytensor_{c}" for c in combo]))
-            numpy_args = list(map(eval, [f"numpy_{c}" for c in combo]))
+            pytensor_args = [eval(f"pytensor_{c}") for c in combo]
+            numpy_args = [eval(f"numpy_{c}") for c in combo]
             pytensor_arg_1 = pytensor_args[0](a_type)
             pytensor_arg_2 = pytensor_args[1](b_type)
             pytensor_dtype = op(
@@ -2329,7 +2479,7 @@ class TestArithmeticCast:
                 op(numpy_arg_1, numpy_arg_2).dtype,
                 op(numpy_arg_2, numpy_arg_1).dtype,
             ]
-            numpy_dtype = ps.upcast(*list(map(str, numpy_dtypes)))
+            numpy_dtype = ps.upcast(*map(str, numpy_dtypes))
 
             if numpy_dtype == pytensor_dtype:
                 # Same data type found, all is good!
@@ -2384,7 +2534,7 @@ class TestArithmeticCast:
                 # a float32 may result in a complex64. As
                 # of 1.9.2. this is still the case so it is
                 # probably by design
-                pytest.skip("Known issue with" "numpy see #761")
+                pytest.skip("Known issue with numpy see #761")
             # In any other situation: something wrong is
             # going on!
             raise AssertionError()
@@ -2436,36 +2586,50 @@ def test_mod_compile():
 
 
 class TestInferShape(utt.InferShapeTester):
-    def test_Mean(self):
-        adtens3 = dtensor3()
-        adtens3_val = random(3, 4, 5)
-        aiscal_val = 2
-        self._compile_and_check([adtens3], [Mean(None)(adtens3)], [adtens3_val], Mean)
-        self._compile_and_check(
-            [adtens3], [Mean(aiscal_val)(adtens3)], [adtens3_val], Mean
-        )
-
-    def test_MaxAndArgmax(self):
+    def test_Max(self):
         adtens3 = dtensor3()
         adtens3_val = random(4, 5, 3)
         self._compile_and_check(
-            [adtens3], max_and_argmax(adtens3, None), [adtens3_val], MaxAndArgmax
+            [adtens3], max_and_argmax(adtens3, None), [adtens3_val], Max
         )
 
         self._compile_and_check(
-            [adtens3], max_and_argmax(adtens3, 0), [adtens3_val], MaxAndArgmax
+            [adtens3], max_and_argmax(adtens3, 0), [adtens3_val], Max
         )
 
         self._compile_and_check(
-            [adtens3], max_and_argmax(adtens3, 1), [adtens3_val], MaxAndArgmax
+            [adtens3], max_and_argmax(adtens3, 1), [adtens3_val], Max
         )
 
         self._compile_and_check(
-            [adtens3], max_and_argmax(adtens3, 2), [adtens3_val], MaxAndArgmax
+            [adtens3], max_and_argmax(adtens3, 2), [adtens3_val], Max
         )
 
         self._compile_and_check(
-            [adtens3], max_and_argmax(adtens3, [0, 1, 2]), [adtens3_val], MaxAndArgmax
+            [adtens3], max_and_argmax(adtens3, [0, 1, 2]), [adtens3_val], Max
+        )
+
+    def test_Argmax(self):
+        adtens3 = dtensor3()
+        adtens3_val = random(4, 5, 3)
+        self._compile_and_check(
+            [adtens3], max_and_argmax(adtens3, None), [adtens3_val], Argmax
+        )
+
+        self._compile_and_check(
+            [adtens3], max_and_argmax(adtens3, 0), [adtens3_val], Argmax
+        )
+
+        self._compile_and_check(
+            [adtens3], max_and_argmax(adtens3, 1), [adtens3_val], Argmax
+        )
+
+        self._compile_and_check(
+            [adtens3], max_and_argmax(adtens3, 2), [adtens3_val], Argmax
+        )
+
+        self._compile_and_check(
+            [adtens3], max_and_argmax(adtens3, [0, 1, 2]), [adtens3_val], Argmax
         )
 
     def test_Dot(self):
@@ -3036,52 +3200,56 @@ class TestMeanDtype:
             # TODO FIXME: This is a bad test
             f(data)
 
-    @pytest.mark.slow
-    def test_mean_custom_dtype(self):
+    @pytest.mark.parametrize(
+        "input_dtype",
+        (
+            "bool",
+            "uint16",
+            "int8",
+            "int64",
+            "float16",
+            "float32",
+            "float64",
+            "complex64",
+            "complex128",
+        ),
+    )
+    @pytest.mark.parametrize(
+        "sum_dtype",
+        (
+            "bool",
+            "uint16",
+            "int8",
+            "int64",
+            "float16",
+            "float32",
+            "float64",
+            "complex64",
+            "complex128",
+        ),
+    )
+    @pytest.mark.parametrize("axis", [None, ()])
+    def test_mean_custom_dtype(self, input_dtype, sum_dtype, axis):
         # Test the ability to provide your own output dtype for a mean.
 
-        # We try multiple axis combinations even though axis should not matter.
-        axes = [None, 0, 1, [], [0], [1], [0, 1]]
-        idx = 0
-        for input_dtype in map(str, ps.all_types):
-            x = matrix(dtype=input_dtype)
-            for sum_dtype in map(str, ps.all_types):
-                axis = axes[idx % len(axes)]
-                # If the inner sum cannot be created, it will raise a
-                # TypeError.
-                try:
-                    mean_var = x.mean(dtype=sum_dtype, axis=axis)
-                except TypeError:
-                    pass
-                else:
-                    # Executed if no TypeError was raised
-                    if sum_dtype in discrete_dtypes:
-                        assert mean_var.dtype == "float64", (mean_var.dtype, sum_dtype)
-                    else:
-                        assert mean_var.dtype == sum_dtype, (mean_var.dtype, sum_dtype)
-                    if (
-                        "complex" in input_dtype or "complex" in sum_dtype
-                    ) and input_dtype != sum_dtype:
-                        continue
-                    f = function([x], mean_var)
-                    data = np.random.random((3, 4)) * 10
-                    data = data.astype(input_dtype)
-                    # TODO FIXME: This is a bad test
-                    f(data)
-                    # Check that we can take the gradient, when implemented
-                    if "complex" in mean_var.dtype:
-                        continue
-                    try:
-                        grad(mean_var.sum(), x, disconnected_inputs="ignore")
-                    except NotImplementedError:
-                        # TrueDiv does not seem to have a gradient when
-                        # the numerator is complex.
-                        if mean_var.dtype in complex_dtypes:
-                            pass
-                        else:
-                            raise
+        x = matrix(dtype=input_dtype)
+        # If the inner sum cannot be created, it will raise a TypeError.
+        mean_var = x.mean(dtype=sum_dtype, axis=axis)
+        if sum_dtype in discrete_dtypes:
+            assert mean_var.dtype == "float64", (mean_var.dtype, sum_dtype)
+        else:
+            assert mean_var.dtype == sum_dtype, (mean_var.dtype, sum_dtype)
 
-                idx += 1
+        f = function([x], mean_var, mode="FAST_COMPILE")
+        data = np.ones((2, 1)).astype(input_dtype)
+        if axis != ():
+            expected_res = np.array(2).astype(sum_dtype) / 2
+        else:
+            expected_res = data
+        np.testing.assert_allclose(f(data), expected_res)
+
+        if "complex" not in mean_var.dtype:
+            grad(mean_var.sum(), x, disconnected_inputs="ignore")
 
     def test_mean_precision(self):
         # Check that the default accumulator precision is sufficient
@@ -3244,7 +3412,7 @@ class TestSumMeanMaxMinArgMaxVarReduceAxes:
 def reduce_bitwise_and(x, axis=-1, dtype="int8"):
     identity = np.array((-1,), dtype=dtype)[0]
 
-    shape_without_axis = tuple([s for i, s in enumerate(x.shape) if i != axis])
+    shape_without_axis = tuple(s for i, s in enumerate(x.shape) if i != axis)
     if 0 in shape_without_axis:
         return np.empty(shape=shape_without_axis, dtype=x.dtype)
 
@@ -3303,8 +3471,9 @@ def test_grad_useless_sum():
     old_values_eq_approx = staticmethod(TensorType.values_eq_approx)
     TensorType.values_eq_approx = staticmethod(values_eq_approx_remove_nan)
     try:
-        for test_value in test_values:
-            outputs.append(f(np.array([test_value]).astype("float32")))
+        outputs.extend(
+            f(np.array([test_value]).astype("float32")) for test_value in test_values
+        )
     finally:
         TensorType.values_eq_approx = old_values_eq_approx
 
@@ -3514,3 +3683,76 @@ class TestPolyGamma:
         n = scalar(dtype="int64")
         with pytest.raises(NullTypeGradError):
             grad(polygamma(n, 0.5), wrt=n)
+
+
+def test_infs():
+    x = tensor(shape=(7,))
+
+    f_pos = function([x], isposinf(x))
+    f_neg = function([x], isneginf(x))
+
+    y = np.array([1, np.inf, 2, np.inf, -np.inf, -np.inf, 4]).astype(x.dtype)
+    out_pos = f_pos(y)
+    out_neg = f_neg(y)
+
+    np.testing.assert_allclose(
+        out_pos,
+        [0, 1, 0, 1, 0, 0, 0],
+    )
+    np.testing.assert_allclose(
+        out_neg,
+        [0, 0, 0, 0, 1, 1, 0],
+    )
+
+
+@pytest.mark.parametrize(
+    ["nan", "posinf", "neginf"],
+    [(0, None, None), (0, 0, 0), (0, None, 1000), (3, 1, -1)],
+)
+def test_nan_to_num(nan, posinf, neginf):
+    x = tensor(shape=(7,))
+
+    out = nan_to_num(x, nan, posinf, neginf)
+
+    f = function([x], out)
+
+    y = np.array([1, 2, np.nan, np.inf, -np.inf, 3, 4]).astype(x.dtype)
+    out = f(y)
+
+    posinf = np.finfo(x.real.dtype).max if posinf is None else posinf
+    neginf = np.finfo(x.real.dtype).min if neginf is None else neginf
+
+    np.testing.assert_allclose(
+        out,
+        np.nan_to_num(y, nan=nan, posinf=posinf, neginf=neginf),
+    )
+
+
+@pytest.mark.parametrize(
+    "ndim, axis",
+    [
+        (2, None),
+        (2, 1),
+        (2, (0, 1)),
+        (3, None),
+        (3, (1, 2)),
+        (4, (1, 3, 0)),
+    ],
+)
+def test_median(ndim, axis):
+    # Generate random data with both odd and even lengths
+    shape_even = np.arange(1, ndim + 1) * 2
+    shape_odd = shape_even - 1
+
+    data_even = np.random.rand(*shape_even)
+    data_odd = np.random.rand(*shape_odd)
+
+    x = tensor(dtype="float64", shape=(None,) * ndim)
+    f = function([x], median(x, axis=axis))
+    result_odd = f(data_odd)
+    result_even = f(data_even)
+    expected_odd = np.median(data_odd, axis=axis)
+    expected_even = np.median(data_even, axis=axis)
+
+    assert np.allclose(result_odd, expected_odd)
+    assert np.allclose(result_even, expected_even)

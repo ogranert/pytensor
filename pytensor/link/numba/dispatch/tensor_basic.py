@@ -35,10 +35,10 @@ def numba_funcify_AllocEmpty(op, node, **kwargs):
     shape_var_item_names = [f"{name}_item" for name in shape_var_names]
     shapes_to_items_src = indent(
         "\n".join(
-            [
-                f"{item_name} = to_scalar({shape_name})"
-                for item_name, shape_name in zip(shape_var_item_names, shape_var_names)
-            ]
+            f"{item_name} = to_scalar({shape_name})"
+            for item_name, shape_name in zip(
+                shape_var_item_names, shape_var_names, strict=True
+            )
         ),
         " " * 4,
     )
@@ -69,10 +69,10 @@ def numba_funcify_Alloc(op, node, **kwargs):
     shape_var_item_names = [f"{name}_item" for name in shape_var_names]
     shapes_to_items_src = indent(
         "\n".join(
-            [
-                f"{item_name} = to_scalar({shape_name})"
-                for item_name, shape_name in zip(shape_var_item_names, shape_var_names)
-            ]
+            f"{item_name} = to_scalar({shape_name})"
+            for item_name, shape_name in zip(
+                shape_var_item_names, shape_var_names, strict=True
+            )
         ),
         " " * 4,
     )
@@ -174,14 +174,14 @@ def numba_funcify_ExtractDiag(op, node, **kwargs):
             else:
                 diag_len = min(x.shape[axis2], max(0, x.shape[axis1] + offset))
             base_shape = x.shape[:axis1] + x.shape[axis1p1:axis2] + x.shape[axis2p1:]
-            out_shape = base_shape + (diag_len,)
+            out_shape = (*base_shape, diag_len)
             out = np.empty(out_shape)
 
             for i in range(diag_len):
                 if offset >= 0:
-                    new_entry = x[leading_dims + (i,) + middle_dims + (i + offset,)]
+                    new_entry = x[(*leading_dims, i, *middle_dims, i + offset)]
                 else:
-                    new_entry = x[leading_dims + (i - offset,) + middle_dims + (i,)]
+                    new_entry = x[(*leading_dims, i - offset, *middle_dims, i)]
                 out[..., i] = new_entry
             return out
 

@@ -1,18 +1,18 @@
 import copy
 import math
 import sys
+from collections import defaultdict
 from collections.abc import Iterable, Sequence
 from functools import cmp_to_key
 from io import StringIO
-from typing import Optional, Union
+from typing import Union
 
 from pytensor.configdefaults import config
 from pytensor.graph.rewriting import basic as pytensor_rewriting
 from pytensor.misc.ordered_set import OrderedSet
-from pytensor.utils import DefaultOrderedDict
 
 
-RewritesType = Union[pytensor_rewriting.GraphRewriter, pytensor_rewriting.NodeRewriter]
+RewritesType = pytensor_rewriting.GraphRewriter | pytensor_rewriting.NodeRewriter
 
 
 class RewriteDatabase:
@@ -23,7 +23,7 @@ class RewriteDatabase:
     """
 
     def __init__(self):
-        self.__db__ = DefaultOrderedDict(OrderedSet)
+        self.__db__ = defaultdict(OrderedSet)
         self._names = set()
         # This will be reset by `self.register` (via `obj.name` by the thing
         # doing the registering)
@@ -60,11 +60,9 @@ class RewriteDatabase:
         """
         if not isinstance(
             rewriter,
-            (
-                RewriteDatabase,
-                pytensor_rewriting.GraphRewriter,
-                pytensor_rewriting.NodeRewriter,
-            ),
+            RewriteDatabase
+            | pytensor_rewriting.GraphRewriter
+            | pytensor_rewriting.NodeRewriter,
         ):
             raise TypeError(f"{rewriter} is not a valid rewrite type.")
 
@@ -73,7 +71,7 @@ class RewriteDatabase:
 
         if use_db_name_as_tag:
             if self.name is not None:
-                tags = tags + (self.name,)
+                tags = (*tags, self.name)
 
         rewriter.name = name
         # This restriction is there because in many place we suppose that
@@ -183,16 +181,15 @@ class RewriteDatabaseQuery:
 
     def __init__(
         self,
-        include: Iterable[Union[str, None]],
-        require: Optional[Union[OrderedSet, Sequence[str]]] = None,
-        exclude: Optional[Union[OrderedSet, Sequence[str]]] = None,
-        subquery: Optional[dict[str, "RewriteDatabaseQuery"]] = None,
+        include: Iterable[str | None],
+        require: OrderedSet | Sequence[str] | None = None,
+        exclude: OrderedSet | Sequence[str] | None = None,
+        subquery: dict[str, "RewriteDatabaseQuery"] | None = None,
         position_cutoff: float = math.inf,
-        extra_rewrites: Optional[
-            Sequence[
-                tuple[Union["RewriteDatabaseQuery", RewritesType], Union[int, float]]
-            ]
-        ] = None,
+        extra_rewrites: Sequence[
+            tuple[Union["RewriteDatabaseQuery", RewritesType], int | float]
+        ]
+        | None = None,
     ):
         """
 
@@ -224,7 +221,7 @@ class RewriteDatabaseQuery:
         self.exclude = OrderedSet(exclude) if exclude else OrderedSet()
         self.subquery = subquery or {}
         self.position_cutoff = position_cutoff
-        self.name: Optional[str] = None
+        self.name: str | None = None
         if extra_rewrites is None:
             extra_rewrites = []
         self.extra_rewrites = list(extra_rewrites)
@@ -232,10 +229,10 @@ class RewriteDatabaseQuery:
     def __str__(self):
         return (
             "RewriteDatabaseQuery("
-            + f"inc={self.include},ex={self.exclude},"
-            + f"require={self.require},subquery={self.subquery},"
-            + f"position_cutoff={self.position_cutoff},"
-            + f"extra_rewrites={self.extra_rewrites})"
+            f"inc={self.include},ex={self.exclude},"
+            f"require={self.require},subquery={self.subquery},"
+            f"position_cutoff={self.position_cutoff},"
+            f"extra_rewrites={self.extra_rewrites})"
         )
 
     def __setstate__(self, state):
@@ -277,7 +274,7 @@ class RewriteDatabaseQuery:
         )
 
     def register(
-        self, *rewrites: tuple["RewriteDatabaseQuery", Union[int, float]]
+        self, *rewrites: tuple["RewriteDatabaseQuery", int | float]
     ) -> "RewriteDatabaseQuery":
         """Include the given rewrites."""
         return RewriteDatabaseQuery(
@@ -398,14 +395,12 @@ class SequenceDB(RewriteDatabase):
                 self.__position__[name] = 0
             else:
                 self.__position__[name] = max(self.__position__.values()) + 1
-        elif isinstance(position, (int, float)):
+        elif isinstance(position, int | float):
             self.__position__[name] = position
         else:
             raise TypeError(f"`position` must be numeric; got {position}")
 
-    def query(
-        self, *tags, position_cutoff: Optional[Union[int, float]] = None, **kwtags
-    ):
+    def query(self, *tags, position_cutoff: int | float | None = None, **kwtags):
         """
 
         Parameters

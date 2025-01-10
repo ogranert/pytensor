@@ -1,7 +1,5 @@
 from abc import abstractmethod
-from typing import Any, Generic, Optional, TypeVar, Union
-
-from typing_extensions import TypeAlias
+from typing import Any, Generic, TypeAlias, TypeVar
 
 from pytensor.graph import utils
 from pytensor.graph.basic import Constant, Variable
@@ -35,7 +33,7 @@ class Type(MetaObject, Generic[D]):
     The `Type` that will be created by a call to `Type.make_constant`.
     """
 
-    def in_same_class(self, otype: "Type") -> Optional[bool]:
+    def in_same_class(self, otype: "Type") -> bool | None:
         """Determine if another `Type` represents a subset from the same "class" of types represented by `self`.
 
         A "class" of types could be something like "float64 tensors with four
@@ -50,12 +48,9 @@ class Type(MetaObject, Generic[D]):
         unique element (i.e. it uses `self.__eq__`).
 
         """
-        if self == otype:
-            return True
+        return self == otype
 
-        return False
-
-    def is_super(self, otype: "Type") -> Optional[bool]:
+    def is_super(self, otype: "Type") -> bool | None:
         """Determine if `self` is a supertype of `otype`.
 
         This method effectively implements the type relation ``>``.
@@ -77,7 +72,7 @@ class Type(MetaObject, Generic[D]):
 
     @abstractmethod
     def filter(
-        self, data: Any, strict: bool = False, allow_downcast: Optional[bool] = None
+        self, data: Any, strict: bool = False, allow_downcast: bool | None = None
     ) -> D:
         """Return data or an appropriately wrapped/converted data.
 
@@ -106,7 +101,7 @@ class Type(MetaObject, Generic[D]):
         value: Any,
         storage: Any,
         strict: bool = False,
-        allow_downcast: Optional[bool] = None,
+        allow_downcast: bool | None = None,
     ):
         """Return data or an appropriately wrapped/converted data by converting it in-place.
 
@@ -130,7 +125,7 @@ class Type(MetaObject, Generic[D]):
         raise NotImplementedError()
 
     def filter_variable(
-        self, other: Union[Variable, D], allow_convert: bool = True
+        self, other: Variable | D, allow_convert: bool = True
     ) -> variable_type:
         r"""Convert a `other` into a `Variable` with a `Type` that's compatible with `self`.
 
@@ -154,7 +149,7 @@ class Type(MetaObject, Generic[D]):
             )
         return other
 
-    def convert_variable(self, var: Variable) -> Optional[Variable]:
+    def convert_variable(self, var: Variable) -> Variable | None:
         """Produce a `Variable` that's compatible with both `self` and `var.type`, if possible.
 
         A compatible `Variable` is a `Variable` with a `Type` that's the
@@ -188,7 +183,7 @@ class Type(MetaObject, Generic[D]):
         except (TypeError, ValueError):
             return False
 
-    def make_variable(self, name: Optional[str] = None) -> variable_type:
+    def make_variable(self, name: str | None = None) -> variable_type:
         """Return a new `Variable` instance of this `Type`.
 
         Parameters
@@ -199,7 +194,7 @@ class Type(MetaObject, Generic[D]):
         """
         return self.variable_type(self, None, name=name)
 
-    def make_constant(self, value: D, name: Optional[str] = None) -> constant_type:
+    def make_constant(self, value: D, name: str | None = None) -> constant_type:
         """Return a new `Constant` instance of this `Type`.
 
         Parameters
@@ -216,7 +211,7 @@ class Type(MetaObject, Generic[D]):
         """Clone a copy of this type with the given arguments/keyword values, if any."""
         return type(self)(*args, **kwargs)
 
-    def __call__(self, name: Optional[str] = None) -> variable_type:
+    def __call__(self, name: str | None = None) -> variable_type:
         """Return a new `Variable` instance of Type `self`.
 
         Parameters
@@ -272,4 +267,4 @@ class HasShape:
     """A mixin for a type that has :attr:`shape` and :attr:`ndim` attributes."""
 
     ndim: int
-    shape: tuple[Optional[int], ...]
+    shape: tuple[int | None, ...]

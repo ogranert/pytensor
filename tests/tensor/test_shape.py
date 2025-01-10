@@ -1,3 +1,5 @@
+import re
+
 import numpy as np
 import pytest
 
@@ -6,15 +8,12 @@ from pytensor import Mode, function, grad
 from pytensor.compile.ops import DeepCopyOp
 from pytensor.configdefaults import config
 from pytensor.graph.basic import Variable, equal_computations
-from pytensor.graph.fg import FunctionGraph
 from pytensor.graph.replace import clone_replace, vectorize_node
 from pytensor.graph.type import Type
-from pytensor.misc.safe_asarray import _asarray
 from pytensor.scalar.basic import ScalarConstant
 from pytensor.tensor import as_tensor_variable, broadcast_to, get_vector_length, row
-from pytensor.tensor.basic import MakeVector, as_tensor, constant
+from pytensor.tensor.basic import MakeVector, constant, stack
 from pytensor.tensor.elemwise import DimShuffle, Elemwise
-from pytensor.tensor.rewriting.shape import ShapeFeature
 from pytensor.tensor.shape import (
     Reshape,
     Shape,
@@ -24,7 +23,6 @@ from pytensor.tensor.shape import (
     _specify_shape,
     reshape,
     shape,
-    shape_i,
     shape_tuple,
     specify_broadcastable,
     specify_shape,
@@ -166,9 +164,9 @@ class TestReshape(utt.InferShapeTester, utt.OptimizationTestMixin):
         assert np.array_equal(a_val, a_val_copy)
 
         # test that it works with inplace operations
-        a_val = _asarray([0, 1, 2, 3, 4, 5], dtype="float64")
-        a_val_copy = _asarray([0, 1, 2, 3, 4, 5], dtype="float64")
-        b_val = _asarray([[0, 1, 2], [3, 4, 5]], dtype="float64")
+        a_val = np.asarray([0, 1, 2, 3, 4, 5], dtype="float64")
+        a_val_copy = np.asarray([0, 1, 2, 3, 4, 5], dtype="float64")
+        b_val = np.asarray([[0, 1, 2], [3, 4, 5]], dtype="float64")
 
         f_sub = self.function([a, b], c - b)
         assert np.array_equal(f_sub(a_val, b_val), np.zeros_like(b_val))
@@ -176,7 +174,7 @@ class TestReshape(utt.InferShapeTester, utt.OptimizationTestMixin):
 
         # verify gradient
         def just_vals(v):
-            return Reshape(2)(v, _asarray([2, 3], dtype="int32"))
+            return Reshape(2)(v, np.asarray([2, 3], dtype="int32"))
 
         utt.verify_grad(just_vals, [a_val], mode=self.mode)
 
@@ -353,6 +351,29 @@ class TestReshape(utt.InferShapeTester, utt.OptimizationTestMixin):
         assert tuple(y_new.shape.eval({i: i_test})) == (4, 25)
         assert y_new.eval({i: i_test}).shape == (4, 25)
 
+    def test_static_shape(self):
+        dim = lscalar("dim")
+        x1 = tensor(shape=(2, 2, None))
+        x2 = specify_shape(x1, (2, 2, 6))
+
+        assert reshape(x1, (6, 2)).type.shape == (6, 2)
+        assert reshape(x1, (6, -1)).type.shape == (6, None)
+        assert reshape(x1, (6, dim)).type.shape == (6, None)
+        assert reshape(x1, (6, dim, 2)).type.shape == (6, None, 2)
+        assert reshape(x1, (6, 3, 99)).type.shape == (6, 3, 99)
+
+        assert reshape(x2, (6, 4)).type.shape == (6, 4)
+        assert reshape(x2, (6, -1)).type.shape == (6, 4)
+        assert reshape(x2, (6, dim)).type.shape == (6, 4)
+        assert reshape(x2, (6, dim, 2)).type.shape == (6, 2, 2)
+        with pytest.raises(
+            ValueError,
+            match=re.escape(
+                "Reshape: Input shape (2, 2, 6) is incompatible with new shape (6, 3, 99)"
+            ),
+        ):
+            reshape(x2, (6, 3, 99))
+
 
 def test_shape_i_hash():
     assert isinstance(Shape_i(np.int64(1)).__hash__(), int)
@@ -465,7 +486,7 @@ class TestSpecifyShape(utt.InferShapeTester):
             f(xval)
 
         assert isinstance(
-            [n for n in f.maker.fgraph.toposort() if isinstance(n.op, SpecifyShape)][0]
+            next(n for n in f.maker.fgraph.toposort() if isinstance(n.op, SpecifyShape))
             .inputs[0]
             .type,
             self.input_type,
@@ -475,7 +496,7 @@ class TestSpecifyShape(utt.InferShapeTester):
         xval = np.random.random((2, 3)).astype(config.floatX)
         f = pytensor.function([x], specify_shape(x, 2, 3), mode=self.mode)
         assert isinstance(
-            [n for n in f.maker.fgraph.toposort() if isinstance(n.op, SpecifyShape)][0]
+            next(n for n in f.maker.fgraph.toposort() if isinstance(n.op, SpecifyShape))
             .inputs[0]
             .type,
             self.input_type,
@@ -562,16 +583,22 @@ class TestSpecifyBroadcastable:
         x = matrix()
         assert specify_broadcastable(x, 0).type.shape == (1, None)
         assert specify_broadcastable(x, 1).type.shape == (None, 1)
+        assert specify_broadcastable(x, -1).type.shape == (None, 1)
         assert specify_broadcastable(x, 0, 1).type.shape == (1, 1)
 
         x = row()
         assert specify_broadcastable(x, 0) is x
         assert specify_broadcastable(x, 1) is not x
+        assert specify_broadcastable(x, -2) is x
 
     def test_validation(self):
         x = matrix()
-        with pytest.raises(ValueError, match="^Trying to specify broadcastable of*"):
-            specify_broadcastable(x, 2)
+        axis = 2
+        with pytest.raises(
+            ValueError,
+            match=f"axis {axis} is out of bounds for array of dimension {axis}",
+        ):
+            specify_broadcastable(x, axis)
 
 
 class TestRopLop(RopLopChecker):
@@ -602,13 +629,12 @@ def test_nonstandard_shapes():
     tl_shape = shape(tl)
     assert np.array_equal(tl_shape.get_test_value(), (2, 2, 3, 4))
 
-    # There's no `FunctionGraph`, so it should return a `Subtensor`
-    tl_shape_i = shape_i(tl, 0)
+    # Test specific dim
+    tl_shape_i = shape(tl)[0]
     assert isinstance(tl_shape_i.owner.op, Subtensor)
     assert tl_shape_i.get_test_value() == 2
 
-    tl_fg = FunctionGraph([a, b], [tl], features=[ShapeFeature()])
-    tl_shape_i = shape_i(tl, 0, fgraph=tl_fg)
+    tl_shape_i = Shape_i(0)(tl)
     assert not isinstance(tl_shape_i.owner.op, Subtensor)
     assert tl_shape_i.get_test_value() == 2
 
@@ -770,8 +796,14 @@ class TestVectorize:
         [vect_out] = vectorize_node(node, mat, new_shape).outputs
         assert equal_computations([vect_out], [reshape(mat, new_shape)])
 
-        with pytest.raises(NotImplementedError):
-            vectorize_node(node, vec, broadcast_to(as_tensor([5, 2, x]), (2, 3)))
+        new_shape = stack([[-1, x], [x - 1, -1]], axis=0)
+        print(new_shape.type)
+        [vect_out] = vectorize_node(node, vec, new_shape).outputs
+        vec_test_value = np.arange(6)
+        np.testing.assert_allclose(
+            vect_out.eval({x: 3, vec: vec_test_value}),
+            np.broadcast_to(vec_test_value.reshape(2, 3), (2, 2, 3)),
+        )
 
         with pytest.raises(
             ValueError,

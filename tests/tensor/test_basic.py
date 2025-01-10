@@ -10,6 +10,7 @@ import pytensor.scalar as ps
 import pytensor.tensor.basic as ptb
 import pytensor.tensor.math as ptm
 from pytensor import compile, config, function, shared
+from pytensor.compile import SharedVariable
 from pytensor.compile.io import In, Out
 from pytensor.compile.mode import Mode, get_default_mode
 from pytensor.compile.ops import DeepCopyOp
@@ -17,7 +18,6 @@ from pytensor.gradient import grad, hessian
 from pytensor.graph.basic import Apply, equal_computations
 from pytensor.graph.op import Op
 from pytensor.graph.replace import clone_replace
-from pytensor.misc.safe_asarray import _asarray
 from pytensor.raise_op import Assert
 from pytensor.scalar import autocast_float, autocast_float_as
 from pytensor.tensor import NoneConst, vectorize
@@ -36,6 +36,7 @@ from pytensor.tensor.basic import (
     TensorFromScalar,
     Tri,
     alloc,
+    alloc_diag,
     arange,
     as_tensor_variable,
     atleast_Nd,
@@ -86,6 +87,7 @@ from pytensor.tensor.basic import (
     triu_indices,
     triu_indices_from,
     vertical_stack,
+    where,
     zeros_like,
 )
 from pytensor.tensor.blockwise import Blockwise
@@ -418,7 +420,7 @@ class TestMakeVector(utt.InferShapeTester):
             # The gradient should be 0
             utt.assert_allclose(g_val, 0)
         else:
-            for var, grval in zip((b, i, d), g_val):
+            for var, grval in zip((b, i, d), g_val, strict=True):
                 float_inputs = []
                 if var.dtype in int_dtypes:
                     pass
@@ -775,6 +777,7 @@ class TestAlloc:
                 # AdvancedIncSubtensor
                 (some_matrix[idx, idx], 1),
             ],
+            strict=True,
         ):
             derp = pt_sum(dense_dot(subtensor, variables))
 
@@ -848,10 +851,15 @@ class TestAlloc:
             inp = np.zeros(shp, dtype=config.floatX)
             assert np.allclose(zeros_tensor(inp), np.zeros(shp))
 
-    def test_full(self):
-        full_pt = ptb.full((2, 3), 3, dtype="int64")
+    @pytest.mark.parametrize(
+        "shape", [(2, 3), 5, np.int32(5), np.array(5), constant(5)]
+    )
+    def test_full(self, shape):
+        full_pt = ptb.full(shape, 3, dtype="int64")
         res = pytensor.function([], full_pt, mode=self.mode)()
-        assert np.array_equal(res, np.full((2, 3), 3, dtype="int64"))
+        if isinstance(shape, ptb.TensorVariable):
+            shape = shape.eval()
+        assert np.array_equal(res, np.full(shape, 3, dtype="int64"))
 
     @pytest.mark.parametrize("func", (ptb.zeros, ptb.empty))
     def test_rebuild(self, func):
@@ -912,8 +920,9 @@ def test_infer_static_shape():
     with pytest.raises(TypeError, match="^Shapes must be scalar integers.*"):
         infer_static_shape([constant(1.0)])
 
-    with config.change_flags(exception_verbosity="high"), pytest.raises(
-        TypeError, match=r"A\. x"
+    with (
+        config.change_flags(exception_verbosity="high"),
+        pytest.raises(TypeError, match=r"A\. x"),
     ):
         infer_static_shape([dscalar("x")])
 
@@ -930,38 +939,46 @@ def test_infer_static_shape():
     assert static_shape == (1,)
 
 
-# This is slow for the ('int8', 3) version.
-def test_eye():
-    def check(dtype, N, M_=None, k=0):
-        # PyTensor does not accept None as a tensor.
-        # So we must use a real value.
-        M = M_
-        # Currently DebugMode does not support None as inputs even if this is
-        # allowed.
-        if M is None and config.mode in ["DebugMode", "DEBUG_MODE"]:
-            M = N
-        N_symb = iscalar()
-        M_symb = iscalar()
-        k_symb = iscalar()
-        f = function([N_symb, M_symb, k_symb], eye(N_symb, M_symb, k_symb, dtype=dtype))
-        result = f(N, M, k)
-        assert np.allclose(result, np.eye(N, M_, k, dtype=dtype))
-        assert result.dtype == np.dtype(dtype)
+class TestEye:
+    # This is slow for the ('int8', 3) version.
+    def test_basic(self):
+        def check(dtype, N, M_=None, k=0):
+            # PyTensor does not accept None as a tensor.
+            # So we must use a real value.
+            M = M_
+            # Currently DebugMode does not support None as inputs even if this is
+            # allowed.
+            if M is None and config.mode in ["DebugMode", "DEBUG_MODE"]:
+                M = N
+            N_symb = iscalar()
+            M_symb = iscalar()
+            k_symb = iscalar()
+            f = function(
+                [N_symb, M_symb, k_symb], eye(N_symb, M_symb, k_symb, dtype=dtype)
+            )
+            result = f(N, M, k)
+            assert np.allclose(result, np.eye(N, M_, k, dtype=dtype))
+            assert result.dtype == np.dtype(dtype)
 
-    for dtype in ALL_DTYPES:
-        check(dtype, 3)
-        # M != N, k = 0
-        check(dtype, 3, 5)
-        check(dtype, 5, 3)
-        # N == M, k != 0
-        check(dtype, 3, 3, 1)
-        check(dtype, 3, 3, -1)
-        # N < M, k != 0
-        check(dtype, 3, 5, 1)
-        check(dtype, 3, 5, -1)
-        # N > M, k != 0
-        check(dtype, 5, 3, 1)
-        check(dtype, 5, 3, -1)
+        for dtype in ALL_DTYPES:
+            check(dtype, 3)
+            # M != N, k = 0
+            check(dtype, 3, 5)
+            check(dtype, 5, 3)
+            # N == M, k != 0
+            check(dtype, 3, 3, 1)
+            check(dtype, 3, 3, -1)
+            # N < M, k != 0
+            check(dtype, 3, 5, 1)
+            check(dtype, 3, 5, -1)
+            # N > M, k != 0
+            check(dtype, 5, 3, 1)
+            check(dtype, 5, 3, -1)
+
+    def test_static_output_type(self):
+        l = lscalar("l")
+        assert eye(5, 3, l).type.shape == (5, 3)
+        assert eye(1, l, 3).type.shape == (1, None)
 
 
 class TestTriangle:
@@ -1104,7 +1121,7 @@ class TestNonzero:
 
             assert np.allclose(res_matrix, np.vstack(np.nonzero(m)))
 
-            for i, j in zip(res_tuple, np.nonzero(m)):
+            for i, j in zip(res_tuple, np.nonzero(m), strict=True):
                 assert np.allclose(i, j)
 
         rand0d = np.empty(())
@@ -1315,7 +1332,7 @@ class TestJoinAndSplit:
         topo = f.maker.fgraph.toposort()
         assert [True for node in topo if isinstance(node.op, type(self.join_op))]
         variables = f()
-        if isinstance(variables, (tuple, list)) and len(variables) == 1:
+        if isinstance(variables, tuple | list) and len(variables) == 1:
             return variables[0]
         return variables
 
@@ -1326,7 +1343,7 @@ class TestJoinAndSplit:
         topo = f.maker.fgraph.toposort()
         assert [True for node in topo if isinstance(node.op, type(make_vector_op))]
         variables = f()
-        if isinstance(variables, (tuple, list)) and len(variables) == 1:
+        if isinstance(variables, tuple | list) and len(variables) == 1:
             return variables[0]
         return variables
 
@@ -2154,7 +2171,7 @@ class TestJoinAndSplit:
         )
         x_test = np.arange(5, dtype=config.floatX)
         res = f(x_test)
-        for r, expected in zip(res, ([], [0, 1, 2], [3, 4])):
+        for r, expected in zip(res, ([], [0, 1, 2], [3, 4]), strict=True):
             assert np.allclose(r, expected)
             if linker == "py":
                 assert r.base is x_test
@@ -2247,8 +2264,8 @@ def test_flatten_ndim_default():
     a = dmatrix()
     c = flatten(a)
     f = inplace_func([a], c)
-    a_val = _asarray([[0, 1, 2], [3, 4, 5]], dtype="float64")
-    c_val = _asarray([0, 1, 2, 3, 4, 5], dtype="float64")
+    a_val = np.asarray([[0, 1, 2], [3, 4, 5]], dtype="float64")
+    c_val = np.asarray([0, 1, 2, 3, 4, 5], dtype="float64")
     assert np.all(f(a_val) == c_val)
     f = inplace_func([a], c)
     assert np.all(f(a_val) == c_val)
@@ -2260,8 +2277,8 @@ def test_flatten_scalar():
     a = dscalar()
     c = flatten(a)
     f = inplace_func([a], c)
-    a_val = _asarray(3.0, dtype="float64")
-    c_val = _asarray([3.0], dtype="float64")
+    a_val = np.asarray(3.0, dtype="float64")
+    c_val = np.asarray([3.0], dtype="float64")
     assert np.all(f(a_val) == c_val)
     f = inplace_func([a], c)
     assert np.all(f(a_val) == c_val)
@@ -2273,8 +2290,8 @@ def test_flatten_ndim1():
     a = dmatrix()
     c = flatten(a, 1)
     f = inplace_func([a], c)
-    a_val = _asarray([[0, 1, 2], [3, 4, 5]], dtype="float64")
-    c_val = _asarray([0, 1, 2, 3, 4, 5], dtype="float64")
+    a_val = np.asarray([[0, 1, 2], [3, 4, 5]], dtype="float64")
+    c_val = np.asarray([0, 1, 2, 3, 4, 5], dtype="float64")
     assert np.all(f(a_val) == c_val)
     f = inplace_func([a], c)
     assert np.all(f(a_val) == c_val)
@@ -2286,7 +2303,7 @@ def test_flatten_ndim2():
     a = dmatrix()
     c = flatten(a, 2)
     f = inplace_func([a], c)
-    a_val = _asarray([[0, 1, 2], [3, 4, 5]], dtype="float64")
+    a_val = np.asarray([[0, 1, 2], [3, 4, 5]], dtype="float64")
     assert np.all(f(a_val) == a_val)
     f = inplace_func([a], c)
     assert np.all(f(a_val) == a_val)
@@ -2299,8 +2316,8 @@ def test_flatten_ndim2_of_3():
     a = TensorType("float64", shape=(None, None, None))()
     c = flatten(a, 2)
     f = inplace_func([a], c)
-    a_val = _asarray([[[0, 1], [2, 3]], [[4, 5], [6, 7]]], dtype="float64")
-    c_val = _asarray([[0, 1, 2, 3], [4, 5, 6, 7]], dtype="float64")
+    a_val = np.asarray([[[0, 1], [2, 3]], [[4, 5], [6, 7]]], dtype="float64")
+    c_val = np.asarray([[0, 1, 2, 3], [4, 5, 6, 7]], dtype="float64")
     assert np.all(f(a_val) == c_val)
     f = inplace_func([a], c)
     assert np.all(f(a_val) == c_val)
@@ -2379,8 +2396,8 @@ def test_tile():
     def run_tile(x, x_, reps, use_symbolic_reps):
         if use_symbolic_reps:
             rep_symbols = [iscalar() for _ in range(len(reps))]
-            f = function([x] + rep_symbols, tile(x, rep_symbols))
-            return f(*([x_] + list(reps)))
+            f = function([x, *rep_symbols], tile(x, rep_symbols))
+            return f(*([x_, *reps]))
         else:
             f = function([x], tile(x, reps))
             return f(x_)
@@ -2480,7 +2497,7 @@ def test_tile():
         # (3) ndim > len(reps)
         ndim_ = len(reps_) + 1
         f = function([x], tile(x, reps_, ndim_))
-        assert np.all(f(x_) == np.tile(x_, [1] + reps_))
+        assert np.all(f(x_) == np.tile(x_, [1, *reps_]))
 
         # reps is list, ndim > x.ndim > len(reps):
         r = [2, 3, 4, 5]
@@ -2488,7 +2505,7 @@ def test_tile():
             ndim_ = k + 1
             reps_ = r[: k - 1]
             f = function([x], tile(x, reps_, ndim_))
-            assert np.all(f(x_) == np.tile(x_, [1, 1] + reps_))
+            assert np.all(f(x_) == np.tile(x_, [1, 1, *reps_]))
 
         # error raising test: ndim not specified when reps is vector
         reps = ivector()
@@ -2935,8 +2952,8 @@ class TestNdGrid:
             mgrid[0:1:0.1, 1:10:1.0, 10:100:10.0],
             mgrid[0:2:1, 1:10:1, 10:100:10],
         )
-        for n, t in zip(nmgrid, tmgrid):
-            for ng, tg in zip(n, t):
+        for n, t in zip(nmgrid, tmgrid, strict=True):
+            for ng, tg in zip(n, t, strict=True):
                 utt.assert_allclose(ng, tg.eval())
 
     def test_ogrid_numpy_equiv(self):
@@ -2950,8 +2967,8 @@ class TestNdGrid:
             ogrid[0:1:0.1, 1:10:1.0, 10:100:10.0],
             ogrid[0:2:1, 1:10:1, 10:100:10],
         )
-        for n, t in zip(nogrid, togrid):
-            for ng, tg in zip(n, t):
+        for n, t in zip(nogrid, togrid, strict=True):
+            for ng, tg in zip(n, t, strict=True):
                 utt.assert_allclose(ng, tg.eval())
 
     def test_mgrid_pytensor_variable_numpy_equiv(self):
@@ -2963,8 +2980,10 @@ class TestNdGrid:
         timgrid = mgrid[l:2:1, 1:m:1, 10:100:n]
         ff = pytensor.function([i, j, k], tfmgrid)
         fi = pytensor.function([l, m, n], timgrid)
-        for n, t in zip((nfmgrid, nimgrid), (ff(0, 10, 10.0), fi(0, 10, 10))):
-            for ng, tg in zip(n, t):
+        for n, t in zip(
+            (nfmgrid, nimgrid), (ff(0, 10, 10.0), fi(0, 10, 10)), strict=True
+        ):
+            for ng, tg in zip(n, t, strict=True):
                 utt.assert_allclose(ng, tg)
 
     def test_ogrid_pytensor_variable_numpy_equiv(self):
@@ -2976,8 +2995,10 @@ class TestNdGrid:
         tiogrid = ogrid[l:2:1, 1:m:1, 10:100:n]
         ff = pytensor.function([i, j, k], tfogrid)
         fi = pytensor.function([l, m, n], tiogrid)
-        for n, t in zip((nfogrid, niogrid), (ff(0, 10, 10.0), fi(0, 10, 10))):
-            for ng, tg in zip(n, t):
+        for n, t in zip(
+            (nfogrid, niogrid), (ff(0, 10, 10.0), fi(0, 10, 10)), strict=True
+        ):
+            for ng, tg in zip(n, t, strict=True):
                 utt.assert_allclose(ng, tg)
 
 
@@ -3022,7 +3043,7 @@ class TestInversePermutation:
         assert np.all(f_inverse(inv_val) == p_val)
         # Check that, for each permutation,
         # permutation(inverse) == inverse(permutation) = identity
-        for p_row, i_row in zip(p_val, inv_val):
+        for p_row, i_row in zip(p_val, inv_val, strict=True):
             assert np.all(p_row[i_row] == np.arange(10))
             assert np.all(i_row[p_row] == np.arange(10))
 
@@ -3088,7 +3109,9 @@ class TestPermuteRowElements:
 
         # Each row of p contains a permutation to apply to the corresponding
         # row of input
-        out_bis = np.asarray([i_row[p_row] for i_row, p_row in zip(input_val, p_val)])
+        out_bis = np.asarray(
+            [i_row[p_row] for i_row, p_row in zip(input_val, p_val, strict=True)]
+        )
         assert np.all(out_val == out_bis)
 
         # Verify gradient
@@ -3156,7 +3179,7 @@ def test_stack():
     sx, sy = dscalar(), dscalar()
 
     rval = inplace_func([sx, sy], stack([sx, sy]))(-4.0, -2.0)
-    assert type(rval) == np.ndarray
+    assert type(rval) is np.ndarray
     assert [-4, -2] == list(rval)
 
 
@@ -3223,8 +3246,8 @@ def test_autocast_custom():
     with autocast_float_as("float32"):
         assert (dvector() + 1.1).dtype == "float64"
         assert (fvector() + 1.1).dtype == "float32"
-        assert (fvector() + _asarray(1.1, dtype="float64")).dtype == "float64"
-        assert (fvector() + _asarray(1.1, dtype="float32")).dtype == "float32"
+        assert (fvector() + np.asarray(1.1, dtype="float64")).dtype == "float64"
+        assert (fvector() + np.asarray(1.1, dtype="float32")).dtype == "float32"
 
         assert (dvector() + 1).dtype == "float64"
         assert (fvector() + 1).dtype == "float32"
@@ -3234,8 +3257,8 @@ def test_autocast_custom():
         assert (dvector() + 1.1).dtype == "float64"
         assert (fvector() + 1.1).dtype == "float64"
         assert (fvector() + 1.0).dtype == "float64"
-        assert (fvector() + _asarray(1.1, dtype="float64")).dtype == "float64"
-        assert (fvector() + _asarray(1.1, dtype="float32")).dtype == "float32"
+        assert (fvector() + np.asarray(1.1, dtype="float64")).dtype == "float64"
+        assert (fvector() + np.asarray(1.1, dtype="float32")).dtype == "float32"
 
         assert (dvector() + 1).dtype == "float64"
         assert (fvector() + 1).dtype == "float32"
@@ -3247,10 +3270,10 @@ def test_autocast_custom():
         assert (fvector() + 1.0).dtype == "float32"
         assert (dvector() + np.float32(1.1)).dtype == "float64"
         assert (dvector() + np.float64(1.1)).dtype == "float64"
-        assert (dvector() + float(1.1)).dtype == "float64"
+        assert (dvector() + 1.1).dtype == "float64"
         assert (fvector() + np.float32(1.1)).dtype == "float32"
         assert (fvector() + np.float64(1.1)).dtype == "float64"
-        assert (fvector() + float(1.1)).dtype == config.floatX
+        assert (fvector() + 1.1).dtype == config.floatX
         assert (lvector() + np.int64(1)).dtype == "int64"
         assert (lvector() + np.int32(1)).dtype == "int64"
         assert (lvector() + np.int16(1)).dtype == "int64"
@@ -3272,9 +3295,7 @@ def test_autocast_numpy():
     def ok(z):
         assert constant(z).dtype == np.asarray(z).dtype
 
-    for x in (
-        [2**i for i in range(63)] + [0, 0, 1, 2**63 - 1] + [0.0, 1.0, 1.1, 1.5]
-    ):
+    for x in [2**i for i in range(63)] + [0, 0, 1, 2**63 - 1] + [0.0, 1.0, 1.1, 1.5]:
         n_x = np.asarray(x)
         # Make sure the data type is the same as the one found by numpy.
         ok(x)
@@ -3303,9 +3324,7 @@ def test_autocast_numpy_floatX():
         # into int64, as that is the maximal integer type that PyTensor
         # supports, and that is the maximal type in Python indexing.
         for x in (
-            [2**i - 1 for i in range(64)]
-            + [0, 0, 1, 2**63 - 1]
-            + [0.0, 1.0, 1.1, 1.5]
+            [2**i - 1 for i in range(64)] + [0, 0, 1, 2**63 - 1] + [0.0, 1.0, 1.1, 1.5]
         ):
             with config.change_flags(floatX=floatX):
                 ok(x, floatX)
@@ -3405,7 +3424,7 @@ def test_unalign():
 def test_dimshuffle_duplicate():
     x = vector()
     with pytest.raises(ValueError, match="may not appear twice"):
-        DimShuffle((False,), (0, 0))(x)
+        DimShuffle(input_ndim=1, new_order=(0, 0))(x)
 
 
 class TestGetUnderlyingScalarConstantValue:
@@ -3781,6 +3800,18 @@ class TestAllocDiag:
                 )
                 assert np.all(true_grad_input == grad_input)
 
+    def test_multiple_ops_same_graph(self):
+        """Regression test when AllocDiag OFG was given insufficient props, causing incompatible Ops to be merged."""
+        v1 = vector("v1", shape=(2,), dtype="float64")
+        v2 = vector("v2", shape=(3,), dtype="float64")
+        a1 = alloc_diag(v1)
+        a2 = alloc_diag(v2)
+
+        fn = function([v1, v2], [a1, a2])
+        res1, res2 = fn(v1=[np.e, np.e], v2=[np.pi, np.pi, np.pi])
+        np.testing.assert_allclose(res1, np.eye(2) * np.e)
+        np.testing.assert_allclose(res2, np.eye(3) * np.pi)
+
 
 def test_diagonal_negative_axis():
     x = np.arange(2 * 3 * 3).reshape((2, 3, 3))
@@ -3816,6 +3847,7 @@ def test_transpose():
     )
 
     t1, t2, t3, t1b, t2b, t3b, t2c, t3c, t2d, t3d = f(x1v, x2v, x3v)
+
     assert t1.shape == np.transpose(x1v).shape
     assert t2.shape == np.transpose(x2v).shape
     assert t3.shape == np.transpose(x3v).shape
@@ -3834,11 +3866,30 @@ def test_transpose():
     assert np.all(t2d == np.transpose(x2v, [0, 1]))
     assert np.all(t3d == np.transpose(x3v, [0, 2, 1]))
 
+    # Check we don't introduce useless transpose
+    assert ptb.transpose(x1) is x1
+
     # Check that we create a name.
-    assert ptb.transpose(x1).name == "x1.T"
     assert ptb.transpose(x2).name == "x2.T"
     assert ptb.transpose(x3).name == "x3.T"
     assert ptb.transpose(dmatrix()).name is None
+
+
+def test_matrix_transpose():
+    with pytest.raises(ValueError, match="Input array must be at least 2-dimensional"):
+        ptb.matrix_transpose(dvector("x1"))
+
+    x2 = dmatrix("x2")
+    x3 = dtensor3("x3")
+
+    var1 = ptb.matrix_transpose(x2)
+    expected_var1 = swapaxes(x2, -1, -2)
+
+    var2 = x3.mT
+    expected_var2 = swapaxes(x3, -1, -2)
+
+    assert equal_computations([var1], [expected_var1])
+    assert equal_computations([var2], [expected_var2])
 
 
 def test_stacklists():
@@ -4545,3 +4596,94 @@ def test_vectorize_extract_diag():
         vectorize_pt(x_test),
         vectorize_np(x_test),
     )
+
+
+@pytest.mark.parametrize(
+    "batch_shapes",
+    [
+        ((3,),),  # edge case of make_vector with a single input
+        ((), (), ()),  # Useless
+        ((3,), (3,), (3,)),  # No broadcasting needed
+        ((3,), (5, 3), ()),  # Broadcasting needed
+    ],
+)
+def test_vectorize_make_vector(batch_shapes):
+    n_inputs = len(batch_shapes)
+    input_sig = ",".join(["()"] * n_inputs)
+    signature = f"{input_sig}->({n_inputs})"  # Something like "(),(),()->(3)"
+
+    def core_pt(*scalars):
+        out = stack(scalars)
+        out.dprint()
+        return out
+
+    def core_np(*scalars):
+        return np.stack(scalars)
+
+    tensors = [tensor(shape=shape) for shape in batch_shapes]
+
+    vectorize_pt = function(tensors, vectorize(core_pt, signature=signature)(*tensors))
+    assert not any(
+        isinstance(node.op, Blockwise) for node in vectorize_pt.maker.fgraph.apply_nodes
+    )
+
+    test_values = [
+        np.random.normal(size=tensor.type.shape).astype(tensor.type.dtype)
+        for tensor in tensors
+    ]
+
+    np.testing.assert_allclose(
+        vectorize_pt(*test_values),
+        np.vectorize(core_np, signature=signature)(*test_values),
+    )
+
+
+@pytest.mark.parametrize("axis", [constant(1), constant(-2), shared(1)])
+@pytest.mark.parametrize("broadcasting_y", ["none", "implicit", "explicit"])
+@config.change_flags(cxx="")  # C code not needed
+def test_vectorize_join(axis, broadcasting_y):
+    # Signature for join along intermediate axis
+    signature = "(a,b1,c),(a,b2,c)->(a,b,c)"
+
+    def core_pt(x, y):
+        return join(axis, x, y)
+
+    def core_np(x, y):
+        return np.concatenate([x, y], axis=axis.eval())
+
+    x = tensor(shape=(4, 2, 3, 5))
+    y_shape = {"none": (4, 2, 3, 5), "implicit": (2, 3, 5), "explicit": (1, 2, 3, 5)}
+    y = tensor(shape=y_shape[broadcasting_y])
+
+    vectorize_pt = function([x, y], vectorize(core_pt, signature=signature)(x, y))
+
+    blockwise_needed = isinstance(axis, SharedVariable) or broadcasting_y != "none"
+    has_blockwise = any(
+        isinstance(node.op, Blockwise) for node in vectorize_pt.maker.fgraph.apply_nodes
+    )
+    assert has_blockwise == blockwise_needed
+
+    x_test = np.random.normal(size=x.type.shape).astype(x.type.dtype)
+    y_test = np.random.normal(size=y.type.shape).astype(y.type.dtype)
+    vectorize_np = np.vectorize(core_np, signature=signature)
+    np.testing.assert_allclose(
+        vectorize_pt(x_test, y_test),
+        vectorize_np(x_test, y_test),
+    )
+
+
+def test_where():
+    a = np.arange(10)
+    cond = a < 5
+    ift = np.pi
+    iff = np.e
+    # Test for all 3 inputs
+    np.testing.assert_allclose(np.where(cond, ift, iff), where(cond, ift, iff).eval())
+
+    # Test for only condition input
+    for np_output, pt_output in zip(np.where(cond), where(cond), strict=True):
+        np.testing.assert_allclose(np_output, pt_output.eval())
+
+    # Test for error
+    with pytest.raises(ValueError, match="either both"):
+        where(cond, ift)

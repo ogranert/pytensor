@@ -3,34 +3,33 @@ import pytest
 
 import pytensor.tensor as pt
 from pytensor import config, function
-from pytensor.gradient import NullTypeGradError, grad
-from pytensor.graph.replace import vectorize_node
+from pytensor.graph.replace import vectorize_graph
 from pytensor.raise_op import Assert
 from pytensor.tensor.math import eq
 from pytensor.tensor.random import normal
-from pytensor.tensor.random.op import RandomState, RandomVariable, default_rng
+from pytensor.tensor.random.basic import NormalRV
+from pytensor.tensor.random.op import RandomVariable, default_rng
 from pytensor.tensor.shape import specify_shape
-from pytensor.tensor.type import all_dtypes, iscalar, tensor
+from pytensor.tensor.type import iscalar, tensor
 
 
-@pytest.fixture(scope="module", autouse=True)
-def set_pytensor_flags():
+@pytest.fixture(scope="function", autouse=False)
+def strict_test_value_flags():
     with config.change_flags(cxx="", compute_test_value="raise"):
         yield
 
 
-def test_RandomVariable_basics():
+def test_RandomVariable_basics(strict_test_value_flags):
     str_res = str(
         RandomVariable(
             "normal",
-            0,
-            [0, 0],
-            "float32",
-            inplace=True,
+            signature="(),()->()",
+            dtype="float32",
+            inplace=False,
         )
     )
 
-    assert str_res == "normal_rv{0, (0, 0), float32, True}"
+    assert str_res == 'normal_rv{"(),()->()"}'
 
     # `ndims_params` should be a `Sequence` type
     with pytest.raises(TypeError, match="^Parameter ndims_params*"):
@@ -52,21 +51,10 @@ def test_RandomVariable_basics():
             inplace=True,
         )(0, 1, size={1, 2})
 
-    # No dtype
-    with pytest.raises(TypeError, match="^dtype*"):
-        RandomVariable(
-            "normal",
-            0,
-            [0, 0],
-            inplace=True,
-        )(0, 1)
-
     # Confirm that `inplace` works
     rv = RandomVariable(
         "normal",
-        0,
-        [0, 0],
-        "normal",
+        signature="(),()->()",
         inplace=True,
     )
 
@@ -74,28 +62,31 @@ def test_RandomVariable_basics():
     assert rv.destroy_map == {0: [0]}
 
     # A no-params `RandomVariable`
-    rv = RandomVariable(name="test_rv", ndim_supp=0, ndims_params=())
+    rv = RandomVariable(name="test_rv", signature="->()")
 
     with pytest.raises(TypeError):
         rv.make_node(rng=1)
 
     # `RandomVariable._infer_shape` should handle no parameters
     rv_shape = rv._infer_shape(pt.constant([]), (), [])
-    assert rv_shape.equals(pt.constant([], dtype="int64"))
+    assert rv_shape == ()
 
-    # Integer-specified `dtype`
-    dtype_1 = all_dtypes[1]
-    rv_node = rv.make_node(None, None, 1)
-    rv_out = rv_node.outputs[1]
-    rv_out.tag.test_value = 1
+    # `dtype` is respected
+    rv = RandomVariable("normal", signature="(),()->()", dtype="int32")
+    with config.change_flags(compute_test_value="off"):
+        rv_out = rv(0, 0)
+        assert rv_out.dtype == "int32"
+        rv_out = rv(0, 0, dtype="int64")
+        assert rv_out.dtype == "int64"
 
-    assert rv_out.dtype == dtype_1
+        with pytest.raises(
+            ValueError,
+            match="Cannot change the dtype of a normal RV from int32 to float32",
+        ):
+            assert rv(0, 0, dtype="float32").dtype == "float32"
 
-    with pytest.raises(NullTypeGradError):
-        grad(rv_out, [rv_node.inputs[0]])
 
-
-def test_RandomVariable_bcast():
+def test_RandomVariable_bcast(strict_test_value_flags):
     rv = RandomVariable("normal", 0, [0, 0], config.floatX, inplace=True)
 
     mu = tensor(dtype=config.floatX, shape=(1, None, None))
@@ -125,7 +116,7 @@ def test_RandomVariable_bcast():
     assert res.broadcastable == (True, False)
 
 
-def test_RandomVariable_bcast_specify_shape():
+def test_RandomVariable_bcast_specify_shape(strict_test_value_flags):
     rv = RandomVariable("normal", 0, [0, 0], config.floatX, inplace=True)
 
     s1 = pt.as_tensor(1, dtype=np.int64)
@@ -146,7 +137,7 @@ def test_RandomVariable_bcast_specify_shape():
     assert res.type.shape == (1, None, None, None, 1)
 
 
-def test_RandomVariable_floatX():
+def test_RandomVariable_floatX(strict_test_value_flags):
     test_rv_op = RandomVariable(
         "normal",
         0,
@@ -168,31 +159,26 @@ def test_RandomVariable_floatX():
 @pytest.mark.parametrize(
     "seed, maker_op, numpy_res",
     [
-        (3, RandomState, np.random.RandomState(3)),
         (3, default_rng, np.random.default_rng(3)),
     ],
 )
-def test_random_maker_op(seed, maker_op, numpy_res):
+def test_random_maker_op(strict_test_value_flags, seed, maker_op, numpy_res):
     seed = pt.as_tensor_variable(seed)
     z = function(inputs=[], outputs=[maker_op(seed)])()
     aes_res = z[0]
     assert maker_op.random_type.values_eq(aes_res, numpy_res)
 
 
-def test_random_maker_ops_no_seed():
+def test_random_maker_ops_no_seed(strict_test_value_flags):
     # Testing the initialization when seed=None
     # Since internal states randomly generated,
     # we just check the output classes
-    z = function(inputs=[], outputs=[RandomState()])()
-    aes_res = z[0]
-    assert isinstance(aes_res, np.random.RandomState)
-
     z = function(inputs=[], outputs=[default_rng()])()
     aes_res = z[0]
     assert isinstance(aes_res, np.random.Generator)
 
 
-def test_RandomVariable_incompatible_size():
+def test_RandomVariable_incompatible_size(strict_test_value_flags):
     rv_op = RandomVariable("normal", 0, [0, 0], config.floatX, inplace=True)
     with pytest.raises(
         ValueError, match="Size length is incompatible with batched dimensions"
@@ -216,7 +202,6 @@ class MultivariateRandomVariable(RandomVariable):
         return [dist_params[0].shape[-1]]
 
 
-@config.change_flags(compute_test_value="off")
 def test_multivariate_rv_infer_static_shape():
     """Test that infer shape for multivariate random variable works when a parameter must be broadcasted."""
     mv_op = MultivariateRandomVariable()
@@ -242,35 +227,93 @@ def test_multivariate_rv_infer_static_shape():
     assert mv_op(param1, param2, size=(10, 2)).type.shape == (10, 2, 3)
 
 
-def test_vectorize_node():
+def test_vectorize():
     vec = tensor(shape=(None,))
-    vec.tag.test_value = [0, 0, 0]
     mat = tensor(shape=(None, None))
-    mat.tag.test_value = [[0, 0, 0], [1, 1, 1]]
 
     # Test without size
-    node = normal(vec).owner
-    new_inputs = node.inputs.copy()
-    new_inputs[3] = mat
-    vect_node = vectorize_node(node, *new_inputs)
-    assert vect_node.op is normal
-    assert vect_node.inputs[3] is mat
+    out = normal(vec)
+    vect_node = vectorize_graph(out, {vec: mat}).owner
+    assert isinstance(vect_node.op, NormalRV)
+    assert vect_node.op.dist_params(vect_node)[0] is mat
 
     # Test with size, new size provided
-    node = normal(vec, size=(3,)).owner
-    new_inputs = node.inputs.copy()
-    new_inputs[1] = (2, 3)
-    new_inputs[3] = mat
-    vect_node = vectorize_node(node, *new_inputs)
-    assert vect_node.op is normal
-    assert tuple(vect_node.inputs[1].eval()) == (2, 3)
-    assert vect_node.inputs[3] is mat
+    size = pt.as_tensor(np.array((3,), dtype="int64"))
+    out = normal(vec, size=size)
+    vect_node = vectorize_graph(out, {vec: mat, size: (2, 3)}).owner
+    assert isinstance(vect_node.op, NormalRV)
+    assert tuple(vect_node.op.size_param(vect_node).eval()) == (2, 3)
+    assert vect_node.op.dist_params(vect_node)[0] is mat
 
     # Test with size, new size not provided
-    node = normal(vec, size=(3,)).owner
-    new_inputs = node.inputs.copy()
-    new_inputs[3] = mat
-    vect_node = vectorize_node(node, *new_inputs)
-    assert vect_node.op is normal
-    assert vect_node.inputs[3] is mat
-    assert tuple(vect_node.inputs[1].eval({mat: mat.tag.test_value})) == (2, 3)
+    out = normal(vec, size=(3,))
+    vect_node = vectorize_graph(out, {vec: mat}).owner
+    assert isinstance(vect_node.op, NormalRV)
+    assert vect_node.op.dist_params(vect_node)[0] is mat
+    assert tuple(
+        vect_node.op.size_param(vect_node).eval(
+            {mat: np.zeros((2, 3), dtype=config.floatX)}
+        )
+    ) == (2, 3)
+
+    # Test parameter broadcasting
+    mu = vec
+    sigma = pt.as_tensor(np.array(1.0))
+    out = normal(mu, sigma)
+    new_mu = tensor("mu", shape=(10, 5))
+    new_sigma = tensor("sigma", shape=(10,))
+    vect_node = vectorize_graph(out, {mu: new_mu, sigma: new_sigma}).owner
+    assert isinstance(vect_node.op, NormalRV)
+    assert vect_node.default_output().type.shape == (10, 5)
+
+    # Test parameter broadcasting with non-expanding size
+    mu = vec
+    sigma = pt.as_tensor(np.array(1.0))
+    out = normal(mu, sigma, size=(5,))
+    new_mu = tensor("mu", shape=(10, 5))
+    new_sigma = tensor("sigma", shape=(10,))
+    vect_node = vectorize_graph(out, {mu: new_mu, sigma: new_sigma}).owner
+    assert isinstance(vect_node.op, NormalRV)
+    assert vect_node.default_output().type.shape == (10, 5)
+
+    mu = vec
+    sigma = pt.as_tensor(np.array(1.0))
+    out = normal(mu, sigma, size=(5,))
+    new_mu = tensor("mu", shape=(1, 5))  # mu
+    new_sigma = tensor("sigma", shape=(10,))  # sigma
+    vect_node = vectorize_graph(out, {mu: new_mu, sigma: new_sigma}).owner
+    assert isinstance(vect_node.op, NormalRV)
+    assert vect_node.default_output().type.shape == (10, 5)
+
+    # Test parameter broadcasting with expanding size
+    mu = vec
+    sigma = pt.as_tensor(np.array(1.0))
+    out = normal(mu, sigma, size=(2, 5))
+    new_mu = tensor("mu", shape=(1, 5))
+    new_sigma = tensor("sigma", shape=(10,))
+    vect_node = vectorize_graph(out, {mu: new_mu, sigma: new_sigma}).owner
+    assert isinstance(vect_node.op, NormalRV)
+    assert vect_node.default_output().type.shape == (10, 2, 5)
+
+
+def test_vectorize_empty_size():
+    scalar_mu = pt.scalar("scalar_mu")
+    scalar_x = pt.random.normal(loc=scalar_mu, size=())
+    assert scalar_x.type.shape == ()
+
+    vector_mu = pt.vector("vector_mu", shape=(5,))
+    vector_x = vectorize_graph(scalar_x, {scalar_mu: vector_mu})
+    assert vector_x.type.shape == (5,)
+
+
+def test_size_none_vs_empty():
+    rv = RandomVariable(
+        "normal",
+        signature="(),()->()",
+    )
+    assert rv([0], [1], size=None).type.shape == (1,)
+
+    with pytest.raises(
+        ValueError, match="Size length is incompatible with batched dimensions"
+    ):
+        rv([0], [1], size=())

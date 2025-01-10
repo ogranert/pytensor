@@ -1,19 +1,19 @@
 """
-  Questions and notes about scan that should be answered :
+Questions and notes about scan that should be answered :
 
-   * Scan seems to do copies of every input variable. Is that needed?
-   answer : probably not, but it doesn't hurt also ( what we copy is
-   pytensor variables, which just cary information about the type / dimension
-   of the data)
+ * Scan seems to do copies of every input variable. Is that needed?
+ answer : probably not, but it doesn't hurt also ( what we copy is
+ pytensor variables, which just cary information about the type / dimension
+ of the data)
 
-   * There is some of scan functionality that is not well documented
+ * There is some of scan functionality that is not well documented
 """
 
 import os
 import pickle
 import shutil
 import sys
-from collections import OrderedDict
+from pathlib import Path
 from tempfile import mkdtemp
 
 import numpy as np
@@ -33,15 +33,13 @@ from pytensor.graph.fg import FunctionGraph
 from pytensor.graph.op import Op
 from pytensor.graph.rewriting.basic import MergeOptimizer
 from pytensor.graph.utils import MissingInputError
-from pytensor.misc.safe_asarray import _asarray
 from pytensor.raise_op import assert_op
 from pytensor.scan.basic import scan
 from pytensor.scan.op import Scan
 from pytensor.scan.utils import until
 from pytensor.tensor.math import all as pt_all
-from pytensor.tensor.math import dot, exp, mean, sigmoid
+from pytensor.tensor.math import dot, exp, mean, sigmoid, tanh
 from pytensor.tensor.math import sum as pt_sum
-from pytensor.tensor.math import tanh
 from pytensor.tensor.random import normal
 from pytensor.tensor.random.utils import RandomStream
 from pytensor.tensor.shape import Shape_i, reshape, specify_shape
@@ -106,7 +104,7 @@ class multiple_outputs_numeric_grad:
                 rval *= i
             return rval
 
-        if not isinstance(pt, (list, tuple)):
+        if not isinstance(pt, list | tuple):
             pt = [pt]
 
         # This mask tells us if we are dealing with an ndarray input or
@@ -175,11 +173,10 @@ class multiple_outputs_numeric_grad:
             raise ValueError("argument has wrong number of elements", len(g_pt))
         errs = []
 
-        for i, (a, b) in enumerate(zip(g_pt, self.gx)):
+        for i, (a, b) in enumerate(zip(g_pt, self.gx, strict=True)):
             if a.shape != b.shape:
                 raise ValueError(
-                    "argument element %i has wrong shape %s"
-                    % (i, str((a.shape, b.shape)))
+                    f"argument element {i} has wrong shape {(a.shape, b.shape)}"
                 )
             errs.append(np.max(multiple_outputs_numeric_grad.abs_rel_err(a, b)))
         if np.all(np.isfinite(errs)):
@@ -197,18 +194,21 @@ class multiple_outputs_numeric_grad:
 def scan_project_sum(*args, **kwargs):
     rng = RandomStream(123)
     scan_outputs, updates = scan(*args, **kwargs)
-    if not isinstance(scan_outputs, (list, tuple)):
+    if not isinstance(scan_outputs, list | tuple):
         scan_outputs = [scan_outputs]
     # we should ignore the random-state updates so that
     # the uniform numbers are the same every evaluation and on every call
     rng.add_default_updates = False
     factors = [rng.uniform(0.1, 0.9, size=s.shape) for s in scan_outputs]
     # Random values (?)
-    return (sum((s * f).sum() for s, f in zip(scan_outputs, factors)), updates)
+    return (
+        sum((s * f).sum() for s, f in zip(scan_outputs, factors, strict=True)),
+        updates,
+    )
 
 
 def asarrayX(value):
-    return _asarray(value, dtype=config.floatX)
+    return np.asarray(value, dtype=config.floatX)
 
 
 def clone_optimized_graph(f):
@@ -230,7 +230,7 @@ def grab_scan_node(output):
         ri = grab_scan_node(i)
         if ri is not None:
             rval += ri
-    if rval is []:
+    if rval == []:
         return None
     else:
         return rval
@@ -245,10 +245,7 @@ def scan_nodes_from_fct(fct):
 class TestScan:
     @pytest.mark.parametrize(
         "rng_type",
-        [
-            np.random.default_rng,
-            np.random.RandomState,
-        ],
+        [np.random.default_rng],
     )
     def test_inner_graph_cloning(self, rng_type):
         r"""Scan should remove the updates-providing special properties on `RandomType`\s."""
@@ -332,15 +329,15 @@ class TestScan:
             [state, n_steps], output, updates=updates, allow_input_downcast=True
         )
 
-        origdir = os.getcwd()
+        origdir = Path.cwd()
         tmpdir = None
         try:
             tmpdir = mkdtemp()
             os.chdir(tmpdir)
 
-            with open("tmp_scan_test_pickle.pkl", "wb") as f_out:
+            with Path("tmp_scan_test_pickle.pkl").open("wb") as f_out:
                 pickle.dump(_my_f, f_out, protocol=-1)
-            with open("tmp_scan_test_pickle.pkl", "rb") as f_in:
+            with Path("tmp_scan_test_pickle.pkl").open("rb") as f_in:
                 my_f = pickle.load(f_in)
         finally:
             # Get back to the original dir, and delete the temporary one.
@@ -768,11 +765,9 @@ class TestScan:
         b = shared(np.random.default_rng(utt.fetch_seed()).random((5, 4)))
 
         def inner_func(a):
-            return a + 1, OrderedDict([(b, 2 * b)])
+            return a + 1, {b: 2 * b}
 
-        out, updates = scan(
-            inner_func, outputs_info=[OrderedDict([("initial", init_a)])], n_steps=1
-        )
+        out, updates = scan(inner_func, outputs_info=[{"initial": init_a}], n_steps=1)
         out = out[-1]
         assert out.type.ndim == a.type.ndim
         assert updates[b].type.ndim == b.type.ndim
@@ -938,7 +933,7 @@ class TestScan:
         state = shared(v_state, "vstate")
 
         def f_2():
-            return OrderedDict([(state, 2 * state)])
+            return {state: 2 * state}
 
         n_steps = iscalar("nstep")
         output, updates = scan(
@@ -972,7 +967,7 @@ class TestScan:
         X = shared(np.array(1))
 
         out, updates = scan(
-            lambda: OrderedDict([(X, (X + 1))]),
+            lambda: {X: (X + 1)},
             outputs_info=[],
             non_sequences=[],
             sequences=[],
@@ -988,7 +983,7 @@ class TestScan:
         y = shared(np.array(1))
 
         out, updates = scan(
-            lambda: OrderedDict([(x, x + 1), (y, x)]),
+            lambda: {x: x + 1, y: x},
             outputs_info=[],
             non_sequences=[],
             sequences=[],
@@ -1631,7 +1626,7 @@ class TestScan:
 
         # Also validate that the mappings outer_inp_from_outer_out and
         # outer_inp_from_inner_inp produce the correct results
-        scan_node = list(updates.values())[0].owner
+        scan_node = next(iter(updates.values())).owner
 
         var_mappings = scan_node.op.get_oinp_iinp_iout_oout_mappings()
         result = var_mappings["outer_inp_from_outer_out"]
@@ -1918,12 +1913,12 @@ class TestScan:
         shared_var = shared(np.float32(1.0))
 
         def inner_fn():
-            return [], OrderedDict([(shared_var, shared_var + np.float32(1.0))])
+            return [], {shared_var: shared_var + np.float32(1.0)}
 
         _, updates = scan(
             inner_fn, n_steps=10, truncate_gradient=-1, go_backwards=False
         )
-        cost = list(updates.values())[0]
+        cost = next(iter(updates.values()))
         g_sh = grad(cost, shared_var)
         fgrad = function([], g_sh)
         assert fgrad() == 1
@@ -2750,7 +2745,7 @@ class TestExamples:
 
         v1 = shared(np.ones(5, dtype=config.floatX))
         v2 = shared(np.ones((5, 5), dtype=config.floatX))
-        shapef = function([W], expr, givens=OrderedDict([(initial, v1), (inpt, v2)]))
+        shapef = function([W], expr, givens={initial: v1, inpt: v2})
         # First execution to cache n_steps
         shapef(np.ones((5, 5), dtype=config.floatX))
 
@@ -2759,7 +2754,7 @@ class TestExamples:
         f = function(
             [W, inpt],
             d_cost_wrt_W,
-            givens=OrderedDict([(initial, shared(np.zeros(5)))]),
+            givens={initial: shared(np.zeros(5))},
         )
 
         rval = np.asarray([[5187989] * 5] * 5, dtype=config.floatX)
@@ -2960,7 +2955,7 @@ class TestExamples:
 
         seq = matrix()
         initial_value = shared(np.zeros((4, 1), dtype=config.floatX))
-        outputs_info = [OrderedDict([("initial", initial_value), ("taps", [-4])]), None]
+        outputs_info = [{"initial": initial_value, "taps": [-4]}, None]
         results, updates = scan(fn=onestep, sequences=seq, outputs_info=outputs_info)
 
         f = function([seq], results[1])
@@ -2983,10 +2978,10 @@ class TestExamples:
 
         seq = matrix()
         initial_value = shared(np.zeros((4, 1), dtype=config.floatX))
-        outputs_info = [OrderedDict([("initial", initial_value), ("taps", [-4])]), None]
+        outputs_info = [{"initial": initial_value, "taps": [-4]}, None]
         results, _ = scan(fn=onestep, sequences=seq, outputs_info=outputs_info)
         sharedvar = shared(np.zeros((1, 1), dtype=config.floatX))
-        updates = OrderedDict([(sharedvar, results[0][-1:])])
+        updates = {sharedvar: results[0][-1:]}
 
         f = function([seq], results[1], updates=updates)
 
@@ -3851,7 +3846,7 @@ class TestExamples:
         gparams = grad(cost, params)
         updates = [
             (param, param - gparam * learning_rate)
-            for param, gparam in zip(params, gparams)
+            for param, gparam in zip(params, gparams, strict=True)
         ]
         learn_rnn_fn = function(inputs=[x, t], outputs=cost, updates=updates, mode=mode)
         function(inputs=[x], outputs=y, mode=mode)

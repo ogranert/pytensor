@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import numpy as np
 
 from pytensor.graph.basic import Apply, Constant
@@ -28,7 +30,7 @@ class LoadFromDisk(Op):
         if mmap_mode not in (None, "c"):
             raise ValueError(
                 "The only supported values for mmap_mode "
-                "are None and 'c', got %s" % mmap_mode
+                f"are None and 'c', got {mmap_mode}"
             )
         self.mmap_mode = mmap_mode
 
@@ -38,8 +40,8 @@ class LoadFromDisk(Op):
         return Apply(self, [path], [tensor(dtype=self.dtype, shape=self.shape)])
 
     def perform(self, node, inp, out):
-        path = inp[0]
-        if path.split(".")[-1] == "npz":
+        path = Path(inp[0])
+        if path.suffix != ".npy":
             raise ValueError(f"Expected a .npy file, got {path} instead")
         result = np.load(path, mmap_mode=self.mmap_mode)
         if result.dtype != self.dtype:
@@ -49,10 +51,8 @@ class LoadFromDisk(Op):
         out[0][0] = result
 
     def __str__(self):
-        return "Load{{dtype: {}, shape: {}, mmep: {}}}".format(
-            self.dtype,
-            self.shape,
-            self.mmap_mode,
+        return (
+            f"Load{{dtype: {self.dtype}, shape: {self.shape}, mmep: {self.mmap_mode}}}"
         )
 
 
@@ -80,8 +80,8 @@ def load(path, dtype, shape, mmap_mode=None):
     --------
     >>> from pytensor import *
     >>> path = Variable(Generic(), None)
-    >>> x = tensor.load(path, 'int64', (None,))
-    >>> y = x*2
+    >>> x = tensor.load(path, "int64", (None,))
+    >>> y = x * 2
     >>> fn = function([path], y)
     >>> fn("stored-array.npy")  # doctest: +SKIP
     array([0, 2, 4, 6, 8], dtype=int64)

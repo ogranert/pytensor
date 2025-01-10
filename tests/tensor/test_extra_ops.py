@@ -35,9 +35,6 @@ from pytensor.tensor.extra_ops import (
     diff,
     fill_diagonal,
     fill_diagonal_offset,
-    geomspace,
-    linspace,
-    logspace,
     ravel_multi_index,
     repeat,
     searchsorted,
@@ -332,7 +329,6 @@ class TestDiff(utt.InferShapeTester):
         g = pytensor.function([x], diff(x, n=n, axis=axis))
         assert np.allclose(np.diff(a, n=n, axis=axis), g(a))
 
-    @pytest.mark.xfail(reason="Subtensor shape cannot be inferred correctly")
     @pytest.mark.parametrize(
         "x_type",
         (
@@ -370,6 +366,7 @@ class TestSqueeze(utt.InferShapeTester):
                 [1, None, None],
                 [1, None, 1, 1, None],
             ],
+            strict=True,
         ),
     )
     def test_op(self, shape, var_shape):
@@ -393,6 +390,7 @@ class TestSqueeze(utt.InferShapeTester):
                 [1, None, None],
                 [1, None, 1, 1, None],
             ],
+            strict=True,
         ),
     )
     def test_infer_shape(self, shape, var_shape):
@@ -412,6 +410,7 @@ class TestSqueeze(utt.InferShapeTester):
                 [True, False, False],
                 [True, False, True, True, False],
             ],
+            strict=True,
         ),
     )
     def test_grad(self, shape, broadcast):
@@ -427,6 +426,7 @@ class TestSqueeze(utt.InferShapeTester):
                 [1, None, None],
                 [1, None, 1, 1, None],
             ],
+            strict=True,
         ),
     )
     def test_var_interface(self, shape, var_shape):
@@ -463,14 +463,6 @@ class TestSqueeze(utt.InferShapeTester):
 
         assert res.broadcastable == (False, True, False)
 
-    def test_invalid_axis(self):
-        # Test that trying to squeeze a non broadcastable dimension raises error
-        variable = TensorType(config.floatX, shape=(1, None))()
-        with pytest.raises(
-            ValueError, match="Cannot drop a non-broadcastable dimension"
-        ):
-            squeeze(variable, axis=1)
-
     def test_scalar_input(self):
         x = pt.scalar("x")
 
@@ -481,6 +473,22 @@ class TestSqueeze(utt.InferShapeTester):
             match=re.escape("axis (1,) is out of bounds for array of dimension 0"),
         ):
             squeeze(x, axis=1)
+
+    def test_invalid_input(self):
+        x = pt.vector("x")
+        axis = 0
+
+        f = pytensor.function([x], pt.squeeze(x, axis))
+
+        # Test that we allow squeezing of valid non-broadcastable dimension
+        assert f([0]) == 0
+
+        # Test that we cannot squeeze dimensions whose length is greater than 1
+        with pytest.raises(
+            ValueError,
+            match="cannot reshape array of size 3 into shape ()",
+        ):
+            f([0, 1, 2])
 
 
 class TestCompress(utt.InferShapeTester):
@@ -501,6 +509,7 @@ class TestCompress(utt.InferShapeTester):
                 [1, 1, 0, 1, 0],
             ],
             [(2, 3), (4, 3), (4, 3), (4, 3), (4, 3), (3, 5)],
+            strict=True,
         ),
     )
     def test_op(self, axis, cond, shape):
@@ -885,11 +894,13 @@ class TestUnique(utt.InferShapeTester):
             np.unique(inp, False, True, True, axis=axis),
             np.unique(inp, True, True, True, axis=axis),
         ]
-        for params, outs_expected in zip(self.op_params, list_outs_expected):
+        for params, outs_expected in zip(
+            self.op_params, list_outs_expected, strict=True
+        ):
             out = pt.unique(x, *params, axis=axis)
             f = pytensor.function(inputs=[x], outputs=out)
             outs = f(inp)
-            for out, out_exp in zip(outs, outs_expected):
+            for out, out_exp in zip(outs, outs_expected, strict=True):
                 utt.assert_allclose(out, out_exp)
 
     @pytest.mark.parametrize(
@@ -1058,7 +1069,7 @@ def test_broadcast_shape_basic():
         if use_bcast:
             return tuple(
                 s if not bcast else 1
-                for s, bcast in zip(tuple(x.shape), x.broadcastable)
+                for s, bcast in zip(tuple(x.shape), x.broadcastable, strict=True)
             )
         else:
             return tuple(s for s in tuple(x.shape))
@@ -1198,12 +1209,12 @@ def test_broadcast_shape_constants():
 def test_broadcast_shape_symbolic(s1_vals, s2_vals, exp_res):
     s1s = pt.lscalars(len(s1_vals))
     eval_point = {}
-    for s, s_val in zip(s1s, s1_vals):
+    for s, s_val in zip(s1s, s1_vals, strict=True):
         eval_point[s] = s_val
         s.tag.test_value = s_val
 
     s2s = pt.lscalars(len(s2_vals))
-    for s, s_val in zip(s2s, s2_vals):
+    for s, s_val in zip(s2s, s2_vals, strict=True):
         eval_point[s] = s_val
         s.tag.test_value = s_val
 
@@ -1270,25 +1281,37 @@ def test_broadcast_arrays():
 
 
 @pytest.mark.parametrize(
-    "start, stop, num_samples",
+    "op",
+    ["linspace", "logspace", "geomspace"],
+    ids=["linspace", "logspace", "geomspace"],
+)
+@pytest.mark.parametrize("dtype", [None, "int", "float"], ids=[None, "int", "float"])
+@pytest.mark.parametrize(
+    "start, stop, num_samples, endpoint, axis",
     [
-        (1, 10, 50),
-        (np.array([5, 6]), np.array([[10, 10], [10, 10]]), 25),
-        (1, np.array([5, 6]), 30),
+        (1, 10, 50, True, 0),
+        (1, 10, 1, True, 0),
+        (np.array([5, 6]), np.array([[10, 10], [10, 10]]), 25, True, 0),
+        (np.array([5, 6]), np.array([[10, 10], [10, 10]]), 25, True, 1),
+        (np.array([5, 6]), np.array([[10, 10], [10, 10]]), 25, False, -1),
+        (1, np.array([5, 6]), 30, True, 0),
+        (1, np.array([5, 6]), 30, False, -1),
     ],
 )
-def test_space_ops(start, stop, num_samples):
-    z = linspace(start, stop, num_samples)
-    pytensor_res = function(inputs=[], outputs=z)()
-    numpy_res = np.linspace(start, stop, num=num_samples)
-    assert np.allclose(pytensor_res, numpy_res)
+def test_space_ops(op, dtype, start, stop, num_samples, endpoint, axis):
+    pt_func = getattr(pt, op)
+    np_func = getattr(np, op)
+    dtype = dtype + config.floatX[-2:] if dtype is not None else dtype
+    z = pt_func(start, stop, num_samples, endpoint=endpoint, axis=axis, dtype=dtype)
 
-    z = logspace(start, stop, num_samples)
-    pytensor_res = function(inputs=[], outputs=z)()
-    numpy_res = np.logspace(start, stop, num=num_samples)
-    assert np.allclose(pytensor_res, numpy_res)
+    numpy_res = np_func(
+        start, stop, num=num_samples, endpoint=endpoint, dtype=dtype, axis=axis
+    )
+    pytensor_res = function(inputs=[], outputs=z, mode="FAST_COMPILE")()
 
-    z = geomspace(start, stop, num_samples)
-    pytensor_res = function(inputs=[], outputs=z)()
-    numpy_res = np.geomspace(start, stop, num=num_samples)
-    assert np.allclose(pytensor_res, numpy_res)
+    np.testing.assert_allclose(
+        pytensor_res,
+        numpy_res,
+        atol=1e-6 if config.floatX.endswith("64") else 1e-4,
+        rtol=1e-6 if config.floatX.endswith("64") else 1e-4,
+    )

@@ -1,11 +1,11 @@
-from typing import Callable, Optional
+from collections.abc import Callable
 
 from pytensor.graph import vectorize_graph
-from pytensor.tensor import TensorVariable
 from pytensor.tensor.utils import _parse_gufunc_signature
+from pytensor.tensor.variable import TensorVariable
 
 
-def vectorize(func: Callable, signature: Optional[str] = None) -> Callable:
+def vectorize(func: Callable, signature: str | None = None) -> Callable:
     """Create a vectorized version of a python function that takes TensorVariables as inputs and outputs.
 
     Similar to numpy.vectorize. See respective docstrings for more details.
@@ -39,8 +39,10 @@ def vectorize(func: Callable, signature: Optional[str] = None) -> Callable:
         import pytensor
         import pytensor.tensor as pt
 
+
         def func(x):
             return pt.exp(x) / pt.sum(pt.exp(x))
+
 
         vec_func = pt.vectorize(func, signature="(a)->(a)")
 
@@ -58,8 +60,10 @@ def vectorize(func: Callable, signature: Optional[str] = None) -> Callable:
         import pytensor
         import pytensor.tensor as pt
 
+
         def func(x):
             return x[0], x[-1]
+
 
         vec_func = pt.vectorize(func, signature="(a)->(),()")
 
@@ -85,7 +89,7 @@ def vectorize(func: Callable, signature: Optional[str] = None) -> Callable:
 
         # Create dummy core inputs by stripping the batched dimensions of inputs
         core_inputs = []
-        for input, input_sig in zip(inputs, inputs_sig):
+        for input, input_sig in zip(inputs, inputs_sig, strict=True):
             if not isinstance(input, TensorVariable):
                 raise TypeError(
                     f"Inputs to vectorize function must be TensorVariable, got {type(input)}"
@@ -109,7 +113,7 @@ def vectorize(func: Callable, signature: Optional[str] = None) -> Callable:
             raise ValueError("vectorize function returned no outputs")
 
         if signature is not None:
-            if isinstance(core_outputs, (list, tuple)):
+            if isinstance(core_outputs, list | tuple):
                 n_core_outputs = len(core_outputs)
             else:
                 n_core_outputs = 1
@@ -119,7 +123,9 @@ def vectorize(func: Callable, signature: Optional[str] = None) -> Callable:
                 )
 
         # Vectorize graph by replacing dummy core inputs by original inputs
-        outputs = vectorize_graph(core_outputs, replace=dict(zip(core_inputs, inputs)))
+        outputs = vectorize_graph(
+            core_outputs, replace=dict(zip(core_inputs, inputs, strict=True))
+        )
         return outputs
 
     return inner

@@ -6,7 +6,7 @@ from pytensor.typed_list.basic import Append, Extend, Insert, Remove, Reverse
 @node_rewriter([Append, Extend, Insert, Reverse, Remove], inplace=True)
 def typed_list_inplace_rewrite(fgraph, node):
     if (
-        isinstance(node.op, (Append, Extend, Insert, Reverse, Remove))
+        isinstance(node.op, Append | Extend | Insert | Reverse | Remove)
         and not node.op.inplace
     ):
         new_op = node.op.__class__(inplace=True)
@@ -22,5 +22,5 @@ optdb.register(
     ),
     "fast_run",
     "inplace",
-    position=60,
+    position=50.1,
 )

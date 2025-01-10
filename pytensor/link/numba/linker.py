@@ -1,25 +1,8 @@
-from typing import TYPE_CHECKING, Any
-
-import numpy as np
-
-import pytensor
 from pytensor.link.basic import JITLinker
-
-
-if TYPE_CHECKING:
-    from pytensor.graph.basic import Variable
 
 
 class NumbaLinker(JITLinker):
     """A `Linker` that JIT-compiles NumPy-based operations using Numba."""
-
-    def output_filter(self, var: "Variable", out: Any) -> Any:
-        if not isinstance(var, np.ndarray) and isinstance(
-            var.type, pytensor.tensor.TensorType
-        ):
-            return var.type.filter(out, allow_downcast=True)
-
-        return out
 
     def fgraph_convert(self, fgraph, **kwargs):
         from pytensor.link.numba.dispatch import numba_funcify
@@ -29,7 +12,7 @@ class NumbaLinker(JITLinker):
     def jit_compile(self, fn):
         from pytensor.link.numba.dispatch.basic import numba_njit
 
-        jitted_fn = numba_njit(fn)
+        jitted_fn = numba_njit(fn, no_cpython_wrapper=False, no_cfunc_wrapper=False)
         return jitted_fn
 
     def create_thunk_inputs(self, storage_map):

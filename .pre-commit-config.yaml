@@ -1,13 +1,15 @@
+ci:
+  autofix_prs: false
+
 exclude: |
     (?x)^(
         versioneer\.py|
         pytensor/_version\.py|
         doc/.*|
-        bin/.*
     )$
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v4.4.0
+    rev: v5.0.0
     hooks:
       - id: debug-statements
         exclude: |
@@ -19,51 +21,14 @@ repos:
               pytensor/tensor/variable\.py|
           )$
       - id: check-merge-conflict
-  - repo: https://github.com/asottile/pyupgrade
-    rev: v3.3.1
+  - repo: https://github.com/sphinx-contrib/sphinx-lint                                  
+    rev: v1.0.0                                                                          
+    hooks:                                                                               
+    - id: sphinx-lint 
+      args: ["."]
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.7.3
     hooks:
-      - id: pyupgrade
-        args: [--py39-plus]
-  - repo: https://github.com/psf/black
-    rev: 23.1.0
-    hooks:
-      - id: black
-        language_version: python3
-  - repo: https://github.com/pycqa/flake8
-    rev: 6.0.0
-    hooks:
-      - id: flake8
-        additional_dependencies:
-          - flake8-comprehensions
-  - repo: https://github.com/pycqa/isort
-    rev: 5.12.0
-    hooks:
-      - id: isort
-  - repo: https://github.com/humitos/mirrors-autoflake.git
-    rev: v1.1
-    hooks:
-      - id: autoflake
-        exclude: |
-          (?x)^(
-              .*/?__init__\.py|
-              pytensor/graph/toolbox\.py|
-              pytensor/link/jax/jax_dispatch\.py|
-              pytensor/link/jax/jax_linker\.py|
-              pytensor/scalar/basic_scipy\.py|
-              pytensor/tensor/linalg\.py
-          )$
-        args: ['--in-place', '--remove-all-unused-imports', '--remove-unused-variable']
-  - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.0.0
-    hooks:
-      - id: mypy
-        language: python
-        entry: python ./scripts/run_mypy.py --verbose
-        additional_dependencies:
-        - numpy>=1.20
-        - pandas
-        - types-filelock
-        - types-setuptools>=67.6.0.8
-        always_run: true
-        require_serial: true
-        pass_filenames: false
+      - id: ruff
+        args: ["--fix", "--output-format=full"]
+      - id: ruff-format

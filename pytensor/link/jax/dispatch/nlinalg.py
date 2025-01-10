@@ -1,13 +1,12 @@
 import jax.numpy as jnp
 
 from pytensor.link.jax.dispatch import jax_funcify
-from pytensor.tensor.blas import BatchedDot
-from pytensor.tensor.math import Dot, MaxAndArgmax
 from pytensor.tensor.nlinalg import (
     SVD,
     Det,
     Eig,
     Eigh,
+    KroneckerProduct,
     MatrixInverse,
     MatrixPinv,
     QRFull,
@@ -78,14 +77,6 @@ def jax_funcify_QRFull(op, **kwargs):
     return qr_full
 
 
-@jax_funcify.register(Dot)
-def jax_funcify_Dot(op, **kwargs):
-    def dot(x, y):
-        return jnp.dot(x, y)
-
-    return dot
-
-
 @jax_funcify.register(MatrixPinv)
 def jax_funcify_Pinv(op, **kwargs):
     def pinv(x):
@@ -94,49 +85,9 @@ def jax_funcify_Pinv(op, **kwargs):
     return pinv
 
 
-@jax_funcify.register(BatchedDot)
-def jax_funcify_BatchedDot(op, **kwargs):
-    def batched_dot(a, b):
-        if a.shape[0] != b.shape[0]:
-            raise TypeError("Shapes must match in the 0-th dimension")
-        return jnp.matmul(a, b)
+@jax_funcify.register(KroneckerProduct)
+def jax_funcify_KroneckerProduct(op, **kwargs):
+    def _kron(x, y):
+        return jnp.kron(x, y)
 
-    return batched_dot
-
-
-@jax_funcify.register(MaxAndArgmax)
-def jax_funcify_MaxAndArgmax(op, **kwargs):
-    axis = op.axis
-
-    def maxandargmax(x, axis=axis):
-        if axis is None:
-            axes = tuple(range(x.ndim))
-        else:
-            axes = tuple(int(ax) for ax in axis)
-
-        max_res = jnp.max(x, axis)
-
-        # NumPy does not support multiple axes for argmax; this is a
-        # work-around
-        keep_axes = jnp.array(
-            [i for i in range(x.ndim) if i not in axes], dtype="int64"
-        )
-        # Not-reduced axes in front
-        transposed_x = jnp.transpose(
-            x, jnp.concatenate((keep_axes, jnp.array(axes, dtype="int64")))
-        )
-        kept_shape = transposed_x.shape[: len(keep_axes)]
-        reduced_shape = transposed_x.shape[len(keep_axes) :]
-
-        # Numpy.prod returns 1.0 when arg is empty, so we cast it to int64
-        # Otherwise reshape would complain citing float arg
-        new_shape = kept_shape + (
-            jnp.prod(jnp.array(reduced_shape, dtype="int64"), dtype="int64"),
-        )
-        reshaped_x = transposed_x.reshape(new_shape)
-
-        max_idx_res = jnp.argmax(reshaped_x, axis=-1).astype("int64")
-
-        return max_res, max_idx_res
-
-    return maxandargmax
+    return _kron

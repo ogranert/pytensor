@@ -1,7 +1,8 @@
 import typing
 import warnings
 from abc import abstractmethod
-from typing import Callable, Optional
+from collections.abc import Callable
+from typing import Optional
 
 from pytensor.graph.basic import Apply, Constant
 from pytensor.graph.utils import MethodNotDefined
@@ -29,7 +30,7 @@ class CLinkerObject:
         .. code-block:: python
 
             def c_headers(self, **kwargs):
-                return ['<iostream>', '<math.h>', '/full/path/to/header.h']
+                return ["<iostream>", "<math.h>", "/full/path/to/header.h"]
 
 
         """
@@ -53,7 +54,7 @@ class CLinkerObject:
         .. code-block:: python
 
             def c_header_dirs(self, **kwargs):
-                return ['/usr/local/include', '/opt/weirdpath/src/include']
+                return ["/usr/local/include", "/opt/weirdpath/src/include"]
 
         """
         return []
@@ -133,7 +134,7 @@ class CLinkerObject:
         .. code-block:: python
 
             def c_compile_args(self, **kwargs):
-                return ['-ffast-math']
+                return ["-ffast-math"]
 
         """
         return []
@@ -557,20 +558,18 @@ class CLinkerType(CLinkerObject):
         uninitialized.
 
         """
-        return """
-        if (py_%(name)s == Py_None)
-        {
-            %(c_init_code)s
-        }
+        c_init_code = self.c_init(name, sub)
+        c_extract_code = self.c_extract(name, sub, check_input)
+        return f"""
+        if (py_{name} == Py_None)
+        {{
+            {c_init_code}
+        }}
         else
-        {
-            %(c_extract_code)s
-        }
-        """ % dict(
-            name=name,
-            c_init_code=self.c_init(name, sub),
-            c_extract_code=self.c_extract(name, sub, check_input),
-        )
+        {{
+            {c_extract_code}
+        }}
+        """
 
     def c_cleanup(self, name: str, sub: dict[str, str]) -> str:
         """Return C code to clean up after :meth:`CLinkerType.c_extract`.

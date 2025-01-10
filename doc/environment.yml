@@ -3,7 +3,7 @@ channels:
   - conda-forge
   - nodefaults
 dependencies:
-  - python=3.9
+  - python=3.10
   - gcc_linux-64
   - gxx_linux-64
   - numpy
@@ -12,7 +12,8 @@ dependencies:
   - sphinx>=5.1.0,<6
   - mock
   - pillow
+  - pymc-sphinx-theme
+  - sphinx-design
   - pip
   - pip:
-    - git+https://github.com/pymc-devs/pymc-sphinx-theme
     - -e ..

@@ -29,7 +29,9 @@ In your Op sub-class:
 
 .. code-block:: python
 
-    params_type = ParamsType(attr1=TensorType('int32', shape=(None, None)), attr2=ScalarType('float64'))
+    params_type = ParamsType(
+        attr1=TensorType("int32", shape=(None, None)), attr2=ScalarType("float64")
+    )
 
 If your op contains attributes ``attr1`` **and** ``attr2``, the default ``op.get_params()``
 implementation will automatically try to look for it and generate an appropriate Params object.
@@ -77,26 +79,35 @@ enumerations will be directly available as ParamsType attributes.
     from pytensor.link.c.params_type import ParamsType
     from pytensor.link.c.type import EnumType, EnumList
 
-    wrapper = ParamsType(enum1=EnumList('CONSTANT_1', 'CONSTANT_2', 'CONSTANT_3'),
-                         enum2=EnumType(PI=3.14, EPSILON=0.001))
+    wrapper = ParamsType(
+        enum1=EnumList("CONSTANT_1", "CONSTANT_2", "CONSTANT_3"),
+        enum2=EnumType(PI=3.14, EPSILON=0.001),
+    )
 
     # Each enum constant is available as a wrapper attribute:
-    print(wrapper.CONSTANT_1, wrapper.CONSTANT_2, wrapper.CONSTANT_3,
-          wrapper.PI, wrapper.EPSILON)
+    print(
+        wrapper.CONSTANT_1,
+        wrapper.CONSTANT_2,
+        wrapper.CONSTANT_3,
+        wrapper.PI,
+        wrapper.EPSILON,
+    )
 
     # For convenience, you can also look for a constant by name with
     # ``ParamsType.get_enum()`` method.
-    pi = wrapper.get_enum('PI')
-    epsilon = wrapper.get_enum('EPSILON')
-    constant_2 = wrapper.get_enum('CONSTANT_2')
+    pi = wrapper.get_enum("PI")
+    epsilon = wrapper.get_enum("EPSILON")
+    constant_2 = wrapper.get_enum("CONSTANT_2")
     print(pi, epsilon, constant_2)
 
 This implies that a ParamsType cannot contain different enum types with common enum names::
 
     # Following line will raise an error,
     # as there is a "CONSTANT_1" defined both in enum1 and enum2.
-    wrapper = ParamsType(enum1=EnumList('CONSTANT_1', 'CONSTANT_2'),
-                         enum2=EnumType(CONSTANT_1=0, CONSTANT_3=5))
+    wrapper = ParamsType(
+        enum1=EnumList("CONSTANT_1", "CONSTANT_2"),
+        enum2=EnumType(CONSTANT_1=0, CONSTANT_3=5),
+    )
 
 If your enum types contain constant aliases, you can retrieve them from ParamsType
 with ``ParamsType.enum_from_alias(alias)`` method (see :class:`pytensor.link.c.type.EnumType`
@@ -104,15 +115,15 @@ for more info about enumeration aliases).
 
 .. code-block:: python
 
-    wrapper = ParamsType(enum1=EnumList('A', ('B', 'beta'), 'C'),
-                         enum2=EnumList(('D', 'delta'), 'E', 'F'))
+    wrapper = ParamsType(
+        enum1=EnumList("A", ("B", "beta"), "C"), enum2=EnumList(("D", "delta"), "E", "F")
+    )
     b1 = wrapper.B
-    b2 = wrapper.get_enum('B')
-    b3 = wrapper.enum_from_alias('beta')
+    b2 = wrapper.get_enum("B")
+    b3 = wrapper.enum_from_alias("beta")
     assert b1 == b2 == b3
 
 """
-
 
 import hashlib
 import re
@@ -237,10 +248,13 @@ class Params(dict):
 
         from pytensor.link.c.params_type import ParamsType, Params
         from pytensor.scalar import ScalarType
+
         # You must create a ParamsType first:
-        params_type = ParamsType(attr1=ScalarType('int32'),
-                                 key2=ScalarType('float32'),
-                                 field3=ScalarType('int64'))
+        params_type = ParamsType(
+            attr1=ScalarType("int32"),
+            key2=ScalarType("float32"),
+            field3=ScalarType("int64"),
+        )
         # Then you can create a Params object with
         # the params type defined above and values for attributes.
         params = Params(params_type, attr1=1, key2=2.0, field3=3)
@@ -263,9 +277,10 @@ class Params(dict):
         self.__dict__.update(__params_type__=params_type, __signatures__=None)
 
     def __repr__(self):
-        return "Params(%s)" % ", ".join(
-            [(f"{k}:{type(self[k]).__name__}:{self[k]}") for k in sorted(self.keys())]
+        args = ", ".join(
+            (f"{k}:{type(self[k]).__name__}:{self[k]}") for k in sorted(self)
         )
+        return f"Params({args})"
 
     def __getattr__(self, key):
         if key not in self:
@@ -293,11 +308,11 @@ class Params(dict):
                 .signature()
                 for i in range(self.__params_type__.length)
             )
-        return hash((type(self), self.__params_type__) + self.__signatures__)
+        return hash((type(self), self.__params_type__, *self.__signatures__))
 
     def __eq__(self, other):
         return (
-            type(self) == type(other)
+            type(self) is type(other)
             and self.__params_type__ == other.__params_type__
             and all(
                 # NB: Params object should have been already filtered.
@@ -347,24 +362,21 @@ class ParamsType(CType):
         for attribute_name in kwargs:
             if re.match("^[A-Za-z_][A-Za-z0-9_]*$", attribute_name) is None:
                 raise AttributeError(
-                    'ParamsType: attribute "%s" should be a valid identifier.'
-                    % attribute_name
+                    f'ParamsType: attribute "{attribute_name}" should be a valid identifier.'
                 )
             if attribute_name in c_cpp_keywords:
                 raise SyntaxError(
-                    'ParamsType: "%s" is a potential C/C++ keyword and should not be used as attribute name.'
-                    % attribute_name
+                    f'ParamsType: "{attribute_name}" is a potential C/C++ keyword and should not be used as attribute name.'
                 )
             type_instance = kwargs[attribute_name]
             type_name = type_instance.__class__.__name__
             if not isinstance(type_instance, CType):
                 raise TypeError(
-                    'ParamsType: attribute "%s" should inherit from PyTensor CType, got "%s".'
-                    % (attribute_name, type_name)
+                    f'ParamsType: attribute "{attribute_name}" should inherit from PyTensor CType, got "{type_name}".'
                 )
 
         self.length = len(kwargs)
-        self.fields = tuple(sorted(kwargs.keys()))
+        self.fields = tuple(sorted(kwargs))
         self.types = tuple(kwargs[field] for field in self.fields)
         self.name = self.generate_struct_name()
 
@@ -426,19 +438,20 @@ class ParamsType(CType):
         return super().__getattr__(self, key)
 
     def __repr__(self):
-        return "ParamsType<%s>" % ", ".join(
-            [(f"{self.fields[i]}:{self.types[i]}") for i in range(self.length)]
+        args = ", ".join(
+            f"{self.fields[i]}:{self.types[i]}" for i in range(self.length)
         )
+        return f"ParamsType<{args}>"
 
     def __eq__(self, other):
         return (
-            type(self) == type(other)
+            type(self) is type(other)
             and self.fields == other.fields
             and self.types == other.types
         )
 
     def __hash__(self):
-        return hash((type(self),) + self.fields + self.types)
+        return hash((type(self), *self.fields, *self.types))
 
     def generate_struct_name(self):
         # This method tries to generate an unique name for the current instance.
@@ -493,11 +506,13 @@ class ParamsType(CType):
             from pytensor.link.c.type import EnumType, EnumList
             from pytensor.scalar import ScalarType
 
-            wrapper = ParamsType(scalar=ScalarType('int32'),
-                                 letters=EnumType(A=1, B=2, C=3),
-                                 digits=EnumList('ZERO', 'ONE', 'TWO'))
-            print(wrapper.get_enum('C'))  # 3
-            print(wrapper.get_enum('TWO'))  # 2
+            wrapper = ParamsType(
+                scalar=ScalarType("int32"),
+                letters=EnumType(A=1, B=2, C=3),
+                digits=EnumList("ZERO", "ONE", "TWO"),
+            )
+            print(wrapper.get_enum("C"))  # 3
+            print(wrapper.get_enum("TWO"))  # 2
 
             # You can also directly do:
             print(wrapper.C)
@@ -522,17 +537,19 @@ class ParamsType(CType):
             from pytensor.link.c.type import EnumType, EnumList
             from pytensor.scalar import ScalarType
 
-            wrapper = ParamsType(scalar=ScalarType('int32'),
-                                 letters=EnumType(A=(1, 'alpha'), B=(2, 'beta'), C=3),
-                                 digits=EnumList(('ZERO', 'nothing'), ('ONE', 'unit'), ('TWO', 'couple')))
-            print(wrapper.get_enum('C'))  # 3
-            print(wrapper.get_enum('TWO'))  # 2
-            print(wrapper.enum_from_alias('alpha')) # 1
-            print(wrapper.enum_from_alias('nothing')) # 0
+            wrapper = ParamsType(
+                scalar=ScalarType("int32"),
+                letters=EnumType(A=(1, "alpha"), B=(2, "beta"), C=3),
+                digits=EnumList(("ZERO", "nothing"), ("ONE", "unit"), ("TWO", "couple")),
+            )
+            print(wrapper.get_enum("C"))  # 3
+            print(wrapper.get_enum("TWO"))  # 2
+            print(wrapper.enum_from_alias("alpha"))  # 1
+            print(wrapper.enum_from_alias("nothing"))  # 0
 
             # For the following, alias 'C' is not defined, so the method looks for
             # a constant named 'C', and finds it.
-            print(wrapper.enum_from_alias('C')) # 3
+            print(wrapper.enum_from_alias("C"))  # 3
 
         .. note::
 
@@ -569,12 +586,14 @@ class ParamsType(CType):
             from pytensor.tensor.type import dmatrix
             from pytensor.scalar import ScalarType
 
+
             class MyObject:
                 def __init__(self):
                     self.a = 10
                     self.b = numpy.asarray([[1, 2, 3], [4, 5, 6]])
 
-            params_type = ParamsType(a=ScalarType('int32'), b=dmatrix, c=ScalarType('bool'))
+
+            params_type = ParamsType(a=ScalarType("int32"), b=dmatrix, c=ScalarType("bool"))
 
             o = MyObject()
             value_for_c = False
@@ -706,7 +725,7 @@ class ParamsType(CType):
         c_init_list = []
         c_cleanup_list = []
         c_extract_list = []
-        for attribute_name, type_instance in zip(self.fields, self.types):
+        for attribute_name, type_instance in zip(self.fields, self.types, strict=True):
             try:
                 # c_support_code() may return a code string or a list of code strings.
                 support_code = type_instance.c_support_code()
@@ -723,94 +742,79 @@ class ParamsType(CType):
             c_cleanup_list.append(type_instance.c_cleanup(attribute_name, sub))
 
             c_extract_list.append(
-                """
-            void extract_%(attribute_name)s(PyObject* py_%(attribute_name)s) {
-                %(extract_code)s
-            }
+                f"""
+            void extract_{attribute_name}(PyObject* py_{attribute_name}) {{
+                {type_instance.c_extract(attribute_name, sub)}
+            }}
             """
-                % {
-                    "attribute_name": attribute_name,
-                    "extract_code": type_instance.c_extract(attribute_name, sub),
-                }
             )
 
         struct_declare = "\n".join(c_declare_list)
         struct_init = "\n".join(c_init_list)
         struct_cleanup = "\n".join(c_cleanup_list)
         struct_extract = "\n\n".join(c_extract_list)
-        struct_extract_method = """
-        void extract(PyObject* object, int field_pos) {
-            switch(field_pos) {
+        args = "\n".join(
+            f"case {i}: extract_{self.fields[i]}(object); break;"
+            for i in range(self.length)
+        )
+        struct_extract_method = f"""
+        void extract(PyObject* object, int field_pos) {{
+            switch(field_pos) {{
                 // Extraction cases.
-                %s
+                {args}
                 // Default case.
                 default:
-                    PyErr_Format(PyExc_TypeError, "ParamsType: no extraction defined for a field %%d.", field_pos);
+                    PyErr_Format(PyExc_TypeError, "ParamsType: no extraction defined for a field %d.", field_pos);
                     this->setErrorOccurred();
                     break;
-            }
-        }
-        """ % (
-            "\n".join(
-                [
-                    ("case %d: extract_%s(object); break;" % (i, self.fields[i]))
-                    for i in range(self.length)
-                ]
-            )
-        )
-        final_struct_code = """
-        /** ParamsType %(struct_name)s **/
-        #ifndef %(struct_name_defined)s
-        #define %(struct_name_defined)s
-        struct %(struct_name)s {
+            }}
+        }}
+        """
+        final_struct_code = f"""
+        /** ParamsType {struct_name} **/
+        #ifndef {struct_name_defined}
+        #define {struct_name_defined}
+        struct {struct_name} {{
             /* Attributes, */
-            int %(struct_name)s_error;
-            %(struct_declare)s
+            int {struct_name}_error;
+            {struct_declare}
 
             /* Constructor. */
-            %(struct_name)s() {
-                %(struct_name)s_error = 0;
-                %(struct_init)s
-            }
+            {struct_name}() {{
+                {struct_name}_error = 0;
+                {struct_init}
+            }}
 
             /* Destructor. */
-            ~%(struct_name)s() {
+            ~{struct_name}() {{
                 // cleanup() is defined below.
                 cleanup();
-            }
+            }}
 
             /* Cleanup method. */
-            void cleanup() {
-                %(struct_cleanup)s
-            }
+            void cleanup() {{
+                {struct_cleanup}
+            }}
 
             /* Extraction methods. */
-            %(struct_extract)s
+            {struct_extract}
 
             /* Extract method. */
-            %(struct_extract_method)s
+            {struct_extract_method}
 
             /* Other methods. */
-            void setErrorOccurred() {
-                ++%(struct_name)s_error;
-            }
-            int errorOccurred() {
-                return %(struct_name)s_error;
-            }
-        };
+            void setErrorOccurred() {{
+                ++{struct_name}_error;
+            }}
+            int errorOccurred() {{
+                return {struct_name}_error;
+            }}
+        }};
         #endif
-        /** End ParamsType %(struct_name)s **/
-        """ % dict(
-            struct_name_defined=struct_name_defined,
-            struct_name=struct_name,
-            struct_declare=struct_declare,
-            struct_init=struct_init,
-            struct_cleanup=struct_cleanup,
-            struct_extract=struct_extract,
-            struct_extract_method=struct_extract_method,
-        )
+        /** End ParamsType {struct_name} **/
+        """
 
-        return sorted(c_support_code_set) + [final_struct_code]
+        return [*sorted(c_support_code_set), final_struct_code]
 
     def c_code_cache_version(self):
         return ((3,), tuple(t.c_code_cache_version() for t in self.types))
@@ -821,11 +825,9 @@ class ParamsType(CType):
     # pointers.
 
     def c_declare(self, name, sub, check_input=True):
-        return """
-        %(struct_name)s* %(name)s;
-        """ % dict(
-            struct_name=self.name, name=name
-        )
+        return f"""
+        {self.name}* {name};
+        """
 
     def c_init(self, name, sub):
         # NB: It seems c_init() is not called for an op param.
@@ -841,38 +843,33 @@ class ParamsType(CType):
         """
 
     def c_extract(self, name, sub, check_input=True, **kwargs):
-        return """
+        fields_list = ", ".join(f'"{x}"' for x in self.fields)
+        return f"""
         /* Seems c_init() is not called for a op param. So I call `new` here. */
-        %(name)s = new %(struct_name)s;
+        {name} = new {self.name};
 
-        { // This need a separate namespace for Clinker
-        const char* fields[] = {%(fields_list)s};
-        if (py_%(name)s == Py_None) {
+        {{ // This need a separate namespace for Clinker
+        const char* fields[] = {{{fields_list}}};
+        if (py_{name} == Py_None) {{
             PyErr_SetString(PyExc_ValueError, "ParamsType: expected an object, not None.");
-            %(fail)s
-        }
-        for (int i = 0; i < %(length)s; ++i) {
-            PyObject* o = PyDict_GetItemString(py_%(name)s, fields[i]);
-            if (o == NULL) {
-                PyErr_Format(PyExc_TypeError, "ParamsType: missing expected attribute \\"%%s\\" in object.", fields[i]);
-                %(fail)s
-            }
-            %(name)s->extract(o, i);
-            if (%(name)s->errorOccurred()) {
+            {sub['fail']}
+        }}
+        for (int i = 0; i < {self.length}; ++i) {{
+            PyObject* o = PyDict_GetItemString(py_{name}, fields[i]);
+            if (o == NULL) {{
+                PyErr_Format(PyExc_TypeError, "ParamsType: missing expected attribute \\"%s\\" in object.", fields[i]);
+                {sub['fail']}
+            }}
+            {name}->extract(o, i);
+            if ({name}->errorOccurred()) {{
                 /* The extract code from attribute type should have already raised a Python exception,
                  * so we just print the attribute name in stderr. */
-                fprintf(stderr, "\\nParamsType: error when extracting value for attribute \\"%%s\\".\\n", fields[i]);
-                %(fail)s
-            }
-        }
-        }
-        """ % dict(
-            name=name,
-            struct_name=self.name,
-            length=self.length,
-            fail=sub["fail"],
-            fields_list='"%s"' % '", "'.join(self.fields),
-        )
+                fprintf(stderr, "\\nParamsType: error when extracting value for attribute \\"%s\\".\\n", fields[i]);
+                {sub['fail']}
+            }}
+        }}
+        }}
+        """
 
     def c_sync(self, name, sub):
         # FIXME: Looks like we need to decrement a reference count our two.

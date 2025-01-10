@@ -3,10 +3,21 @@ import warnings
 import numpy as np
 
 from pytensor.compile import SharedVariable, shared_constructor
-from pytensor.misc.safe_asarray import _asarray
 from pytensor.tensor import _get_vector_length
 from pytensor.tensor.type import TensorType
-from pytensor.tensor.variable import _tensor_py_operators
+from pytensor.tensor.variable import TensorVariable
+
+
+def __getattr__(name):
+    if name == "ScalarSharedVariable":
+        warnings.warn(
+            "The class `ScalarSharedVariable` has been deprecated. "
+            "Use `TensorSharedVariable` instead and check for `ndim==0`.",
+            FutureWarning,
+        )
+        return TensorSharedVariable
+
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def load_shared_variable(val):
@@ -19,7 +30,7 @@ def load_shared_variable(val):
     return tensor_constructor(val)
 
 
-class TensorSharedVariable(_tensor_py_operators, SharedVariable):
+class TensorSharedVariable(SharedVariable, TensorVariable):
     def zero(self, borrow: bool = False):
         r"""Set the values of a shared variable to 0.
 
@@ -53,7 +64,6 @@ def tensor_constructor(
     allow_downcast=None,
     borrow=False,
     shape=None,
-    target="cpu",
     broadcastable=None,
 ):
     r"""`SharedVariable` constructor for `TensorType`\s.
@@ -75,9 +85,6 @@ def tensor_constructor(
         )
         shape = broadcastable
 
-    if target != "cpu":
-        raise TypeError("not for cpu")
-
     # If no shape is given, then the default is to assume that the value might
     # be resized in any dimension in the future.
     if shape is None:
@@ -94,16 +101,12 @@ def tensor_constructor(
     )
 
 
-class ScalarSharedVariable(TensorSharedVariable):
-    pass
-
-
 @shared_constructor.register(np.number)
 @shared_constructor.register(float)
 @shared_constructor.register(int)
 @shared_constructor.register(complex)
 def scalar_constructor(
-    value, name=None, strict=False, allow_downcast=None, borrow=False, target="cpu"
+    value, name=None, strict=False, allow_downcast=None, borrow=False
 ):
     """`SharedVariable` constructor for scalar values.
 
@@ -118,21 +121,18 @@ def scalar_constructor(
     borrow, as it is a hint to PyTensor that we can reuse it.
 
     """
-    if target != "cpu":
-        raise TypeError("not for cpu")
-
     try:
         dtype = value.dtype
     except AttributeError:
         dtype = np.asarray(value).dtype
 
     dtype = str(dtype)
-    value = _asarray(value, dtype=dtype)
+    value = np.asarray(value, dtype=dtype)
     tensor_type = TensorType(dtype=str(value.dtype), shape=())
 
     # Do not pass the dtype to asarray because we want this to fail if
     # strict is True and the types do not match.
-    rval = ScalarSharedVariable(
+    rval = TensorSharedVariable(
         type=tensor_type,
         value=np.array(value, copy=True),
         name=name,

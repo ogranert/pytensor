@@ -4,7 +4,7 @@ import copy
 import dataclasses
 from itertools import chain
 from sys import maxsize
-from typing import Optional, cast
+from typing import cast
 
 import numpy as np
 
@@ -27,7 +27,7 @@ from pytensor.graph.basic import (
 )
 from pytensor.graph.destroyhandler import DestroyHandler
 from pytensor.graph.features import ReplaceValidate
-from pytensor.graph.fg import FunctionGraph
+from pytensor.graph.fg import FunctionGraph, Output
 from pytensor.graph.op import compute_test_value
 from pytensor.graph.replace import clone_replace
 from pytensor.graph.rewriting.basic import (
@@ -166,7 +166,7 @@ def remove_constants_and_unused_inputs_scan(fgraph, node):
     # Look through non sequences
     nw_inner_nonseq = []
     nw_outer_nonseq = []
-    for idx, (nw_in, nw_out) in enumerate(zip(non_seqs, outer_non_seqs)):
+    for idx, (nw_in, nw_out) in enumerate(zip(non_seqs, outer_non_seqs, strict=True)):
         if isinstance(nw_out, Constant):
             givens[nw_in] = nw_out
         elif nw_in in all_ins:
@@ -203,13 +203,13 @@ def remove_constants_and_unused_inputs_scan(fgraph, node):
             allow_gc=op.allow_gc,
         )
         nw_outs = nwScan(*nw_outer, return_list=True)
-        return dict([("remove", [node])] + list(zip(node.outputs, nw_outs)))
+        return dict([("remove", [node]), *zip(node.outputs, nw_outs, strict=True)])
     else:
         return False
 
 
 @node_rewriter([Scan])
-def push_out_non_seq_scan(fgraph, node):
+def scan_push_out_non_seq(fgraph, node):
     r"""Push out the variables inside the `Scan` that depend only on non-sequences.
 
     This optimizations pushes, out of `Scan`'s inner function and into the outer
@@ -348,7 +348,7 @@ def push_out_non_seq_scan(fgraph, node):
         nw_outer = []
         nw_inner = []
         for to_repl, repl_in, repl_out in zip(
-            clean_to_replace, clean_replace_with_in, clean_replace_with_out
+            clean_to_replace, clean_replace_with_in, clean_replace_with_out, strict=True
         ):
             if isinstance(repl_out, Constant):
                 repl_in = repl_out
@@ -380,7 +380,7 @@ def push_out_non_seq_scan(fgraph, node):
         # Do not call make_node for test_value
         nw_node = nwScan(*(node.inputs + nw_outer), return_list=True)[0].owner
 
-        replacements = dict(zip(node.outputs, nw_node.outputs))
+        replacements = dict(zip(node.outputs, nw_node.outputs, strict=True))
         replacements["remove"] = [node]
         return replacements
     elif not to_keep_set:
@@ -417,10 +417,10 @@ def push_out_non_seq_scan(fgraph, node):
 
 
 @node_rewriter([Scan])
-def push_out_seq_scan(fgraph, node):
+def scan_push_out_seq(fgraph, node):
     r"""Push out the variables inside the `Scan` that depend only on constants and sequences.
 
-    This optimization resembles `push_out_non_seq_scan` but it tries to push--out of
+    This optimization resembles `scan_push_out_non_seq` but it tries to push--out of
     the inner function--the computation that only relies on sequence and
     non-sequence inputs. The idea behind this optimization is that, when it is
     possible to do so, it is generally more computationally efficient to perform
@@ -584,7 +584,7 @@ def push_out_seq_scan(fgraph, node):
         nw_outer = []
         nw_inner = []
         for to_repl, repl_in, repl_out in zip(
-            clean_to_replace, clean_replace_with_in, clean_replace_with_out
+            clean_to_replace, clean_replace_with_in, clean_replace_with_out, strict=True
         ):
             if isinstance(repl_out, Constant):
                 repl_in = repl_out
@@ -616,7 +616,7 @@ def push_out_seq_scan(fgraph, node):
             return_list=True,
         )[0].owner
 
-        replacements = dict(zip(node.outputs, nw_node.outputs))
+        replacements = dict(zip(node.outputs, nw_node.outputs, strict=True))
         replacements["remove"] = [node]
         return replacements
 
@@ -692,7 +692,7 @@ def push_out_inner_vars(
     old_scan_node: Apply,
     old_scan_args: ScanArgs,
 ) -> tuple[list[Variable], ScanArgs, dict[Variable, Variable]]:
-    tmp_outer_vars: list[Optional[Variable]] = []
+    tmp_outer_vars: list[Variable | None] = []
     new_scan_node = old_scan_node
     new_scan_args = old_scan_args
     replacements: dict[Variable, Variable] = {}
@@ -702,7 +702,7 @@ def push_out_inner_vars(
     for idx in range(len(inner_vars)):
         var = inner_vars[idx]
 
-        new_outer_var: Optional[Variable] = None
+        new_outer_var: Variable | None = None
 
         if var in old_scan_args.inner_in_seqs:
             idx_seq = old_scan_args.inner_in_seqs.index(var)
@@ -814,7 +814,7 @@ def add_nitsot_outputs(
     # replacements["remove"] = [old_scan_node]
     # return new_scan_node, replacements
     fgraph.replace_all_validate_remove(  # type: ignore
-        list(zip(old_scan_node.outputs, new_node_old_outputs)),
+        list(zip(old_scan_node.outputs, new_node_old_outputs, strict=True)),
         remove=[old_scan_node],
         reason="scan_pushout_add",
     )
@@ -822,10 +822,10 @@ def add_nitsot_outputs(
 
 
 @node_rewriter([Scan])
-def push_out_add_scan(fgraph, node):
+def scan_push_out_add(fgraph, node):
     r"""Push `Add` operations performed at the end of the inner graph to the outside.
 
-    Like `push_out_seq_scan`, this optimization aims to replace many operations
+    Like `scan_push_out_seq`, this optimization aims to replace many operations
     on small tensors by few operations on large tensors. It can also lead to
     increased memory usage.
     """
@@ -946,7 +946,7 @@ class ScanInplaceOptimizer(GraphRewriter):
 
     def attempt_scan_inplace(
         self, fgraph: FunctionGraph, node: Apply[Scan], output_indices: list[int]
-    ) -> Optional[Apply]:
+    ) -> Apply | None:
         """Attempt to replace a `Scan` node by one which computes the specified outputs inplace.
 
         Parameters
@@ -1020,7 +1020,7 @@ class ScanInplaceOptimizer(GraphRewriter):
             # This whole rewrite should be a simple local rewrite, but, because
             # of this awful approach, it can't be.
             fgraph.replace_all_validate_remove(  # type: ignore
-                list(zip(node.outputs, new_outs)),
+                list(zip(node.outputs, new_outs, strict=True)),
                 remove=[node],
                 reason="scan_make_inplace",
             )
@@ -1067,7 +1067,9 @@ class ScanInplaceOptimizer(GraphRewriter):
                     if client.op.destroy_map:
                         # This flattens the content of destroy_map.values()
                         # which is a list of lists
-                        inplace_inp_indices = sum(client.op.destroy_map.values(), [])
+                        inplace_inp_indices = chain.from_iterable(
+                            client.op.destroy_map.values()
+                        )
 
                         inplace_inps = [client.inputs[i] for i in inplace_inp_indices]
                         if original_node.inputs[inp_idx] in inplace_inps:
@@ -1183,7 +1185,7 @@ def while_scan_merge_subtensor_last_element(fgraph, scan_node):
 
 
 @node_rewriter([Scan])
-def save_mem_new_scan(fgraph, node):
+def scan_save_mem(fgraph, node):
     r"""Graph optimizer that reduces scan memory consumption.
 
     This optimizations attempts to determine if a `Scan` node, during its execution,
@@ -1301,7 +1303,7 @@ def save_mem_new_scan(fgraph, node):
         for cl, _ in fgraph.clients[out]:
             # 2.1 outputs of the function
             # => output needs all its intermediate values
-            if isinstance(cl, str):
+            if isinstance(cl.op, Output):
                 # if the node is actually an output, then
                 # we need to store the entire thing
                 global_nsteps = None
@@ -1410,7 +1412,7 @@ def save_mem_new_scan(fgraph, node):
     for i, out in enumerate(node.outputs[:c_outs]):
         # look at all its clients
         for cl, _ in fgraph.clients[out]:
-            if isinstance(cl, str):
+            if isinstance(cl.op, Output):
                 store_steps[i] = 0
                 break
             elif not isinstance(cl.op, Subtensor):
@@ -1621,9 +1623,7 @@ def save_mem_new_scan(fgraph, node):
         (inps, outs, info, node_ins, compress_map) = compress_outs(
             op, not_required, nw_inputs
         )
-        inv_compress_map = {}
-        for k, v in compress_map.items():
-            inv_compress_map[v] = k
+        inv_compress_map = {v: k for k, v in compress_map.items()}
 
         # 3.6 Compose the new scan
         # TODO: currently we don't support scan with 0 step. So
@@ -1664,7 +1664,7 @@ def save_mem_new_scan(fgraph, node):
                         )
                     else:
                         fslice = sanitize(cnf_slice[0])
-                    nw_slice = (fslice,) + tuple(old_slices[1:])
+                    nw_slice = (fslice, *old_slices[1:])
 
                     nw_pos = inv_compress_map[idx]
 
@@ -1711,7 +1711,8 @@ def save_mem_new_scan(fgraph, node):
                                 sanitize(stop),
                                 sanitize(cnf_slice[0].step),
                             ),
-                        ) + tuple(old_slices[1:])
+                            *old_slices[1:],
+                        )
 
                     else:
                         # Special case when only last value is requested
@@ -1725,7 +1726,7 @@ def save_mem_new_scan(fgraph, node):
                                 cnf_slice[0] - nw_steps - init_l[pos] + store_steps[pos]
                             )
 
-                        nw_slice = (sanitize(position),) + tuple(old_slices[1:])
+                        nw_slice = (sanitize(position), *old_slices[1:])
                     subtens = Subtensor(nw_slice)
                     sl_ins = get_slice_elements(
                         nw_slice, lambda entry: isinstance(entry, Variable)
@@ -1850,7 +1851,7 @@ class ScanMerge(GraphRewriter):
             outer_ins += nd.op.outer_non_seqs(nd.inputs)
 
         # Add back the number of steps
-        outer_ins = [nodes[0].inputs[0]] + outer_ins
+        outer_ins = [nodes[0].inputs[0], *outer_ins]
 
         if as_while:
             # add the condition, which was the one of nodes[0]
@@ -1859,8 +1860,8 @@ class ScanMerge(GraphRewriter):
         # Clone the inner graph of each node independently
         for idx, nd in enumerate(nodes):
             # concatenate all inner_ins and inner_outs of nd
-            flat_inner_ins = sum(inner_ins[idx], [])
-            flat_inner_outs = sum(inner_outs[idx], [])
+            flat_inner_ins = list(chain.from_iterable(inner_ins[idx]))
+            flat_inner_outs = list(chain.from_iterable(inner_outs[idx]))
             # clone
             flat_inner_ins, flat_inner_outs = reconstruct_graph(
                 flat_inner_ins, flat_inner_outs
@@ -1933,14 +1934,14 @@ class ScanMerge(GraphRewriter):
             profile=old_op.profile,
             truncate_gradient=old_op.truncate_gradient,
             allow_gc=old_op.allow_gc,
-            name="&".join([nd.op.name for nd in nodes]),
+            name="&".join(nd.op.name for nd in nodes),
         )
         new_outs = new_op(*outer_ins)
 
-        if not isinstance(new_outs, (list, tuple)):
+        if not isinstance(new_outs, list | tuple):
             new_outs = [new_outs]
 
-        return list(zip(outer_outs, new_outs))
+        return list(zip(outer_outs, new_outs, strict=True))
 
     def belongs_to_set(self, node, set_nodes):
         """
@@ -2009,7 +2010,9 @@ class ScanMerge(GraphRewriter):
         ]
         inner_inputs = op.inner_inputs
         rep_inner_inputs = rep_op.inner_inputs
-        for nominal_input, rep_nominal_input in zip(nominal_inputs, rep_nominal_inputs):
+        for nominal_input, rep_nominal_input in zip(
+            nominal_inputs, rep_nominal_inputs, strict=True
+        ):
             conds.append(node.inputs[mapping[inner_inputs.index(nominal_input)]])
             rep_conds.append(
                 rep_node.inputs[rep_mapping[rep_inner_inputs.index(rep_nominal_input)]]
@@ -2066,7 +2069,7 @@ def make_equiv(lo, li):
     seeno = {}
     left = []
     right = []
-    for o, i in zip(lo, li):
+    for o, i in zip(lo, li, strict=True):
         if o in seeno:
             left += [i]
             right += [o]
@@ -2103,7 +2106,7 @@ def scan_merge_inouts(fgraph, node):
     if has_duplicates(a.outer_in_seqs):
         new_outer_seqs = []
         new_inner_seqs = []
-        for out_seq, in_seq in zip(a.outer_in_seqs, a.inner_in_seqs):
+        for out_seq, in_seq in zip(a.outer_in_seqs, a.inner_in_seqs, strict=True):
             if out_seq in new_outer_seqs:
                 i = new_outer_seqs.index(out_seq)
                 inp_equiv[in_seq] = new_inner_seqs[i]
@@ -2116,7 +2119,9 @@ def scan_merge_inouts(fgraph, node):
     if has_duplicates(a.outer_in_non_seqs):
         new_outer_nseqs = []
         new_inner_nseqs = []
-        for out_nseq, in_nseq in zip(a.outer_in_non_seqs, a.inner_in_non_seqs):
+        for out_nseq, in_nseq in zip(
+            a.outer_in_non_seqs, a.inner_in_non_seqs, strict=True
+        ):
             if out_nseq in new_outer_nseqs:
                 i = new_outer_nseqs.index(out_nseq)
                 inp_equiv[in_nseq] = new_inner_nseqs[i]
@@ -2147,7 +2152,7 @@ def scan_merge_inouts(fgraph, node):
         )
         outputs = new_op(*outer_inputs)
 
-        if not isinstance(outputs, (list, tuple)):
+        if not isinstance(outputs, list | tuple):
             outputs = [outputs]
 
         na = ScanArgs(
@@ -2179,7 +2184,7 @@ def scan_merge_inouts(fgraph, node):
     if has_duplicates(na.outer_in_mit_mot):
         seen = {}
         for omm, imm, _sl in zip(
-            na.outer_in_mit_mot, na.inner_in_mit_mot, na.mit_mot_in_slices
+            na.outer_in_mit_mot, na.inner_in_mit_mot, na.mit_mot_in_slices, strict=True
         ):
             sl = tuple(_sl)
             if (omm, sl) in seen:
@@ -2192,7 +2197,7 @@ def scan_merge_inouts(fgraph, node):
     if has_duplicates(na.outer_in_mit_sot):
         seen = {}
         for oms, ims, _sl in zip(
-            na.outer_in_mit_sot, na.inner_in_mit_sot, na.mit_sot_in_slices
+            na.outer_in_mit_sot, na.inner_in_mit_sot, na.mit_sot_in_slices, strict=True
         ):
             sl = tuple(_sl)
             if (oms, sl) in seen:
@@ -2226,7 +2231,7 @@ def scan_merge_inouts(fgraph, node):
     na.outer_out_nit_sot = [
         map_out(outer_i, inner_o, outer_o, seen)
         for outer_i, inner_o, outer_o in zip(
-            na.outer_in_nit_sot, na.inner_out_nit_sot, na.outer_out_nit_sot
+            na.outer_in_nit_sot, na.inner_out_nit_sot, na.outer_out_nit_sot, strict=True
         )
     ]
 
@@ -2236,7 +2241,7 @@ def scan_merge_inouts(fgraph, node):
     na.outer_out_sit_sot = [
         map_out(outer_i, inner_o, outer_o, seen)
         for outer_i, inner_o, outer_o in zip(
-            na.outer_in_sit_sot, na.inner_out_sit_sot, na.outer_out_sit_sot
+            na.outer_in_sit_sot, na.inner_out_sit_sot, na.outer_out_sit_sot, strict=True
         )
     ]
 
@@ -2246,7 +2251,7 @@ def scan_merge_inouts(fgraph, node):
     na.outer_out_mit_sot = [
         map_out(outer_i, inner_o, outer_o, seen)
         for outer_i, inner_o, outer_o in zip(
-            na.outer_in_mit_sot, na.inner_out_mit_sot, na.outer_out_mit_sot
+            na.outer_in_mit_sot, na.inner_out_mit_sot, na.outer_out_mit_sot, strict=True
         )
     ]
 
@@ -2260,6 +2265,7 @@ def scan_merge_inouts(fgraph, node):
         na.inner_out_mit_mot,
         na.outer_out_mit_mot,
         na.mit_mot_out_slices,
+        strict=True,
     ):
         for s_outer_imm, s_inner_omm, s_outer_omm, sosl in seen:
             if (
@@ -2274,12 +2280,14 @@ def scan_merge_inouts(fgraph, node):
             new_outer_out_mit_mot.append(outer_omm)
     na.outer_out_mit_mot = new_outer_out_mit_mot
     if remove:
-        return dict([("remove", remove)] + list(zip(node.outputs, na.outer_outputs)))
+        return dict(
+            [("remove", remove), *zip(node.outputs, na.outer_outputs, strict=True)]
+        )
     return na.outer_outputs
 
 
 @node_rewriter([Scan])
-def push_out_dot1_scan(fgraph, node):
+def scan_push_out_dot1(fgraph, node):
     r"""
     This is another optimization that attempts to detect certain patterns of
     computation in a `Scan` `Op`'s inner function and move this computation to the
@@ -2299,14 +2307,14 @@ def push_out_dot1_scan(fgraph, node):
     sitsot_outs = op.inner_sitsot_outs(op.inner_outputs)
     outer_sitsot = op.outer_sitsot_outs(node.outputs)
     seqs = op.inner_seqs(op.inner_inputs)
-    for inp, out, outer_out in zip(sitsot_ins, sitsot_outs, outer_sitsot):
+    for inp, out, outer_out in zip(sitsot_ins, sitsot_outs, outer_sitsot, strict=True):
         if (
             out.owner
             and isinstance(out.owner.op, Elemwise)
             and isinstance(out.owner.op.scalar_op, ps.Add)
             and inp in out.owner.inputs
             and len(fgraph.clients[outer_out]) == 1
-            and not isinstance(fgraph.clients[outer_out][0][0], str)
+            and not isinstance(fgraph.clients[outer_out][0][0], Output)
             and isinstance(fgraph.clients[outer_out][0][0].op, Subtensor)
             and fgraph.clients[outer_out][0][0].op.idx_list == (-1,)
         ):
@@ -2399,20 +2407,20 @@ def push_out_dot1_scan(fgraph, node):
                         name=op.name,
                         allow_gc=op.allow_gc,
                     )
-                    _scan_inputs = (
-                        [node.inputs[0]]
-                        + outer_seqs
-                        + outer_mitmot
-                        + outer_mitsot
-                        + outer_sitsot
-                        + outer_shared
-                        + outer_nitsot
-                        + [node.inputs[0]]
-                        + outer_non_seqs
-                    )
+                    _scan_inputs = [
+                        node.inputs[0],
+                        *outer_seqs,
+                        *outer_mitmot,
+                        *outer_mitsot,
+                        *outer_sitsot,
+                        *outer_shared,
+                        *outer_nitsot,
+                        node.inputs[0],
+                        *outer_non_seqs,
+                    ]
 
                     new_outs = new_op(*_scan_inputs)
-                    if not isinstance(new_outs, (list, tuple)):
+                    if not isinstance(new_outs, list | tuple):
                         new_outs = [new_outs]
 
                     # We need now to pair correctly the new outputs
@@ -2452,10 +2460,12 @@ def push_out_dot1_scan(fgraph, node):
                         new_out = dot(val, out_seq)
 
                     pos = node.outputs.index(outer_out)
-                    old_new = list(zip(node.outputs[:pos], new_outs[:pos]))
+                    old_new = list(zip(node.outputs[:pos], new_outs[:pos], strict=True))
                     old = fgraph.clients[node.outputs[pos]][0][0].outputs[0]
                     old_new.append((old, new_out))
-                    old_new += list(zip(node.outputs[pos + 1 :], new_outs[pos:]))
+                    old_new += list(
+                        zip(node.outputs[pos + 1 :], new_outs[pos:], strict=True)
+                    )
                     replacements = dict(old_new)
                     replacements["remove"] = [node]
                     return replacements
@@ -2480,7 +2490,7 @@ optdb.register("scan_eqopt2", scan_eqopt2, "fast_run", "scan", position=1.6)
 # ScanSaveMem should execute only once per node.
 optdb.register(
     "scan_save_mem",
-    in2out(save_mem_new_scan, ignore_newtrees=True),
+    in2out(scan_save_mem, ignore_newtrees=True),
     "fast_run",
     "scan",
     position=1.61,
@@ -2491,7 +2501,7 @@ optdb.register(
     "fast_run",
     "inplace",
     "scan",
-    position=75,
+    position=50.5,
 )
 
 scan_eqopt1.register("all_pushout_opt", scan_seqopt1, "fast_run", "scan")
@@ -2508,8 +2518,9 @@ scan_seqopt1.register(
 
 
 scan_seqopt1.register(
-    "scan_pushout_nonseqs_ops",
-    in2out(push_out_non_seq_scan, ignore_newtrees=True),
+    "scan_push_out_non_seq",
+    in2out(scan_push_out_non_seq, ignore_newtrees=True),
+    "scan_pushout_nonseqs_ops",  # For backcompat: so it can be tagged with old name
     "fast_run",
     "scan",
     "scan_pushout",
@@ -2518,8 +2529,9 @@ scan_seqopt1.register(
 
 
 scan_seqopt1.register(
-    "scan_pushout_seqs_ops",
-    in2out(push_out_seq_scan, ignore_newtrees=True),
+    "scan_push_out_seq",
+    in2out(scan_push_out_seq, ignore_newtrees=True),
+    "scan_pushout_seqs_ops",  # For backcompat: so it can be tagged with old name
     "fast_run",
     "scan",
     "scan_pushout",
@@ -2528,8 +2540,9 @@ scan_seqopt1.register(
 
 
 scan_seqopt1.register(
-    "scan_pushout_dot1",
-    in2out(push_out_dot1_scan, ignore_newtrees=True),
+    "scan_push_out_dot1",
+    in2out(scan_push_out_dot1, ignore_newtrees=True),
+    "scan_pushout_dot1",  # For backcompat: so it can be tagged with old name
     "fast_run",
     "more_mem",
     "scan",
@@ -2539,9 +2552,10 @@ scan_seqopt1.register(
 
 
 scan_seqopt1.register(
-    "scan_pushout_add",
+    "scan_push_out_add",
     # TODO: Perhaps this should be an `EquilibriumGraphRewriter`?
-    in2out(push_out_add_scan, ignore_newtrees=False),
+    in2out(scan_push_out_add, ignore_newtrees=False),
+    "scan_pushout_add",  # For backcompat: so it can be tagged with old name
     "fast_run",
     "more_mem",
     "scan",

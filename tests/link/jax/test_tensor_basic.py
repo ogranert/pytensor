@@ -5,7 +5,7 @@ from pytensor.compile import get_mode
 
 
 jax = pytest.importorskip("jax")
-import jax.errors
+from jax import errors
 
 import pytensor
 import pytensor.tensor.basic as ptb
@@ -74,7 +74,7 @@ def test_arange_of_shape():
     x = vector("x")
     out = ptb.arange(1, x.shape[-1], 2)
     fgraph = FunctionGraph([x], [out])
-    compare_jax_and_py(fgraph, [np.zeros((5,))])
+    compare_jax_and_py(fgraph, [np.zeros((5,))], jax_mode="JAX")
 
 
 def test_arange_nonconcrete():
@@ -200,7 +200,7 @@ class TestJaxSplit:
             fn = pytensor.function([a, split_axis], a_splits, mode="JAX")
         # Same as above, an AttributeError surpasses the `TracerIntegerConversionError`
         # Both errors are included for backwards compatibility
-        with pytest.raises((AttributeError, jax.errors.TracerIntegerConversionError)):
+        with pytest.raises((AttributeError, errors.TracerIntegerConversionError)):
             fn(np.zeros((6, 6), dtype=pytensor.config.floatX), 0)
 
 
@@ -218,6 +218,10 @@ def test_tri():
     compare_jax_and_py(fgraph, [])
 
 
+@pytest.mark.skipif(
+    jax.__version__ == "0.4.31",
+    reason="https://github.com/google/jax/issues/22751",
+)
 def test_tri_nonconcrete():
     """JAX cannot JIT-compile `jax.numpy.tri` when arguments are not concrete values."""
 

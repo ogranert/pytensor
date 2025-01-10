@@ -12,20 +12,19 @@ you probably want to use pytensor.tensor.[c,z,f,d,b,w,i,l,]scalar!
 
 import builtins
 import math
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from copy import copy
 from itertools import chain
 from textwrap import dedent
-from typing import Any, Optional, Union
+from typing import Any, TypeAlias
 
 import numpy as np
-from typing_extensions import TypeAlias
 
 import pytensor
 from pytensor import printing
 from pytensor.configdefaults import config
 from pytensor.gradient import DisconnectedType, grad_undefined
-from pytensor.graph.basic import Apply, Constant, Variable, clone, list_of_nodes
+from pytensor.graph.basic import Apply, Constant, Variable, applys_between, clone
 from pytensor.graph.fg import FunctionGraph
 from pytensor.graph.op import HasInnerGraph
 from pytensor.graph.rewriting.basic import MergeOptimizer
@@ -33,7 +32,6 @@ from pytensor.graph.type import HasDataType, HasShape
 from pytensor.graph.utils import MetaObject, MethodNotDefined
 from pytensor.link.c.op import COp
 from pytensor.link.c.type import CType
-from pytensor.misc.safe_asarray import _asarray
 from pytensor.printing import pprint
 from pytensor.utils import (
     apply_across_args,
@@ -60,7 +58,7 @@ class IntegerDivisionError(Exception):
     """
 
 
-def upcast(dtype, *dtypes):
+def upcast(dtype, *dtypes) -> str:
     # This tries to keep data in floatX or lower precision, unless we
     # explicitly request a higher precision datatype.
     keep_float32 = [
@@ -138,7 +136,7 @@ class NumpyAutocaster:
 
     def __call__(self, x):
         # Make sure we only deal with scalars.
-        assert isinstance(x, (int, builtins.float)) or (
+        assert isinstance(x, int | builtins.float) or (
             isinstance(x, np.ndarray) and x.ndim == 0
         )
 
@@ -151,7 +149,7 @@ class NumpyAutocaster:
                 and rval.dtype in ("float64", "float32")
                 and rval.dtype != config.floatX
             ):
-                rval = _asarray(rval, dtype=config.floatX)
+                rval = rval.astype(config.floatX)
             return rval
 
         # The following is the original code, corresponding to the 'custom'
@@ -177,7 +175,7 @@ class NumpyAutocaster:
             and config.floatX in self.dtypes
             and config.floatX != "float64"
         ):
-            return _asarray(x, dtype=config.floatX)
+            return np.asarray(x, dtype=config.floatX)
 
         # Don't autocast to float16 unless config.floatX is float16
         try_dtypes = [
@@ -185,7 +183,7 @@ class NumpyAutocaster:
         ]
 
         for dtype in try_dtypes:
-            x_ = _asarray(x, dtype=dtype)
+            x_ = np.asarray(x).astype(dtype=dtype)
             if np.all(x == x_):
                 break
         # returns either an exact x_==x, or the last cast x_
@@ -209,9 +207,10 @@ class autocast_float_as:
 
     Examples
     --------
-    >>> with autocast_float_as('float32'):
-    ...    assert (fvector() + 1.1).dtype == 'float32'  # temporary downcasting
-    >>> assert (fvector() + 1.1).dtype == 'float64' # back to default behaviour
+    >>> from pytensor.tensor import fvector
+    >>> with autocast_float_as("float32"):
+    ...     assert (fvector() + 1.1).dtype == "float32"  # temporary downcasting
+    >>> assert (fvector() + 1.1).dtype == "float64"  # back to default behaviour
 
     """
 
@@ -245,7 +244,9 @@ def convert(x, dtype=None):
 
     if dtype is not None:
         # in this case, the semantics are that the caller is forcing the dtype
-        x_ = _asarray(x, dtype=dtype)
+        if dtype == "floatX":
+            dtype = config.floatX
+        x_ = np.asarray(x).astype(dtype)
     else:
         # In this case, this function should infer the dtype according to the
         # autocasting rules. See autocasting above.
@@ -256,7 +257,7 @@ def convert(x, dtype=None):
             except OverflowError:
                 # This is to imitate numpy behavior which tries to fit
                 # bigger numbers into a uint64.
-                x_ = _asarray(x, dtype="uint64")
+                x_ = np.asarray(x, dtype="uint64")
         elif isinstance(x, builtins.float):
             x_ = autocast_float(x)
         elif isinstance(x, np.ndarray):
@@ -268,12 +269,11 @@ def convert(x, dtype=None):
             x_ = np.asarray(x)
             if x_.size == 0 and not hasattr(x, "dtype"):
                 x_ = np.asarray(x, dtype=config.floatX)
-    assert issubclass(type(x_), (np.ndarray, np.memmap))
+    assert issubclass(type(x_), np.ndarray | np.memmap)
     return x_
 
 
 class ScalarType(CType, HasDataType, HasShape):
-
     """
     Internal class, should not be used by clients.
 
@@ -303,13 +303,6 @@ class ScalarType(CType, HasDataType, HasShape):
             dtype = self.dtype
         return type(self)(dtype)
 
-    @staticmethod
-    def may_share_memory(a, b):
-        # This class represent basic c type, represented in python
-        # with numpy.scalar. They are read only. So from python, they
-        # can never share memory.
-        return False
-
     def filter(self, data, strict=False, allow_downcast=None):
         py_type = self.dtype_specs()[0]
         if strict and not isinstance(data, py_type):
@@ -323,7 +316,7 @@ class ScalarType(CType, HasDataType, HasShape):
                 allow_downcast
                 or (
                     allow_downcast is None
-                    and isinstance(data, (float, np.floating))
+                    and isinstance(data, float | np.floating)
                     and self.dtype == config.floatX
                 )
                 or np.array_equal(data, converted_data, equal_nan=True)
@@ -357,18 +350,18 @@ class ScalarType(CType, HasDataType, HasShape):
         # we declare them here and they will be re-used by TensorType
         l.append("<numpy/arrayobject.h>")
         l.append("<numpy/arrayscalars.h>")
-        if config.lib__amblibm and c_compiler.supports_amdlibm:
+        if config.lib__amdlibm and c_compiler.supports_amdlibm:
             l += ["<amdlibm.h>"]
         return l
 
     def c_libraries(self, c_compiler=None, **kwargs):
         l = []
-        if config.lib__amblibm and c_compiler and c_compiler.supports_amdlibm:
+        if config.lib__amdlibm and c_compiler and c_compiler.supports_amdlibm:
             l += ["amdlibm"]
         return l
 
     def c_compile_args(self, c_compiler=None, **kwargs):
-        if config.lib__amblibm and c_compiler and c_compiler.supports_amdlibm:
+        if config.lib__amdlibm and c_compiler and c_compiler.supports_amdlibm:
             return ["-DREPLACE_WITH_AMDLIBM"]
         else:
             return []
@@ -416,7 +409,7 @@ class ScalarType(CType, HasDataType, HasShape):
             )
 
     def upcast(self, *others):
-        return upcast(*[x.dtype for x in [self] + list(others)])
+        return upcast(*[x.dtype for x in [self, *others]])
 
     def make_variable(self, name=None):
         return ScalarVariable(self, None, name=name)
@@ -465,43 +458,44 @@ class ScalarType(CType, HasDataType, HasShape):
             raise NotImplementedError("float16")
         specs = self.dtype_specs()
         if check_input:
-            pre = """
-            if (!PyObject_TypeCheck(py_%(name)s, &%(pyarr_type)s))
-            {
+            fail = sub["fail"]
+            dtype = specs[1]
+            pyarr_type = f"Py{specs[2]}ArrType_Type"
+            pre = f"""
+            if (!PyObject_TypeCheck(py_{name}, &{pyarr_type}))
+            {{
                 PyErr_Format(PyExc_ValueError,
-                    "Scalar check failed (%(dtype)s)");
-                %(fail)s
-            }
-            """ % dict(
-                sub, name=name, dtype=specs[1], pyarr_type="Py%sArrType_Type" % specs[2]
-            )
+                    "Scalar check failed ({dtype})");
+                {fail}
+            }}
+            """
         else:
             pre = ""
         return (
             pre
-            + """
-        PyArray_ScalarAsCtype(py_%(name)s, &%(name)s);
+            + f"""
+        PyArray_ScalarAsCtype(py_{name}, &{name});
         """
-            % dict(sub, name=name)
         )
 
     def c_sync(self, name, sub):
         specs = self.dtype_specs()
-        return """
-        Py_XDECREF(py_%(name)s);
-        py_%(name)s = PyArrayScalar_New(%(cls)s);
-        if (!py_%(name)s)
-        {
+        fail = sub["fail"]
+        dtype = specs[1]
+        cls = specs[2]
+        return f"""
+        Py_XDECREF(py_{name});
+        py_{name} = PyArrayScalar_New({cls});
+        if (!py_{name})
+        {{
             Py_XINCREF(Py_None);
-            py_%(name)s = Py_None;
+            py_{name} = Py_None;
             PyErr_Format(PyExc_MemoryError,
-                "Instantiation of new Python scalar failed (%(dtype)s)");
-            %(fail)s
-        }
-        PyArrayScalar_ASSIGN(py_%(name)s, %(cls)s, %(name)s);
-        """ % dict(
-            sub, name=name, dtype=specs[1], cls=specs[2]
-        )
+                "Instantiation of new Python scalar failed ({dtype})");
+            {fail}
+        }}
+        PyArrayScalar_ASSIGN(py_{name}, {cls}, {name});
+        """
 
     def c_cleanup(self, name, sub):
         return ""
@@ -723,7 +717,7 @@ float_types: _ScalarTypes = (float16, float32, float64)
 complex_types: _ScalarTypes = (complex64, complex128)
 
 integer_types: _ScalarTypes = int_types + uint_types
-discrete_types: _ScalarTypes = (bool,) + integer_types
+discrete_types: _ScalarTypes = (bool, *integer_types)
 continuous_types: _ScalarTypes = float_types + complex_types
 all_types: _ScalarTypes = discrete_types + continuous_types
 
@@ -867,7 +861,7 @@ def constant(x, name=None, dtype=None) -> ScalarConstant:
     return ScalarConstant(get_scalar_type(str(x.dtype)), x, name=name)
 
 
-def as_scalar(x: Any, name: Optional[str] = None) -> ScalarVariable:
+def as_scalar(x: Any, name: str | None = None) -> ScalarVariable:
     from pytensor.tensor.basic import scalar_from_tensor
     from pytensor.tensor.type import TensorType
 
@@ -898,31 +892,31 @@ complexs64 = apply_across_args(complex64)
 complexs128 = apply_across_args(complex128)
 
 
-def upcast_out(*types):
+def upcast_out(*types) -> tuple[ScalarType]:
     dtype = ScalarType.upcast(*types)
     return (get_scalar_type(dtype),)
 
 
-def upcast_out_nobool(*types):
+def upcast_out_nobool(*types) -> tuple[ScalarType]:
     type = upcast_out(*types)
     if type[0] == bool:
         raise TypeError("bool output not supported")
     return type
 
 
-def upcast_out_min8(*types):
+def upcast_out_min8(*types) -> tuple[ScalarType]:
     type = upcast_out(*types)
     if type[0] == bool:
         return (int8,)
     return type
 
 
-def upgrade_to_float(*types):
+def upgrade_to_float(*types) -> tuple[ScalarType]:
     """
     Upgrade any int types to float32 or float64 to avoid losing precision.
 
     """
-    conv: Mapping[type, type] = {
+    conv: dict[ScalarType, ScalarType] = {
         bool: float32,
         int8: float32,
         int16: float32,
@@ -933,12 +927,11 @@ def upgrade_to_float(*types):
         uint32: float64,
         uint64: float64,
     }
-    return (
-        get_scalar_type(ScalarType.upcast(*[conv.get(type, type) for type in types])),
-    )
+    up = ScalarType.upcast(*[conv.get(type, type) for type in types])
+    return (get_scalar_type(up),)
 
 
-def upgrade_to_float64(*types):
+def upgrade_to_float64(*types) -> tuple[ScalarType]:
     """
     Upgrade any int and float32 to float64 to do as SciPy.
 
@@ -946,29 +939,29 @@ def upgrade_to_float64(*types):
     return (get_scalar_type("float64"),)
 
 
-def same_out(type):
+def same_out(type: ScalarType) -> tuple[ScalarType]:
     return (type,)
 
 
-def same_out_nobool(type):
+def same_out_nobool(type: ScalarType) -> tuple[ScalarType]:
     if type == bool:
         raise TypeError("bool input not supported")
     return (type,)
 
 
-def same_out_min8(type):
+def same_out_min8(type: ScalarType) -> tuple[ScalarType]:
     if type == bool:
         return (int8,)
     return (type,)
 
 
-def upcast_out_no_complex(*types):
+def upcast_out_no_complex(*types) -> tuple[ScalarType]:
     if any(type in complex_types for type in types):
         raise TypeError("complex type are not supported")
     return (get_scalar_type(dtype=ScalarType.upcast(*types)),)
 
 
-def same_out_float_only(type):
+def same_out_float_only(type) -> tuple[ScalarType]:
     if type not in float_types:
         raise TypeError("only float type are supported")
     return (type,)
@@ -978,7 +971,7 @@ class transfer_type(MetaObject):
     __props__ = ("transfer",)
 
     def __init__(self, *transfer):
-        assert all(isinstance(x, (int, str)) or x is None for x in transfer)
+        assert all(isinstance(x, int | str) or x is None for x in transfer)
         self.transfer = transfer
 
     def __str__(self):
@@ -1068,13 +1061,13 @@ class unary_out_lookup(MetaObject):
             rval = self.tbl[types]
         except Exception:
             raise TypeError(types)
-        if isinstance(types, (list, tuple)):
+        if isinstance(types, list | tuple):
             return rval
         else:
             return [rval]
 
     def __eq__(self, other):
-        return type(self) == type(other) and self.tbl == other.tbl
+        return type(self) is type(other) and self.tbl == other.tbl
 
     def __hash__(self):
         return hash(type(self))  # ignore hash of table
@@ -1122,7 +1115,7 @@ class ScalarOp(COp):
     def output_types(self, types):
         if hasattr(self, "output_types_preference"):
             variables = self.output_types_preference(*types)
-            if not isinstance(variables, (list, tuple)) or any(
+            if not isinstance(variables, list | tuple) or any(
                 not isinstance(x, CType) for x in variables
             ):
                 raise TypeError(
@@ -1141,14 +1134,28 @@ class ScalarOp(COp):
         else:
             raise NotImplementedError(f"Cannot calculate the output types for {self}")
 
+    @staticmethod
+    def _cast_scalar(x, dtype):
+        if hasattr(x, "astype"):
+            return x.astype(dtype)
+        elif dtype == "bool":
+            return np.bool_(x)
+        else:
+            return getattr(np, dtype)(x)
+
     def perform(self, node, inputs, output_storage):
         if self.nout == 1:
-            output_storage[0][0] = self.impl(*inputs)
+            dtype = node.outputs[0].dtype
+            output_storage[0][0] = self._cast_scalar(self.impl(*inputs), dtype)
         else:
             variables = from_return_values(self.impl(*inputs))
             assert len(variables) == len(output_storage)
-            for storage, variable in zip(output_storage, variables):
-                storage[0] = variable
+            # strict=False because we are in a hot loop
+            for out, storage, variable in zip(
+                node.outputs, output_storage, variables, strict=False
+            ):
+                dtype = out.dtype
+                storage[0] = self._cast_scalar(variable, dtype)
 
     def impl(self, *inputs):
         raise MethodNotDefined("impl", type(self), self.__class__.__name__)
@@ -1160,7 +1167,7 @@ class ScalarOp(COp):
         return self.grad(inputs, output_gradients)
 
     def __eq__(self, other):
-        test = type(self) == type(other) and getattr(
+        test = type(self) is type(other) and getattr(
             self, "output_types_preference", None
         ) == getattr(other, "output_types_preference", None)
         return test
@@ -1179,10 +1186,9 @@ class ScalarOp(COp):
                 not in ("name", "_op_use_c_code", "bool", "output_types_preference")
             ]
             if param:
-                return "{}{{{}}}".format(
-                    self.__class__.__name__,
-                    ", ".join(f"{k}={v}" for k, v in param),
-                )
+                classname = self.__class__.__name__
+                args = ", ".join(f"{k}={v}" for k, v in param)
+                return f"{classname}{{{args}}}"
             else:
                 return self.__class__.__name__
 
@@ -1241,13 +1247,13 @@ class ScalarOp(COp):
 
 class UnaryScalarOp(ScalarOp):
     nin = 1
-    amd_float32: Optional[str] = None
-    amd_float64: Optional[str] = None
+    amd_float32: str | None = None
+    amd_float64: str | None = None
 
     def c_code_contiguous(self, node, name, inputs, outputs, sub):
         (x,) = inputs
         (z,) = outputs
-        if not config.lib__amblibm or node.inputs[0].type != node.outputs[0].type:
+        if not config.lib__amdlibm or node.inputs[0].type != node.outputs[0].type:
             raise MethodNotDefined()
 
         dtype = node.inputs[0].type.dtype_specs()[1]
@@ -1262,7 +1268,7 @@ class UnaryScalarOp(ScalarOp):
         """
 
     def c_code_contiguous_raw(self, dtype, n, i, o):
-        if not config.lib__amblibm:
+        if not config.lib__amdlibm:
             raise MethodNotDefined()
         if dtype.startswith("npy_"):
             dtype = dtype[4:]
@@ -1281,9 +1287,9 @@ class BinaryScalarOp(ScalarOp):
     # One may define in subclasses the following fields:
     #   - `commutative`: whether op(a, b) == op(b, a)
     #   - `associative`: whether op(op(a, b), c) == op(a, op(b, c))
-    commutative: Optional[builtins.bool] = None
-    associative: Optional[builtins.bool] = None
-    identity: Optional[Union[builtins.bool, builtins.float, builtins.int]] = None
+    commutative: builtins.bool | None = None
+    associative: builtins.bool | None = None
+    identity: builtins.bool | builtins.float | builtins.int | None = None
     """
     For an associative operation, the identity object corresponds to the neutral
     element. For instance, it will be ``0`` for addition, ``1`` for multiplication,
@@ -1314,13 +1320,13 @@ class LogicalComparison(BinaryScalarOp):
         x, y = inputs
         assert outputs[0].type == bool
         return [
-            x.zeros_like().astype(config.floatX),
-            y.zeros_like().astype(config.floatX),
+            x.zeros_like(dtype=config.floatX),
+            y.zeros_like(dtype=config.floatX),
         ]
 
     def c_code_cache_version(self):
         super_version = super().c_code_cache_version()
-        return super_version + (0,)
+        return (*super_version, 0)
 
 
 class FixedLogicalComparison(UnaryScalarOp):
@@ -1349,11 +1355,11 @@ class FixedLogicalComparison(UnaryScalarOp):
     def L_op(self, inputs, outputs, output_gradients):
         (x,) = inputs
         assert outputs[0].type == bool
-        return [x.zeros_like().astype(config.floatX)]
+        return [x.zeros_like(dtype=config.floatX)]
 
     def c_code_cache_version(self):
         super_version = super().c_code_cache_version()
-        return super_version + (0,)
+        return (*super_version, 0)
 
 
 class LT(LogicalComparison):
@@ -1499,7 +1505,7 @@ class IsNan(FixedLogicalComparison):
 
     def c_code_cache_version(self):
         scalarop_version = super().c_code_cache_version()
-        return tuple(scalarop_version) + (3,)
+        return (*scalarop_version, 3)
 
 
 isnan = IsNan()
@@ -1527,7 +1533,7 @@ class IsInf(FixedLogicalComparison):
 
     def c_code_cache_version(self):
         scalarop_version = super().c_code_cache_version()
-        return tuple(scalarop_version) + (3,)
+        return (*scalarop_version, 3)
 
 
 isinf = IsInf()
@@ -1568,16 +1574,14 @@ class InRange(LogicalComparison):
             )
             raise NotImplementedError(msg)
         elif elem.type in discrete_types:
-            return elem.zeros_like().astype(config.floatX)
+            return elem.zeros_like(dtype=config.floatX)
         else:
             return elem.zeros_like()
 
     def L_op(self, inputs, outputs, gout):
         (x, low, hi) = inputs
         (gz,) = gout
-        grads = []
-        for elem in [x, low, hi]:
-            grads.append(self.get_grad(elem))
+        grads = [self.get_grad(elem) for elem in [x, low, hi]]
         return grads
 
 
@@ -1604,13 +1608,13 @@ class Switch(ScalarOp):
         second_part = switch(cond, 0.0, gz)
 
         if outputs[0].type in discrete_types:
-            first_part = ift.zeros_like(config.floatX)
-            second_part = iff.zeros_like(config.floatX)
+            first_part = ift.zeros_like(dtype=config.floatX)
+            second_part = iff.zeros_like(dtype=config.floatX)
 
         # cond does affect the elements of the output so it is connected.
         # For the sake of making the gradient convenient we assume that
         # condition + epsilon always triggers the same branch as condition
-        condition_grad = cond.zeros_like().astype(config.floatX)
+        condition_grad = cond.zeros_like(dtype=config.floatX)
 
         return (condition_grad, first_part, second_part)
 
@@ -1637,7 +1641,7 @@ class UnaryBitOp(UnaryScalarOp):
         return upcast_out(*input_types[0])
 
     def grad(self, inputs, output_gradients):
-        return [inputs[0].zeros_like().astype(config.floatX)]
+        return [inputs[0].zeros_like(dtype=config.floatX)]
 
 
 class BinaryBitOp(BinaryScalarOp):
@@ -1657,8 +1661,8 @@ class BinaryBitOp(BinaryScalarOp):
     def grad(self, inputs, output_gradients):
         a, b = inputs
         return [
-            a.zeros_like().astype(config.floatX),
-            b.zeros_like().astype(config.floatX),
+            a.zeros_like(dtype=config.floatX),
+            b.zeros_like(dtype=config.floatX),
         ]
 
 
@@ -1714,7 +1718,7 @@ class AND(BinaryBitOp):
 
     def c_code_cache_version(self):
         super_version = super().c_code_cache_version()
-        return super_version + (3,)
+        return (*super_version, 3)
 
 
 and_ = AND()
@@ -1757,7 +1761,7 @@ class ScalarMaximum(BinaryScalarOp):
         if any(i.type in complex_types for i in node.inputs):
             raise NotImplementedError()
         # Test for both y>x and x>=y to detect NaN
-        return f"{z} = (({y})>({x})? ({y}): " f'(({x})>=({y})? ({x}): nan("")));'
+        return f'{z} = (({y})>({x})? ({y}): (({x})>=({y})? ({x}): nan("")));'
 
     def L_op(self, inputs, outputs, gout):
         (x, y) = inputs
@@ -1769,8 +1773,8 @@ class ScalarMaximum(BinaryScalarOp):
 
         if outputs[0].type in discrete_types:
             return [
-                x.zeros_like().astype(config.floatX),
-                y.zeros_like().astype(config.floatX),
+                x.zeros_like(dtype=config.floatX),
+                y.zeros_like(dtype=config.floatX),
             ]
         # This form handle the case when both value are the same.
         # In that case, gx will be gz, gy will be 0.
@@ -1799,7 +1803,7 @@ class ScalarMinimum(BinaryScalarOp):
         (z,) = outputs
         if any(i.type in complex_types for i in node.inputs):
             raise NotImplementedError()
-        return f"{z} = (({y})<({x})? ({y}): " f'(({x})<=({y})? ({x}): nan("")));'
+        return f'{z} = (({y})<({x})? ({y}): (({x})<=({y})? ({x}): nan("")));'
 
     def L_op(self, inputs, outputs, gout):
         (x, y) = inputs
@@ -1811,8 +1815,8 @@ class ScalarMinimum(BinaryScalarOp):
 
         if outputs[0].type in discrete_types:
             return [
-                x.zeros_like().astype(config.floatX),
-                y.zeros_like().astype(config.floatX),
+                x.zeros_like(dtype=config.floatX),
+                y.zeros_like(dtype=config.floatX),
             ]
         # This form handle the case when both value are the same.
         # In that case, gx will be gz, gy will be 0.
@@ -1854,7 +1858,7 @@ class Add(ScalarOp):
             retval = []
             for ii, inp in enumerate(inputs):
                 if hasattr(inp, "zeros_like"):
-                    retval.append(inp.zeros_like().astype(config.floatX))
+                    retval.append(inp.zeros_like(dtype=config.floatX))
                 else:
                     retval.append(grad_undefined(self, ii, inp))
         else:
@@ -1865,32 +1869,6 @@ class Add(ScalarOp):
 
 
 add = Add(upcast_out, name="add")
-
-
-class Mean(ScalarOp):
-    identity = 0
-    commutative = True
-    associative = False
-    nfunc_spec = ("mean", 2, 1)
-    nfunc_variadic = "mean"
-
-    def impl(self, *inputs):
-        return sum(inputs) / len(inputs)
-
-    def c_code(self, node, name, inputs, outputs, sub):
-        (z,) = outputs
-        if not inputs:
-            return f"{z} = 0;"
-        else:
-            return f"{z} = ({' + '.join(inputs)}) / ((double) {len(inputs)});"
-
-    def L_op(self, inputs, outputs, gout):
-        (gz,) = gout
-        retval = [gz / len(inputs)] * len(inputs)
-        return retval
-
-
-mean = Mean(float_out, name="mean")
 
 
 class Mul(ScalarOp):
@@ -1930,7 +1908,7 @@ class Mul(ScalarOp):
                 )
 
         if output_type in discrete_types:
-            return [ipt.zeros_like().astype(config.floatX) for ipt in inputs]
+            return [ipt.zeros_like(dtype=config.floatX) for ipt in inputs]
 
         for input in inputs:
             if gz.type in complex_types:
@@ -1948,7 +1926,7 @@ class Mul(ScalarOp):
                 else:
                     retval += [yr * real(gz) + yi * imag(gz)]
             else:
-                retval += [mul(*([gz] + difference(inputs, [input])))]
+                retval += [mul(*([gz, *difference(inputs, [input])]))]
         return retval
 
 
@@ -1973,8 +1951,8 @@ class Sub(BinaryScalarOp):
             raise NotImplementedError()
         if outputs[0].type in discrete_types:
             return [
-                x.zeros_like().astype(config.floatX),
-                y.zeros_like().astype(config.floatX),
+                x.zeros_like(dtype=config.floatX),
+                y.zeros_like(dtype=config.floatX),
             ]
 
         first_part = gz
@@ -2029,7 +2007,10 @@ class TrueDiv(BinaryScalarOp):
         # to the output; x/y is still a function of x
         # and y; it's just a step function.
         if all(a.dtype in discrete_dtypes for a in (x, y)):
-            return [x.zeros_like(), y.zeros_like()]
+            return [
+                x.zeros_like(dtype=config.floatX),
+                y.zeros_like(dtype=config.floatX),
+            ]
 
         first_part = gz / y
 
@@ -2286,8 +2267,8 @@ class Pow(BinaryScalarOp):
 
         if outputs[0].type in discrete_types:
             return [
-                x.zeros_like().astype(config.floatX),
-                y.zeros_like().astype(config.floatX),
+                x.zeros_like(dtype=config.floatX),
+                y.zeros_like(dtype=config.floatX),
             ]
 
         first_part = gz * y * x ** (y - 1)
@@ -2300,7 +2281,7 @@ class Pow(BinaryScalarOp):
     def c_code_contiguous(self, node, name, inputs, outputs, sub):
         (x, y) = inputs
         (z,) = outputs
-        if not config.lib__amblibm:
+        if not config.lib__amdlibm:
             raise MethodNotDefined()
 
         # We compare the dtype AND the broadcast flag
@@ -2378,7 +2359,7 @@ class Clip(ScalarOp):
 
         def handle_int(v):
             if outputs[0].type in int_types:
-                return v.zeros_like().astype(config.floatX)
+                return v.zeros_like(dtype=config.floatX)
             return v
 
         return list(map(handle_int, [gx, gmn, gmx]))
@@ -2415,7 +2396,7 @@ class Second(BinaryScalarOp):
             # to deal with real-valued inputs by rounding them to the
             # nearest integer. f(x+eps) thus equals f(x) so the gradient
             # is zero, not disconnected or undefined
-            return DisconnectedType()(), y.zeros_like()
+            return DisconnectedType()(), y.zeros_like(dtype=config.floatX)
 
 
 second = Second(transfer_type(1), name="second")
@@ -2487,12 +2468,12 @@ class Cast(UnaryScalarOp):
         if self.o_type in continuous_types:
             return [gz]
         else:
-            return [x.zeros_like().astype(config.floatX)]
+            return [x.zeros_like(dtype=config.floatX)]
 
     def c_code_cache_version(self):
         s = super().c_code_cache_version()
         if s:
-            return (4,) + s
+            return (4, *s)
         else:
             return s
 
@@ -2639,7 +2620,7 @@ class Sign(UnaryScalarOp):
     def c_code_cache_version(self):
         s = super().c_code_cache_version()
         if s:
-            return (4,) + s
+            return (4, *s)
         else:  # if parent is unversioned, we are too
             return s
 
@@ -2708,7 +2689,7 @@ class Trunc(UnaryScalarOp):
     def grad(self, inputs, gout):
         (x,) = inputs
         (gz,) = gout
-        return [x.zeros_like().astype(config.floatX)]
+        return [x.zeros_like(dtype=config.floatX)]
 
     def c_code(self, node, name, inputs, outputs, sub):
         (x,) = inputs
@@ -3029,7 +3010,7 @@ class Log10(UnaryScalarOp):
             else:
                 return [x.zeros_like()]
 
-        return (gz / (x * np.log(10.0)),)
+        return (gz / (x * np.asarray(math.log(10.0)).astype(x.dtype)),)
 
     def c_code(self, node, name, inputs, outputs, sub):
         (x,) = inputs
@@ -4094,9 +4075,10 @@ class ScalarInnerGraphOp(ScalarOp, HasInnerGraph):
         return tuple(rval)
 
     def c_header_dirs(self, **kwargs):
-        rval = sum(
-            (subnode.op.c_header_dirs(**kwargs) for subnode in self.fgraph.toposort()),
-            [],
+        rval = list(
+            chain.from_iterable(
+                subnode.op.c_header_dirs(**kwargs) for subnode in self.fgraph.toposort()
+            )
         )
         return rval
 
@@ -4110,7 +4092,9 @@ class ScalarInnerGraphOp(ScalarOp, HasInnerGraph):
 
     def c_support_code_apply(self, node, name):
         rval = []
-        for subnode, subnodename in zip(self.fgraph.toposort(), self.nodenames):
+        for subnode, subnodename in zip(
+            self.fgraph.toposort(), self.nodenames, strict=True
+        ):
             subnode_support_code = subnode.op.c_support_code_apply(
                 subnode, subnodename % dict(nodename=name)
             )
@@ -4124,7 +4108,7 @@ class ScalarInnerGraphOp(ScalarOp, HasInnerGraph):
 
     def prepare_node(self, node, storage_map, compute_map, impl):
         if impl not in self.prepare_node_called:
-            for n in list_of_nodes(self.inputs, self.outputs):
+            for n in applys_between(self.inputs, self.outputs):
                 n.op.prepare_node(n, None, None, impl)
             self.prepare_node_called.add(impl)
 
@@ -4132,7 +4116,7 @@ class ScalarInnerGraphOp(ScalarOp, HasInnerGraph):
         if self is other:
             return True
         if (
-            type(self) != type(other)
+            type(self) is not type(other)
             or self.nin != other.nin
             or self.nout != other.nout
         ):
@@ -4216,7 +4200,7 @@ class Composite(ScalarInnerGraphOp):
             res2 = pytensor.compile.rebuild_collect_shared(
                 inputs=outputs[0].owner.op.inputs,
                 outputs=outputs[0].owner.op.outputs,
-                replace=dict(zip(outputs[0].owner.op.inputs, res[1])),
+                replace=dict(zip(outputs[0].owner.op.inputs, res[1], strict=True)),
             )
             assert len(res2[1]) == len(outputs)
             assert len(res[0]) == len(inputs)
@@ -4224,8 +4208,8 @@ class Composite(ScalarInnerGraphOp):
             inputs, outputs = res[0], res2[1]
 
         self.inputs, self.outputs = self._cleanup_graph(inputs, outputs)
-        self.inputs_type = tuple([input.type for input in self.inputs])
-        self.outputs_type = tuple([output.type for output in self.outputs])
+        self.inputs_type = tuple(input.type for input in self.inputs)
+        self.outputs_type = tuple(output.type for output in self.outputs)
         self.nin = len(inputs)
         self.nout = len(outputs)
         super().__init__()
@@ -4241,13 +4225,17 @@ class Composite(ScalarInnerGraphOp):
             r.name = f"o{int(i)}"
         io = set(self.fgraph.inputs + self.fgraph.outputs)
         for i, r in enumerate(self.fgraph.variables):
-            if r not in io and len(self.fgraph.clients[r]) > 1:
+            if (
+                not isinstance(r, Constant)
+                and r not in io
+                and len(self.fgraph.clients[r]) > 1
+            ):
                 r.name = f"t{int(i)}"
 
         if len(self.fgraph.outputs) > 1 or len(self.fgraph.apply_nodes) > 10:
             self._name = "Composite{...}"
         else:
-            outputs_str = ", ".join([pprint(output) for output in self.fgraph.outputs])
+            outputs_str = ", ".join(pprint(output) for output in self.fgraph.outputs)
             self._name = f"Composite{{{outputs_str}}}"
 
         return self._name
@@ -4295,14 +4283,14 @@ class Composite(ScalarInnerGraphOp):
         return self.outputs_type
 
     def make_node(self, *inputs):
-        if tuple([i.type for i in self.inputs]) == tuple([i.type for i in inputs]):
+        if tuple(i.type for i in self.inputs) == tuple(i.type for i in inputs):
             return super().make_node(*inputs)
         else:
             # Make a new op with the right input type.
             assert len(inputs) == self.nin
             res = pytensor.compile.rebuild_collect_shared(
                 self.outputs,
-                replace=dict(zip(self.inputs, inputs)),
+                replace=dict(zip(self.inputs, inputs, strict=True)),
                 rebuild_strict=False,
             )
             # After rebuild_collect_shared, the Variable in inputs
@@ -4315,7 +4303,8 @@ class Composite(ScalarInnerGraphOp):
 
     def perform(self, node, inputs, output_storage):
         outputs = self.py_perform_fn(*inputs)
-        for storage, out_val in zip(output_storage, outputs):
+        # strict=False because we are in a hot loop
+        for storage, out_val in zip(output_storage, outputs, strict=False):
             storage[0] = out_val
 
     def grad(self, inputs, output_grads):
@@ -4340,7 +4329,7 @@ class Composite(ScalarInnerGraphOp):
                 if var not in self.fgraph.inputs:
                     # This is an orphan
                     if isinstance(var, Constant) and isinstance(var.type, CLinkerType):
-                        subd[var] = var.type.c_literal(var.data)
+                        subd[var] = f"({var.type.c_literal(var.data)})"
                     else:
                         raise ValueError(
                             "All orphans in the fgraph to Composite must"
@@ -4385,8 +4374,8 @@ class Composite(ScalarInnerGraphOp):
     def c_code(self, node, nodename, inames, onames, sub):
         d = dict(
             chain(
-                zip((f"i{int(i)}" for i in range(len(inames))), inames),
-                zip((f"o{int(i)}" for i in range(len(onames))), onames),
+                zip((f"i{int(i)}" for i in range(len(inames))), inames, strict=True),
+                zip((f"o{int(i)}" for i in range(len(onames))), onames, strict=True),
             ),
             **sub,
         )
@@ -4399,7 +4388,7 @@ class Composite(ScalarInnerGraphOp):
         return self.c_code_template % d
 
     def c_code_cache_version_outer(self) -> tuple[int, ...]:
-        return (4,)
+        return (5,)
 
 
 class Compositef32:
@@ -4426,7 +4415,7 @@ class Compositef32:
                     else:
                         ni = i
                     mapping[i] = ni
-            if isinstance(node.op, tuple(self.special.keys())):
+            if isinstance(node.op, tuple(self.special)):
                 self.special[type(node.op)](node, mapping)
                 continue
             new_node = node.clone_with_new_inputs(
@@ -4434,8 +4423,7 @@ class Compositef32:
             )
             # make sure we don't produce any float16.
             assert not any(o.dtype == "float16" for o in new_node.outputs)
-            for o, no in zip(node.outputs, new_node.outputs):
-                mapping[o] = no
+            mapping.update(zip(node.outputs, new_node.outputs, strict=True))
 
         new_ins = [mapping[inp] for inp in fgraph.inputs]
         new_outs = [mapping[out] for out in fgraph.outputs]
@@ -4478,7 +4466,7 @@ def handle_composite(node, mapping):
     new_op = node.op.clone_float32()
     new_outs = new_op(*[mapping[i] for i in node.inputs], return_list=True)
     assert len(new_outs) == len(node.outputs)
-    for o, no in zip(node.outputs, new_outs):
+    for o, no in zip(node.outputs, new_outs, strict=True):
         mapping[o] = no
 
 

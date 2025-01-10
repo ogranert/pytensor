@@ -15,15 +15,16 @@ from pytensor.compile.sharedvalue import SharedVariable
 from pytensor.gradient import grad
 from pytensor.graph.basic import Constant
 from pytensor.graph.fg import FunctionGraph
-from pytensor.tensor import elemwise as pt_elemwise
-from pytensor.tensor.math import All, Any, Max, Mean, Min, Prod, ProdWithoutZeros, Sum
+from pytensor.scalar import float64
+from pytensor.tensor.elemwise import CAReduce, DimShuffle, Elemwise
+from pytensor.tensor.math import All, Any, Max, Min, Prod, ProdWithoutZeros, Sum
 from pytensor.tensor.special import LogSoftmax, Softmax, SoftmaxGrad
 from tests.link.numba.test_basic import (
     compare_numba_and_py,
     scalar_my_multi_out,
     set_test_value,
 )
-from tests.tensor.test_elemwise import TestElemwise
+from tests.tensor.test_elemwise import TestElemwise, careduce_benchmark_tester
 
 
 rng = np.random.default_rng(42849)
@@ -205,21 +206,21 @@ def test_elemwise_speed(benchmark):
     ],
 )
 def test_Dimshuffle(v, new_order):
-    g = pt_elemwise.DimShuffle(v.broadcastable, new_order)(v)
+    g = v.dimshuffle(new_order)
     g_fg = FunctionGraph(outputs=[g])
     compare_numba_and_py(
         g_fg,
         [
             i.tag.test_value
             for i in g_fg.inputs
-            if not isinstance(i, (SharedVariable, Constant))
+            if not isinstance(i, SharedVariable | Constant)
         ],
     )
 
 
 def test_Dimshuffle_returns_array():
     x = pt.vector("x", shape=(1,))
-    y = 2 * pt_elemwise.DimShuffle([True], [])(x)
+    y = 2 * x.dimshuffle([])
     func = pytensor.function([x], y, mode="NUMBA")
     out = func(np.zeros(1, dtype=config.floatX))
     assert out.ndim == 0
@@ -230,7 +231,7 @@ def test_Dimshuffle_non_contiguous():
     non-contiguous arrays, make sure we work around thpt."""
     x = pt.dvector()
     idx = pt.vector(dtype="int64")
-    op = pytensor.tensor.elemwise.DimShuffle([True], [])
+    op = DimShuffle(input_ndim=1, new_order=[])
     out = op(pt.specify_shape(x[idx][::2], (1,)))
     func = pytensor.function([x, idx], out, mode="NUMBA")
     assert func(np.zeros(3), np.array([1])).ndim == 0
@@ -249,24 +250,12 @@ def test_Dimshuffle_non_contiguous():
         (
             lambda x, axis=None, dtype=None, acc_dtype=None: All(axis)(x),
             0,
-            set_test_value(pt.vector(), np.arange(3, dtype=config.floatX)),
+            set_test_value(pt.vector(dtype="bool"), np.array([False, True, False])),
         ),
         (
             lambda x, axis=None, dtype=None, acc_dtype=None: Any(axis)(x),
             0,
-            set_test_value(pt.vector(), np.arange(3, dtype=config.floatX)),
-        ),
-        (
-            lambda x, axis=None, dtype=None, acc_dtype=None: Mean(axis)(x),
-            0,
-            set_test_value(pt.vector(), np.arange(3, dtype=config.floatX)),
-        ),
-        (
-            lambda x, axis=None, dtype=None, acc_dtype=None: Mean(axis)(x),
-            0,
-            set_test_value(
-                pt.matrix(), np.arange(3 * 2, dtype=config.floatX).reshape((3, 2))
-            ),
+            set_test_value(pt.vector(dtype="bool"), np.array([False, True, False])),
         ),
         (
             lambda x, axis=None, dtype=None, acc_dtype=None: Sum(
@@ -312,6 +301,24 @@ def test_Dimshuffle_non_contiguous():
             set_test_value(
                 pt.matrix(), np.arange(3 * 2, dtype=config.floatX).reshape((3, 2))
             ),
+        ),
+        (
+            lambda x, axis=None, dtype=None, acc_dtype=None: Prod(
+                axis=axis, dtype=dtype, acc_dtype=acc_dtype
+            )(x),
+            (),  # Empty axes would normally be rewritten away, but we want to test it still works
+            set_test_value(
+                pt.matrix(), np.arange(3 * 2, dtype=config.floatX).reshape((3, 2))
+            ),
+        ),
+        (
+            lambda x, axis=None, dtype=None, acc_dtype=None: Prod(
+                axis=axis, dtype=dtype, acc_dtype=acc_dtype
+            )(x),
+            None,
+            set_test_value(
+                pt.scalar(), np.array(99.0, dtype=config.floatX)
+            ),  # Scalar input would normally be rewritten away, but we want to test it still works
         ),
         (
             lambda x, axis=None, dtype=None, acc_dtype=None: Prod(
@@ -379,14 +386,18 @@ def test_CAReduce(careduce_fn, axis, v):
     g = careduce_fn(v, axis=axis)
     g_fg = FunctionGraph(outputs=[g])
 
-    compare_numba_and_py(
+    fn, _ = compare_numba_and_py(
         g_fg,
         [
             i.tag.test_value
             for i in g_fg.inputs
-            if not isinstance(i, (SharedVariable, Constant))
+            if not isinstance(i, SharedVariable | Constant)
         ],
     )
+    # Confirm CAReduce is in the compiled function
+    fn.dprint()
+    [node] = fn.maker.fgraph.apply_nodes
+    assert isinstance(node.op, CAReduce)
 
 
 def test_scalar_Elemwise_Clip():
@@ -440,7 +451,7 @@ def test_SoftmaxGrad(dy, sm, axis, exc):
             [
                 i.tag.test_value
                 for i in g_fg.inputs
-                if not isinstance(i, (SharedVariable, Constant))
+                if not isinstance(i, SharedVariable | Constant)
             ],
         )
 
@@ -486,7 +497,7 @@ def test_Softmax(x, axis, exc):
             [
                 i.tag.test_value
                 for i in g_fg.inputs
-                if not isinstance(i, (SharedVariable, Constant))
+                if not isinstance(i, SharedVariable | Constant)
             ],
         )
 
@@ -522,7 +533,7 @@ def test_LogSoftmax(x, axis, exc):
             [
                 i.tag.test_value
                 for i in g_fg.inputs
-                if not isinstance(i, (SharedVariable, Constant))
+                if not isinstance(i, SharedVariable | Constant)
             ],
         )
 
@@ -552,8 +563,8 @@ def test_LogSoftmax(x, axis, exc):
         ),
     ],
 )
-def test_MaxAndArgmax(x, axes, exc):
-    g = ptm.MaxAndArgmax(axes)(x)
+def test_Max(x, axes, exc):
+    g = ptm.Max(axes)(x)
 
     if isinstance(g, list):
         g_fg = FunctionGraph(outputs=g)
@@ -567,7 +578,52 @@ def test_MaxAndArgmax(x, axes, exc):
             [
                 i.tag.test_value
                 for i in g_fg.inputs
-                if not isinstance(i, (SharedVariable, Constant))
+                if not isinstance(i, SharedVariable | Constant)
+            ],
+        )
+
+
+@pytest.mark.parametrize(
+    "x, axes, exc",
+    [
+        (
+            set_test_value(pt.dscalar(), np.array(0.0, dtype="float64")),
+            [],
+            None,
+        ),
+        (
+            set_test_value(pt.dvector(), rng.random(size=(3,)).astype("float64")),
+            [0],
+            None,
+        ),
+        (
+            set_test_value(pt.dmatrix(), rng.random(size=(3, 2)).astype("float64")),
+            [0],
+            None,
+        ),
+        (
+            set_test_value(pt.dmatrix(), rng.random(size=(3, 2)).astype("float64")),
+            [0, 1],
+            None,
+        ),
+    ],
+)
+def test_Argmax(x, axes, exc):
+    g = ptm.Argmax(axes)(x)
+
+    if isinstance(g, list):
+        g_fg = FunctionGraph(outputs=g)
+    else:
+        g_fg = FunctionGraph(outputs=[g])
+
+    cm = contextlib.suppress() if exc is None else pytest.warns(exc)
+    with cm:
+        compare_numba_and_py(
+            g_fg,
+            [
+                i.tag.test_value
+                for i in g_fg.inputs
+                if not isinstance(i, SharedVariable | Constant)
             ],
         )
 
@@ -586,10 +642,10 @@ def test_logsumexp_benchmark(size, axis, benchmark):
     X_lse_fn = pytensor.function([X], X_lse, mode="NUMBA")
 
     # JIT compile first
-    _ = X_lse_fn(X_val)
-    res = benchmark(X_lse_fn, X_val)
+    res = X_lse_fn(X_val)
     exp_res = scipy.special.logsumexp(X_val, axis=axis, keepdims=True)
     np.testing.assert_array_almost_equal(res, exp_res)
+    benchmark(X_lse_fn, X_val)
 
 
 def test_fused_elemwise_benchmark(benchmark):
@@ -620,3 +676,33 @@ def test_elemwise_out_type():
     x_val = np.broadcast_to(np.zeros((3,)), (6, 3))
 
     assert func(x_val).shape == (18,)
+
+
+@pytest.mark.parametrize(
+    "axis",
+    (0, 1, 2, (0, 1), (0, 2), (1, 2), None),
+    ids=lambda x: f"axis={x}",
+)
+@pytest.mark.parametrize(
+    "c_contiguous",
+    (True, False),
+    ids=lambda x: f"c_contiguous={x}",
+)
+def test_numba_careduce_benchmark(axis, c_contiguous, benchmark):
+    return careduce_benchmark_tester(
+        axis, c_contiguous, mode="NUMBA", benchmark=benchmark
+    )
+
+
+def test_scalar_loop():
+    a = float64("a")
+    scalar_loop = pytensor.scalar.ScalarLoop([a], [a + a])
+
+    x = pt.tensor("x", shape=(3,))
+    elemwise_loop = Elemwise(scalar_loop)(3, x)
+
+    with pytest.warns(UserWarning, match="object mode"):
+        compare_numba_and_py(
+            ([x], [elemwise_loop]),
+            (np.array([1, 2, 3], dtype="float64"),),
+        )

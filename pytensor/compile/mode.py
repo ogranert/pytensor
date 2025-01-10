@@ -5,7 +5,7 @@ WRITEME
 
 import logging
 import warnings
-from typing import Literal, Optional, Union
+from typing import Literal
 
 from pytensor.compile.function.types import Supervisor
 from pytensor.configdefaults import config
@@ -28,6 +28,7 @@ from pytensor.link.basic import Linker, PerformLinker
 from pytensor.link.c.basic import CLinker, OpWiseCLinker
 from pytensor.link.jax.linker import JAXLinker
 from pytensor.link.numba.linker import NumbaLinker
+from pytensor.link.pytorch.linker import PytorchLinker
 from pytensor.link.vm import VMLinker
 
 
@@ -47,6 +48,7 @@ predefined_linkers = {
     "vm_nogc": VMLinker(allow_gc=False, use_cloop=False),
     "cvm_nogc": VMLinker(allow_gc=False, use_cloop=True),
     "jax": JAXLinker(),
+    "pytorch": PytorchLinker(),
     "numba": NumbaLinker(),
 }
 
@@ -260,7 +262,7 @@ optdb.register(
 # final pass just to make sure
 optdb.register("merge3", MergeOptimizer(), "fast_run", "merge", position=100)
 
-_tags: Union[tuple[str, str], tuple]
+_tags: tuple[str, str] | tuple
 
 if config.check_stack_trace in ("raise", "warn", "log"):
     _tags = ("fast_run", "fast_compile")
@@ -297,8 +299,8 @@ class Mode:
 
     def __init__(
         self,
-        linker: Optional[Union[str, Linker]] = None,
-        optimizer: Union[str, RewriteDatabaseQuery] = "default",
+        linker: str | Linker | None = None,
+        optimizer: str | RewriteDatabaseQuery = "default",
         db: RewriteDatabase = None,
     ):
         if linker is None:
@@ -452,7 +454,18 @@ JAX = Mode(
     JAXLinker(),
     RewriteDatabaseQuery(
         include=["fast_run", "jax"],
-        # TODO: "local_uint_constant_indices" can be reintroduced once https://github.com/google/jax/issues/16836 is fixed.
+        exclude=[
+            "cxx_only",
+            "BlasOpt",
+            "fusion",
+            "inplace",
+        ],
+    ),
+)
+PYTORCH = Mode(
+    PytorchLinker(),
+    RewriteDatabaseQuery(
+        include=["fast_run"],
         exclude=[
             "cxx_only",
             "BlasOpt",
@@ -465,7 +478,7 @@ JAX = Mode(
 NUMBA = Mode(
     NumbaLinker(),
     RewriteDatabaseQuery(
-        include=["fast_run"],
+        include=["fast_run", "numba"],
         exclude=["cxx_only", "BlasOpt", "local_careduce_fusion"],
     ),
 )
@@ -476,6 +489,7 @@ predefined_modes = {
     "FAST_RUN": FAST_RUN,
     "JAX": JAX,
     "NUMBA": NUMBA,
+    "PYTORCH": PYTORCH,
 }
 
 instantiated_default_mode = None
@@ -565,7 +579,7 @@ def get_target_language(mode=None) -> tuple[Literal["py", "c", "numba", "jax"], 
     if isinstance(linker, CLinker):
         return ("c",)
 
-    if isinstance(linker, (VMLinker, OpWiseCLinker)):
+    if isinstance(linker, VMLinker | OpWiseCLinker):
         return ("c", "py") if config.cxx else ("py",)
 
     raise Exception(f"Unsupported Linker: {linker}")

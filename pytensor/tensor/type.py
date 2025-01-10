@@ -1,7 +1,7 @@
 import logging
 import warnings
 from collections.abc import Iterable
-from typing import TYPE_CHECKING, Literal, Optional, Union
+from typing import TYPE_CHECKING, Literal, Optional
 
 import numpy as np
 
@@ -12,7 +12,6 @@ from pytensor.graph.basic import Variable
 from pytensor.graph.type import HasDataType, HasShape
 from pytensor.graph.utils import MetaType
 from pytensor.link.c.type import CType
-from pytensor.misc.safe_asarray import _asarray
 from pytensor.utils import apply_across_args
 
 
@@ -70,10 +69,10 @@ class TensorType(CType[np.ndarray], HasDataType, HasShape):
 
     def __init__(
         self,
-        dtype: Union[str, np.dtype],
-        shape: Optional[Iterable[Optional[Union[bool, int]]]] = None,
-        name: Optional[str] = None,
-        broadcastable: Optional[Iterable[bool]] = None,
+        dtype: str | np.dtype,
+        shape: Iterable[bool | int | None] | None = None,
+        name: str | None = None,
+        broadcastable: Iterable[bool] | None = None,
     ):
         r"""
 
@@ -108,9 +107,9 @@ class TensorType(CType[np.ndarray], HasDataType, HasShape):
             self.dtype = np.dtype(dtype).name
 
         def parse_bcast_and_shape(s):
-            if isinstance(s, (bool, np.bool_)):
+            if isinstance(s, bool | np.bool_):
                 return 1 if s else None
-            elif isinstance(s, (int, np.integer)):
+            elif isinstance(s, int | np.integer):
                 return int(s)
             elif s is None:
                 return s
@@ -138,7 +137,7 @@ class TensorType(CType[np.ndarray], HasDataType, HasShape):
             shape = self.shape
         return type(self)(dtype, shape, name=self.name)
 
-    def filter(self, data, strict=False, allow_downcast=None):
+    def filter(self, data, strict=False, allow_downcast=None) -> np.ndarray:
         """Convert `data` to something which can be associated to a `TensorVariable`.
 
         This function is not meant to be called in user code. It is for
@@ -162,7 +161,7 @@ class TensorType(CType[np.ndarray], HasDataType, HasShape):
             pass
         elif isinstance(data, np.ndarray) and (data.dtype == self.numpy_dtype):
             if data.dtype.num != self.numpy_dtype.num:
-                data = _asarray(data, dtype=self.dtype)
+                data = np.asarray(data, dtype=self.dtype)
             # -- now fall through to ndim check
         elif strict:
             # If any of the two conditions above was not met,
@@ -178,7 +177,7 @@ class TensorType(CType[np.ndarray], HasDataType, HasShape):
         else:
             if allow_downcast:
                 # Convert to self.dtype, regardless of the type of data
-                data = _asarray(data, dtype=self.dtype)
+                data = np.asarray(data, dtype=self.dtype)
                 # TODO: consider to pad shape with ones to make it consistent
                 # with self.broadcastable... like vector->row type thing
             else:
@@ -191,7 +190,7 @@ class TensorType(CType[np.ndarray], HasDataType, HasShape):
                         # scalar array, see
                         # http://projects.scipy.org/numpy/ticket/1611
                         # data = data.astype(self.dtype)
-                        data = _asarray(data, dtype=self.dtype)
+                        data = np.asarray(data, dtype=self.dtype)
                     if up_dtype != self.dtype:
                         err_msg = (
                             f"{self} cannot store a value of dtype {data.dtype} without "
@@ -199,21 +198,21 @@ class TensorType(CType[np.ndarray], HasDataType, HasShape):
                             "this loss, you can: "
                             f"1) explicitly cast your data to {self.dtype}, or "
                             '2) set "allow_input_downcast=True" when calling '
-                            f'"function". Value: "{repr(data)}"'
+                            f'"function". Value: "{data!r}"'
                         )
                         raise TypeError(err_msg)
                 elif (
                     allow_downcast is None
-                    and isinstance(data, (float, np.floating))
+                    and isinstance(data, float | np.floating)
                     and self.dtype == config.floatX
                 ):
                     # Special case where we allow downcasting of Python float
                     # literals to floatX, even when floatX=='float32'
-                    data = _asarray(data, self.dtype)
+                    data = np.asarray(data, self.dtype)
                 else:
                     # data has to be converted.
                     # Check that this conversion is lossless
-                    converted_data = _asarray(data, self.dtype)
+                    converted_data = np.asarray(data, self.dtype)
                     # We use the `values_eq` static function from TensorType
                     # to handle NaN values.
                     if TensorType.values_eq(
@@ -249,9 +248,10 @@ class TensorType(CType[np.ndarray], HasDataType, HasShape):
                 " PyTensor C code does not support that.",
             )
 
+        # strict=False because we are in a hot loop
         if not all(
             ds == ts if ts is not None else True
-            for ds, ts in zip(data.shape, self.shape)
+            for ds, ts in zip(data.shape, self.shape, strict=False)
         ):
             raise TypeError(
                 f"The type's shape ({self.shape}) is not compatible with the data's ({data.shape})"
@@ -320,13 +320,17 @@ class TensorType(CType[np.ndarray], HasDataType, HasShape):
         return False
 
     def is_super(self, otype):
+        # strict=False because we are in a hot loop
         if (
             isinstance(otype, type(self))
             and otype.dtype == self.dtype
             and otype.ndim == self.ndim
             # `otype` is allowed to be as or more shape-specific than `self`,
             # but not less
-            and all(sb == ob or sb is None for sb, ob in zip(self.shape, otype.shape))
+            and all(
+                sb == ob or sb is None
+                for sb, ob in zip(self.shape, otype.shape, strict=False)
+            )
         ):
             return True
 
@@ -370,7 +374,7 @@ class TensorType(CType[np.ndarray], HasDataType, HasShape):
         return values_eq_approx(a, b, allow_remove_inf, allow_remove_nan, rtol, atol)
 
     def __eq__(self, other):
-        if type(self) != type(other):
+        if type(self) is not type(other):
             return NotImplemented
 
         return other.dtype == self.dtype and other.shape == self.shape
@@ -401,7 +405,7 @@ class TensorType(CType[np.ndarray], HasDataType, HasShape):
                 else:
                     return str(s)
 
-            formatted_shape = ", ".join([shape_str(s) for s in shape])
+            formatted_shape = ", ".join(shape_str(s) for s in shape)
             if len_shape == 1:
                 formatted_shape += ","
 
@@ -475,54 +479,51 @@ class TensorType(CType[np.ndarray], HasDataType, HasShape):
 
     def c_declare(self, name, sub, check_input=True):
         if check_input:
-            check = """
-            typedef %(dtype)s dtype_%(name)s;
-            """ % dict(
-                sub, name=name, dtype=self.dtype_specs()[1]
-            )
+            dtype = self.dtype_specs()[1]
+            check = f"""
+            typedef {dtype} dtype_{name};
+            """
         else:
             check = ""
-        declaration = """
-        PyArrayObject* %(name)s;
-        """ % dict(
-            sub, name=name, dtype=self.dtype_specs()[1]
-        )
+        declaration = f"""
+        PyArrayObject* {name};
+        """
 
         return declaration + check
 
     def c_init(self, name, sub):
-        return """
-        %(name)s = NULL;
-        """ % dict(
-            sub, name=name, type_num=self.dtype_specs()[2]
-        )
+        return f"""
+        {name} = NULL;
+        """
 
     def c_extract(self, name, sub, check_input=True, **kwargs):
         if check_input:
-            check = """
-            %(name)s = NULL;
-            if (py_%(name)s == Py_None) {
-                // We can either fail here or set %(name)s to NULL and rely on Ops
+            fail = sub["fail"]
+            type_num = self.dtype_specs()[2]
+            check = f"""
+            {name} = NULL;
+            if (py_{name} == Py_None) {{
+                // We can either fail here or set {name} to NULL and rely on Ops
                 // using tensors to handle the NULL case, but if they fail to do so
                 // they'll end up with nasty segfaults, so this is public service.
                 PyErr_SetString(PyExc_ValueError, "expected an ndarray, not None");
-                %(fail)s
-            }
-            if (!PyArray_Check(py_%(name)s)) {
+                {fail}
+            }}
+            if (!PyArray_Check(py_{name})) {{
                 PyErr_SetString(PyExc_ValueError, "expected an ndarray");
-                %(fail)s
-            }
-            // We expect %(type_num)s
-            if (!PyArray_ISALIGNED((PyArrayObject*) py_%(name)s)) {
-                PyArrayObject * tmp = (PyArrayObject*) py_%(name)s;
+                {fail}
+            }}
+            // We expect {type_num}
+            if (!PyArray_ISALIGNED((PyArrayObject*) py_{name})) {{
+                PyArrayObject * tmp = (PyArrayObject*) py_{name};
                 PyErr_Format(PyExc_NotImplementedError,
-                             "expected an aligned array of type %%ld "
-                             "(%(type_num)s), got non-aligned array of type %%ld"
-                             " with %%ld dimensions, with 3 last dims "
-                             "%%ld, %%ld, %%ld"
-                             " and 3 last strides %%ld %%ld, %%ld.",
-                             (long int) %(type_num)s,
-                             (long int) PyArray_TYPE((PyArrayObject*) py_%(name)s),
+                             "expected an aligned array of type %ld "
+                             "({type_num}), got non-aligned array of type %ld"
+                             " with %ld dimensions, with 3 last dims "
+                             "%ld, %ld, %ld"
+                             " and 3 last strides %ld %ld, %ld.",
+                             (long int) {type_num},
+                             (long int) PyArray_TYPE((PyArrayObject*) py_{name}),
                              (long int) PyArray_NDIM(tmp),
                              (long int) (PyArray_NDIM(tmp) >= 3 ?
             PyArray_DIMS(tmp)[PyArray_NDIM(tmp)-3] : -1),
@@ -537,82 +538,72 @@ class TensorType(CType[np.ndarray], HasDataType, HasShape):
                              (long int) (PyArray_NDIM(tmp) >= 1 ?
             PyArray_STRIDES(tmp)[PyArray_NDIM(tmp)-1] : -1)
             );
-                %(fail)s
-            }
+                {fail}
+            }}
             // This is a TypeError to be consistent with DEBUG_MODE
             // Note: DEBUG_MODE also tells the name of the container
-            if (PyArray_TYPE((PyArrayObject*) py_%(name)s) != %(type_num)s) {
+            if (PyArray_TYPE((PyArrayObject*) py_{name}) != {type_num}) {{
                 PyErr_Format(PyExc_TypeError,
-                             "expected type_num %%d (%(type_num)s) got %%d",
-                             %(type_num)s, PyArray_TYPE((PyArrayObject*) py_%(name)s));
-                %(fail)s
-            }
-            """ % dict(
-                sub, name=name, type_num=self.dtype_specs()[2]
-            )
+                             "expected type_num %d ({type_num}) got %d",
+                             {type_num}, PyArray_TYPE((PyArrayObject*) py_{name}));
+                {fail}
+            }}
+            """
         else:
             check = ""
         return (
             check
-            + """
-        %(name)s = (PyArrayObject*)(py_%(name)s);
-        Py_XINCREF(%(name)s);
+            + f"""
+        {name} = (PyArrayObject*)(py_{name});
+        Py_XINCREF({name});
         """
-            % dict(sub, name=name, type_num=self.dtype_specs()[2])
         )
 
     def c_cleanup(self, name, sub):
-        return (
-            """
-        if (%(name)s) {
-            Py_XDECREF(%(name)s);
-        }
+        return f"""
+        if ({name}) {{
+            Py_XDECREF({name});
+        }}
         """
-            % locals()
-        )
 
     def c_sync(self, name, sub):
         fail = sub["fail"]
-        type_num = self.dtype_specs()[2]
-        return (
-            """
-        {Py_XDECREF(py_%(name)s);}
-        if (!%(name)s) {
+        return f"""
+        {{Py_XDECREF(py_{name});}}
+        if (!{name}) {{
             Py_INCREF(Py_None);
-            py_%(name)s = Py_None;
-        }
-        else if ((void*)py_%(name)s != (void*)%(name)s) {
-            py_%(name)s = (PyObject*)%(name)s;
-        }
+            py_{name} = Py_None;
+        }}
+        else if ((void*)py_{name} != (void*){name}) {{
+            py_{name} = (PyObject*){name};
+        }}
 
-        {Py_XINCREF(py_%(name)s);}
+        {{Py_XINCREF(py_{name});}}
 
-        if (%(name)s && !PyArray_ISALIGNED((PyArrayObject*) py_%(name)s)) {
+        if ({name} && !PyArray_ISALIGNED((PyArrayObject*) py_{name})) {{
             PyErr_Format(PyExc_NotImplementedError,
-                         "c_sync: expected an aligned array, got non-aligned array of type %%ld"
-                         " with %%ld dimensions, with 3 last dims "
-                         "%%ld, %%ld, %%ld"
-                         " and 3 last strides %%ld %%ld, %%ld.",
-                         (long int) PyArray_TYPE((PyArrayObject*) py_%(name)s),
-                         (long int) PyArray_NDIM(%(name)s),
-                         (long int) (PyArray_NDIM(%(name)s) >= 3 ?
-        PyArray_DIMS(%(name)s)[PyArray_NDIM(%(name)s)-3] : -1),
-                         (long int) (PyArray_NDIM(%(name)s) >= 2 ?
-        PyArray_DIMS(%(name)s)[PyArray_NDIM(%(name)s)-2] : -1),
-                         (long int) (PyArray_NDIM(%(name)s) >= 1 ?
-        PyArray_DIMS(%(name)s)[PyArray_NDIM(%(name)s)-1] : -1),
-                         (long int) (PyArray_NDIM(%(name)s) >= 3 ?
-        PyArray_STRIDES(%(name)s)[PyArray_NDIM(%(name)s)-3] : -1),
-                         (long int) (PyArray_NDIM(%(name)s) >= 2 ?
-        PyArray_STRIDES(%(name)s)[PyArray_NDIM(%(name)s)-2] : -1),
-                         (long int) (PyArray_NDIM(%(name)s) >= 1 ?
-        PyArray_STRIDES(%(name)s)[PyArray_NDIM(%(name)s)-1] : -1)
+                         "c_sync: expected an aligned array, got non-aligned array of type %ld"
+                         " with %ld dimensions, with 3 last dims "
+                         "%ld, %ld, %ld"
+                         " and 3 last strides %ld %ld, %ld.",
+                         (long int) PyArray_TYPE((PyArrayObject*) py_{name}),
+                         (long int) PyArray_NDIM({name}),
+                         (long int) (PyArray_NDIM({name}) >= 3 ?
+        PyArray_DIMS({name})[PyArray_NDIM({name})-3] : -1),
+                         (long int) (PyArray_NDIM({name}) >= 2 ?
+        PyArray_DIMS({name})[PyArray_NDIM({name})-2] : -1),
+                         (long int) (PyArray_NDIM({name}) >= 1 ?
+        PyArray_DIMS({name})[PyArray_NDIM({name})-1] : -1),
+                         (long int) (PyArray_NDIM({name}) >= 3 ?
+        PyArray_STRIDES({name})[PyArray_NDIM({name})-3] : -1),
+                         (long int) (PyArray_NDIM({name}) >= 2 ?
+        PyArray_STRIDES({name})[PyArray_NDIM({name})-2] : -1),
+                         (long int) (PyArray_NDIM({name}) >= 1 ?
+        PyArray_STRIDES({name})[PyArray_NDIM({name})-1] : -1)
         );
-            %(fail)s
-        }
+            {fail}
+        }}
         """
-            % locals()
-        )
 
     def c_headers(self, **kwargs):
         return ps.get_scalar_type(self.dtype).c_headers(**kwargs)
@@ -632,14 +623,14 @@ class TensorType(CType[np.ndarray], HasDataType, HasShape):
     def c_code_cache_version(self):
         scalar_version = ps.get_scalar_type(self.dtype).c_code_cache_version()
         if scalar_version:
-            return (11,) + scalar_version
+            return (11, *scalar_version)
         else:
             return ()
 
 
 class DenseTypeMeta(MetaType):
     def __instancecheck__(self, o):
-        if type(o) == TensorType or isinstance(o, DenseTypeMeta):
+        if type(o) is TensorType or isinstance(o, DenseTypeMeta):
             return True
         return False
 
@@ -787,14 +778,14 @@ pytensor.compile.register_deep_copy_op_c_code(
 )
 
 # Valid static type entries
-ST = Union[int, None]
+ST = int | None
 
 
 def tensor(
-    name: Optional[str] = None,
+    name: str | None = None,
     *,
     dtype: Optional["DTypeLike"] = None,
-    shape: Optional[tuple[ST, ...]] = None,
+    shape: tuple[ST, ...] | None = None,
     **kwargs,
 ) -> "TensorVariable":
     if name is not None:
@@ -828,7 +819,7 @@ ulscalar = TensorType("uint64", ())
 
 
 def scalar(
-    name: Optional[str] = None,
+    name: str | None = None,
     *,
     dtype: Optional["DTypeLike"] = None,
 ) -> "TensorVariable":
@@ -883,10 +874,10 @@ def _validate_static_shape(shape, ndim: int) -> tuple[ST, ...]:
 
 
 def vector(
-    name: Optional[str] = None,
+    name: str | None = None,
     *,
     dtype: Optional["DTypeLike"] = None,
-    shape: Optional[tuple[ST]] = (None,),
+    shape: tuple[ST] | None = (None,),
 ) -> "TensorVariable":
     """Return a symbolic vector variable.
 
@@ -929,10 +920,10 @@ lmatrix = TensorType("int64", shape=(None, None))
 
 
 def matrix(
-    name: Optional[str] = None,
+    name: str | None = None,
     *,
     dtype: Optional["DTypeLike"] = None,
-    shape: Optional[tuple[ST, ST]] = (None, None),
+    shape: tuple[ST, ST] | None = (None, None),
 ) -> "TensorVariable":
     """Return a symbolic matrix variable.
 
@@ -973,10 +964,10 @@ lrow = TensorType("int64", shape=(1, None))
 
 
 def row(
-    name: Optional[str] = None,
+    name: str | None = None,
     *,
     dtype: Optional["DTypeLike"] = None,
-    shape: Optional[tuple[Literal[1], ST]] = (1, None),
+    shape: tuple[Literal[1], ST] | None = (1, None),
 ) -> "TensorVariable":
     """Return a symbolic row variable (i.e. shape ``(1, None)``).
 
@@ -1017,10 +1008,10 @@ lcol = TensorType("int64", shape=(None, 1))
 
 
 def col(
-    name: Optional[str] = None,
+    name: str | None = None,
     *,
     dtype: Optional["DTypeLike"] = None,
-    shape: Optional[tuple[ST, Literal[1]]] = (None, 1),
+    shape: tuple[ST, Literal[1]] | None = (None, 1),
 ) -> "TensorVariable":
     """Return a symbolic column variable (i.e. shape ``(None, 1)``).
 
@@ -1059,10 +1050,10 @@ ltensor3 = TensorType("int64", shape=((None,) * 3))
 
 
 def tensor3(
-    name: Optional[str] = None,
+    name: str | None = None,
     *,
     dtype: Optional["DTypeLike"] = None,
-    shape: Optional[tuple[ST, ST, ST]] = (None, None, None),
+    shape: tuple[ST, ST, ST] | None = (None, None, None),
 ) -> "TensorVariable":
     """Return a symbolic 3D variable.
 
@@ -1099,10 +1090,10 @@ ltensor4 = TensorType("int64", shape=((None,) * 4))
 
 
 def tensor4(
-    name: Optional[str] = None,
+    name: str | None = None,
     *,
     dtype: Optional["DTypeLike"] = None,
-    shape: Optional[tuple[ST, ST, ST, ST]] = (None, None, None, None),
+    shape: tuple[ST, ST, ST, ST] | None = (None, None, None, None),
 ) -> "TensorVariable":
     """Return a symbolic 4D variable.
 
@@ -1139,10 +1130,10 @@ ltensor5 = TensorType("int64", shape=((None,) * 5))
 
 
 def tensor5(
-    name: Optional[str] = None,
+    name: str | None = None,
     *,
     dtype: Optional["DTypeLike"] = None,
-    shape: Optional[tuple[ST, ST, ST, ST, ST]] = (None, None, None, None, None),
+    shape: tuple[ST, ST, ST, ST, ST] | None = (None, None, None, None, None),
 ) -> "TensorVariable":
     """Return a symbolic 5D variable.
 
@@ -1179,10 +1170,10 @@ ltensor6 = TensorType("int64", shape=((None,) * 6))
 
 
 def tensor6(
-    name: Optional[str] = None,
+    name: str | None = None,
     *,
     dtype: Optional["DTypeLike"] = None,
-    shape: Optional[tuple[ST, ST, ST, ST, ST, ST]] = (
+    shape: tuple[ST, ST, ST, ST, ST, ST] | None = (
         None,
         None,
         None,
@@ -1226,10 +1217,10 @@ ltensor7 = TensorType("int64", shape=((None,) * 7))
 
 
 def tensor7(
-    name: Optional[str] = None,
+    name: str | None = None,
     *,
     dtype: Optional["DTypeLike"] = None,
-    shape: Optional[tuple[ST, ST, ST, ST, ST, ST, ST]] = (
+    shape: tuple[ST, ST, ST, ST, ST, ST, ST] | None = (
         None,
         None,
         None,

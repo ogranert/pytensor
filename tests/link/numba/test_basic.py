@@ -1,11 +1,13 @@
 import contextlib
 import inspect
-from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any, Callable, Optional, Union
+from collections.abc import Callable, Sequence
+from typing import TYPE_CHECKING, Any
 from unittest import mock
 
 import numpy as np
 import pytest
+
+from tests.tensor.test_math_scipy import scipy
 
 
 numba = pytest.importorskip("numba")
@@ -27,12 +29,10 @@ from pytensor.graph.rewriting.db import RewriteDatabaseQuery
 from pytensor.graph.type import Type
 from pytensor.ifelse import ifelse
 from pytensor.link.numba.dispatch import basic as numba_basic
-from pytensor.link.numba.dispatch import numba_typify
 from pytensor.link.numba.linker import NumbaLinker
 from pytensor.raise_op import assert_op
 from pytensor.scalar.basic import ScalarOp, as_scalar
 from pytensor.tensor import blas
-from pytensor.tensor import subtensor as pt_subtensor
 from pytensor.tensor.elemwise import Elemwise
 from pytensor.tensor.shape import Reshape, Shape, Shape_i, SpecifyShape
 
@@ -117,8 +117,12 @@ my_multi_out = Elemwise(MyMultiOut())
 my_multi_out.ufunc = MyMultiOut.impl
 my_multi_out.ufunc.nin = 2
 my_multi_out.ufunc.nout = 2
-opts = RewriteDatabaseQuery(include=[None], exclude=["cxx_only", "BlasOpt"])
-numba_mode = Mode(NumbaLinker(), opts)
+opts = RewriteDatabaseQuery(
+    include=[None], exclude=["cxx_only", "BlasOpt", "local_careduce_fusion"]
+)
+numba_mode = Mode(
+    NumbaLinker(), opts.including("numba", "local_useless_unbatched_blockwise")
+)
 py_mode = Mode("py", opts)
 
 rng = np.random.default_rng(42849)
@@ -221,12 +225,15 @@ def eval_python_only(fn_inputs, fn_outputs, inputs, mode=numba_mode):
 
 
 def compare_numba_and_py(
-    fgraph: Union[FunctionGraph, tuple[Sequence["Variable"], Sequence["Variable"]]],
+    fgraph: FunctionGraph | tuple[Sequence["Variable"], Sequence["Variable"]],
     inputs: Sequence["TensorLike"],
-    assert_fn: Optional[Callable] = None,
+    assert_fn: Callable | None = None,
+    *,
     numba_mode=numba_mode,
     py_mode=py_mode,
     updates=None,
+    inplace: bool = False,
+    eval_obj_mode: bool = True,
 ) -> tuple[Callable, Any]:
     """Function to compare python graph output and Numba compiled output for testing equality
 
@@ -237,7 +244,7 @@ def compare_numba_and_py(
     Parameters
     ----------
     fgraph
-        `FunctionGraph` or inputs to compare.
+        `FunctionGraph` or tuple(inputs, outputs) to compare.
     inputs
         Numeric inputs to be passed to the compiled graphs.
     assert_fn
@@ -245,6 +252,8 @@ def compare_numba_and_py(
         provided uses `np.testing.assert_allclose`.
     updates
         Updates to be passed to `pytensor.function`.
+    eval_obj_mode : bool, default True
+        Whether to do an isolated call in object mode. Used for test coverage
 
     Returns
     -------
@@ -258,18 +267,25 @@ def compare_numba_and_py(
                 x, y
             )
 
-    if isinstance(fgraph, tuple):
-        fn_inputs, fn_outputs = fgraph
-    else:
+    if isinstance(fgraph, FunctionGraph):
         fn_inputs = fgraph.inputs
         fn_outputs = fgraph.outputs
+    else:
+        fn_inputs, fn_outputs = fgraph
 
     fn_inputs = [i for i in fn_inputs if not isinstance(i, SharedVariable)]
 
     pytensor_py_fn = function(
         fn_inputs, fn_outputs, mode=py_mode, accept_inplace=True, updates=updates
     )
-    py_res = pytensor_py_fn(*inputs)
+
+    test_inputs = (inp.copy() for inp in inputs) if inplace else inputs
+    py_res = pytensor_py_fn(*test_inputs)
+
+    # Get some coverage (and catch errors in python mode before unreadable numba ones)
+    if eval_obj_mode:
+        test_inputs = (inp.copy() for inp in inputs) if inplace else inputs
+        eval_python_only(fn_inputs, fn_outputs, test_inputs, mode=numba_mode)
 
     pytensor_numba_fn = function(
         fn_inputs,
@@ -278,13 +294,12 @@ def compare_numba_and_py(
         accept_inplace=True,
         updates=updates,
     )
-    numba_res = pytensor_numba_fn(*inputs)
 
-    # Get some coverage
-    eval_python_only(fn_inputs, fn_outputs, inputs, mode=numba_mode)
+    test_inputs = (inp.copy() for inp in inputs) if inplace else inputs
+    numba_res = pytensor_numba_fn(*test_inputs)
 
     if len(fn_outputs) > 1:
-        for j, p in zip(numba_res, py_res):
+        for j, p in zip(numba_res, py_res, strict=True):
             assert_fn(j, p)
     else:
         assert_fn(numba_res[0], py_res[0])
@@ -358,206 +373,6 @@ def test_create_numba_signature(v, expected, force_scalar):
 
 
 @pytest.mark.parametrize(
-    "input, wrapper_fn, check_fn",
-    [
-        (
-            np.random.RandomState(1),
-            numba_typify,
-            lambda x, y: np.all(x.get_state()[1] == y.get_state()[1]),
-        )
-    ],
-)
-def test_box_unbox(input, wrapper_fn, check_fn):
-    input = wrapper_fn(input)
-
-    pass_through = numba.njit(lambda x: x)
-    res = pass_through(input)
-
-    assert isinstance(res, type(input))
-    assert check_fn(res, input)
-
-
-@pytest.mark.parametrize(
-    "x, indices",
-    [
-        (pt.as_tensor(np.arange(3 * 4 * 5).reshape((3, 4, 5))), (1,)),
-        (
-            pt.as_tensor(np.arange(3 * 4 * 5).reshape((3, 4, 5))),
-            (slice(None)),
-        ),
-        (pt.as_tensor(np.arange(3 * 4 * 5).reshape((3, 4, 5))), (1, 2, 0)),
-        (
-            pt.as_tensor(np.arange(3 * 4 * 5).reshape((3, 4, 5))),
-            (slice(1, 2), 1, slice(None)),
-        ),
-    ],
-)
-def test_Subtensor(x, indices):
-    """Test NumPy's basic indexing."""
-    out_pt = x[indices]
-    assert isinstance(out_pt.owner.op, pt_subtensor.Subtensor)
-    out_fg = FunctionGraph([], [out_pt])
-    compare_numba_and_py(out_fg, [])
-
-
-@pytest.mark.parametrize(
-    "x, indices",
-    [
-        (pt.as_tensor(np.arange(3 * 4 * 5).reshape((3, 4, 5))), ([1, 2],)),
-    ],
-)
-def test_AdvancedSubtensor1(x, indices):
-    """Test NumPy's advanced indexing in one dimension."""
-    out_pt = pt_subtensor.advanced_subtensor1(x, *indices)
-    assert isinstance(out_pt.owner.op, pt_subtensor.AdvancedSubtensor1)
-    out_fg = FunctionGraph([], [out_pt])
-    compare_numba_and_py(out_fg, [])
-
-
-def test_AdvancedSubtensor1_out_of_bounds():
-    out_pt = pt_subtensor.advanced_subtensor1(np.arange(3), [4])
-    assert isinstance(out_pt.owner.op, pt_subtensor.AdvancedSubtensor1)
-    out_fg = FunctionGraph([], [out_pt])
-    with pytest.raises(IndexError):
-        compare_numba_and_py(out_fg, [])
-
-
-@pytest.mark.parametrize(
-    "x, indices",
-    [
-        (pt.as_tensor(np.arange(3 * 4 * 5).reshape((3, 4, 5))), ([1, 2], [2, 3])),
-        (
-            pt.as_tensor(np.arange(3 * 4 * 5).reshape((3, 4, 5))),
-            ([1, 2], slice(None), [3, 4]),
-        ),
-    ],
-)
-def test_AdvancedSubtensor(x, indices):
-    """Test NumPy's advanced indexing in more than one dimension."""
-    out_pt = x[indices]
-    assert isinstance(out_pt.owner.op, pt_subtensor.AdvancedSubtensor)
-    out_fg = FunctionGraph([], [out_pt])
-    compare_numba_and_py(out_fg, [])
-
-
-@pytest.mark.parametrize(
-    "x, y, indices",
-    [
-        (
-            pt.as_tensor(np.arange(3 * 4 * 5).reshape((3, 4, 5))),
-            pt.as_tensor(np.array(10)),
-            (1,),
-        ),
-        (
-            pt.as_tensor(np.arange(3 * 4 * 5).reshape((3, 4, 5))),
-            pt.as_tensor(rng.poisson(size=(4, 5))),
-            (slice(None)),
-        ),
-        (
-            pt.as_tensor(np.arange(3 * 4 * 5).reshape((3, 4, 5))),
-            pt.as_tensor(np.array(10)),
-            (1, 2, 0),
-        ),
-        (
-            pt.as_tensor(np.arange(3 * 4 * 5).reshape((3, 4, 5))),
-            pt.as_tensor(rng.poisson(size=(1, 5))),
-            (slice(1, 2), 1, slice(None)),
-        ),
-    ],
-)
-def test_IncSubtensor(x, y, indices):
-    out_pt = pt.set_subtensor(x[indices], y)
-    assert isinstance(out_pt.owner.op, pt_subtensor.IncSubtensor)
-    out_fg = FunctionGraph([], [out_pt])
-    compare_numba_and_py(out_fg, [])
-
-    out_pt = pt.inc_subtensor(x[indices], y)
-    assert isinstance(out_pt.owner.op, pt_subtensor.IncSubtensor)
-    out_fg = FunctionGraph([], [out_pt])
-    compare_numba_and_py(out_fg, [])
-
-    x_pt = x.type()
-    out_pt = pt.set_subtensor(x_pt[indices], y, inplace=True)
-    assert isinstance(out_pt.owner.op, pt_subtensor.IncSubtensor)
-    out_fg = FunctionGraph([x_pt], [out_pt])
-    compare_numba_and_py(out_fg, [x.data])
-
-
-@pytest.mark.parametrize(
-    "x, y, indices",
-    [
-        (
-            pt.as_tensor(np.arange(3 * 4 * 5).reshape((3, 4, 5))),
-            pt.as_tensor(rng.poisson(size=(2, 4, 5))),
-            ([1, 2],),
-        ),
-        (
-            pt.as_tensor(np.arange(3 * 4 * 5).reshape((3, 4, 5))),
-            pt.as_tensor(rng.poisson(size=(2, 4, 5))),
-            ([1, 1],),
-        ),
-    ],
-)
-def test_AdvancedIncSubtensor1(x, y, indices):
-    out_pt = pt_subtensor.advanced_set_subtensor1(x, y, *indices)
-    assert isinstance(out_pt.owner.op, pt_subtensor.AdvancedIncSubtensor1)
-    out_fg = FunctionGraph([], [out_pt])
-    compare_numba_and_py(out_fg, [])
-
-    out_pt = pt_subtensor.advanced_inc_subtensor1(x, y, *indices)
-    assert isinstance(out_pt.owner.op, pt_subtensor.AdvancedIncSubtensor1)
-    out_fg = FunctionGraph([], [out_pt])
-    compare_numba_and_py(out_fg, [])
-
-    x_pt = x.type()
-    out_pt = pt_subtensor.AdvancedIncSubtensor1(inplace=True)(x_pt, y, *indices)
-    assert isinstance(out_pt.owner.op, pt_subtensor.AdvancedIncSubtensor1)
-    out_fg = FunctionGraph([x_pt], [out_pt])
-    compare_numba_and_py(out_fg, [x.data])
-
-
-@pytest.mark.parametrize(
-    "x, y, indices",
-    [
-        (
-            pt.as_tensor(np.arange(3 * 4 * 5).reshape((3, 4, 5))),
-            pt.as_tensor(rng.poisson(size=(2, 5))),
-            ([1, 2], [2, 3]),
-        ),
-        (
-            pt.as_tensor(np.arange(3 * 4 * 5).reshape((3, 4, 5))),
-            pt.as_tensor(rng.poisson(size=(2, 4))),
-            ([1, 2], slice(None), [3, 4]),
-        ),
-        pytest.param(
-            pt.as_tensor(np.arange(3 * 4 * 5).reshape((3, 4, 5))),
-            pt.as_tensor(rng.poisson(size=(2, 5))),
-            ([1, 1], [2, 2]),
-        ),
-    ],
-)
-def test_AdvancedIncSubtensor(x, y, indices):
-    out_pt = pt.set_subtensor(x[indices], y)
-    assert isinstance(out_pt.owner.op, pt_subtensor.AdvancedIncSubtensor)
-    out_fg = FunctionGraph([], [out_pt])
-    compare_numba_and_py(out_fg, [])
-
-    out_pt = pt.inc_subtensor(x[indices], y)
-    assert isinstance(out_pt.owner.op, pt_subtensor.AdvancedIncSubtensor)
-    out_fg = FunctionGraph([], [out_pt])
-    compare_numba_and_py(out_fg, [])
-
-    x_pt = x.type()
-    out_pt = pt.set_subtensor(x_pt[indices], y)
-    # Inplace isn't really implemented for `AdvancedIncSubtensor`, so we just
-    # hack it on here
-    out_pt.owner.op.inplace = True
-    assert isinstance(out_pt.owner.op, pt_subtensor.AdvancedIncSubtensor)
-    out_fg = FunctionGraph([x_pt], [out_pt])
-    compare_numba_and_py(out_fg, [x.data])
-
-
-@pytest.mark.parametrize(
     "x, i",
     [
         (np.zeros((20, 3)), 1),
@@ -595,7 +410,7 @@ def test_Reshape(v, shape, ndim):
         [
             i.tag.test_value
             for i in g_fg.inputs
-            if not isinstance(i, (SharedVariable, Constant))
+            if not isinstance(i, SharedVariable | Constant)
         ],
     )
 
@@ -610,7 +425,7 @@ def test_Reshape_scalar():
         [
             i.tag.test_value
             for i in g_fg.inputs
-            if not isinstance(i, (SharedVariable, Constant))
+            if not isinstance(i, SharedVariable | Constant)
         ],
     )
 
@@ -645,7 +460,7 @@ def test_SpecifyShape(v, shape, fails):
             [
                 i.tag.test_value
                 for i in g_fg.inputs
-                if not isinstance(i, (SharedVariable, Constant))
+                if not isinstance(i, SharedVariable | Constant)
             ],
         )
 
@@ -664,7 +479,7 @@ def test_ViewOp(v):
         [
             i.tag.test_value
             for i in g_fg.inputs
-            if not isinstance(i, (SharedVariable, Constant))
+            if not isinstance(i, SharedVariable | Constant)
         ],
     )
 
@@ -709,7 +524,7 @@ def test_perform(inputs, op, exc):
             [
                 i.tag.test_value
                 for i in g_fg.inputs
-                if not isinstance(i, (SharedVariable, Constant))
+                if not isinstance(i, SharedVariable | Constant)
             ],
         )
 
@@ -722,7 +537,7 @@ def test_perform_params():
 
     out = assert_op(x, np.array(True))
 
-    if not isinstance(out, (list, tuple)):
+    if not isinstance(out, list | tuple):
         out = [out]
 
     out_fg = FunctionGraph([x], out)
@@ -741,7 +556,7 @@ def test_perform_type_convert():
 
     out = assert_op(x.sum(), np.array(True))
 
-    if not isinstance(out, (list, tuple)):
+    if not isinstance(out, list | tuple):
         out = [out]
 
     out_fg = FunctionGraph([x], out)
@@ -788,7 +603,7 @@ def test_Dot(x, y, exc):
             [
                 i.tag.test_value
                 for i in g_fg.inputs
-                if not isinstance(i, (SharedVariable, Constant))
+                if not isinstance(i, SharedVariable | Constant)
             ],
         )
 
@@ -833,7 +648,7 @@ def test_Softplus(x, exc):
             [
                 i.tag.test_value
                 for i in g_fg.inputs
-                if not isinstance(i, (SharedVariable, Constant))
+                if not isinstance(i, SharedVariable | Constant)
             ],
         )
 
@@ -880,7 +695,7 @@ def test_BatchedDot(x, y, exc):
             [
                 i.tag.test_value
                 for i in g_fg.inputs
-                if not isinstance(i, (SharedVariable, Constant))
+                if not isinstance(i, SharedVariable | Constant)
             ],
         )
 
@@ -1021,9 +836,15 @@ def test_config_options_fastmath():
 
     with config.change_flags(numba__fastmath=True):
         pytensor_numba_fn = function([x], pt.sum(x), mode=numba_mode)
-        print(list(pytensor_numba_fn.vm.jit_fn.py_func.__globals__.keys()))
+        print(list(pytensor_numba_fn.vm.jit_fn.py_func.__globals__))
         numba_mul_fn = pytensor_numba_fn.vm.jit_fn.py_func.__globals__["impl_sum"]
-        assert numba_mul_fn.targetoptions["fastmath"] is True
+        assert numba_mul_fn.targetoptions["fastmath"] == {
+            "afn",
+            "arcp",
+            "contract",
+            "nsz",
+            "reassoc",
+        }
 
 
 def test_config_options_cached():
@@ -1064,3 +885,30 @@ def test_OpFromGraph():
     zv = np.ones((2, 2), dtype=config.floatX) * 5
 
     compare_numba_and_py(((x, y, z), (out,)), [xv, yv, zv])
+
+
+@pytest.mark.filterwarnings("error")
+def test_cache_warning_suppressed():
+    x = pt.vector("x", shape=(5,), dtype="float64")
+    out = pt.psi(x) * 2
+    fn = function([x], out, mode="NUMBA")
+
+    x_test = np.random.uniform(size=5)
+    np.testing.assert_allclose(fn(x_test), scipy.special.psi(x_test) * 2)
+
+
+@pytest.mark.parametrize("mode", ("default", "trust_input", "direct"))
+def test_function_overhead(mode, benchmark):
+    x = pt.vector("x")
+    out = pt.exp(x)
+
+    fn = function([x], out, mode="NUMBA")
+    if mode == "trust_input":
+        fn.trust_input = True
+    elif mode == "direct":
+        fn = fn.vm.jit_fn
+
+    test_x = np.zeros(1000)
+    assert np.sum(fn(test_x)) == 1000
+
+    benchmark(fn, test_x)

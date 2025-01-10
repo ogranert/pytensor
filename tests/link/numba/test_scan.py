@@ -77,15 +77,13 @@ from tests.link.numba.test_basic import compare_numba_and_py
         ),
         # nit-sot, shared input/output
         (
-            lambda: RandomStream(seed=1930, rng_ctor=np.random.RandomState).normal(
-                0, 1, name="a"
-            ),
+            lambda: RandomStream(seed=1930).normal(0, 1, name="a"),
             [],
             [{}],
             [],
             3,
             [],
-            [np.array([-1.63408257, 0.18046406, 2.43265803])],
+            [np.array([0.50100236, 2.16822932, 1.36326596])],
             lambda op: op.info.n_shared_outs > 0,
         ),
         # mit-sot (that's also a type of sit-sot)
@@ -460,8 +458,8 @@ def test_vector_taps_benchmark(benchmark):
     sitsot_init = scalar("sitsot_init", dtype="float64")
 
     def step(seq1, seq2, mitsot1, mitsot2, sitsot1):
-        mitsot3 = mitsot1 + seq2 + mitsot2 + seq1
-        sitsot2 = sitsot1 + mitsot3
+        mitsot3 = (mitsot1 + seq2 + mitsot2 + seq1) / np.sqrt(4)
+        sitsot2 = (sitsot1 + mitsot3) / np.sqrt(2)
         return mitsot3, sitsot2
 
     outs, _ = scan(
@@ -481,16 +479,16 @@ def test_vector_taps_benchmark(benchmark):
         sitsot_init: rng.normal(),
     }
 
-    numba_fn = pytensor.function(list(test.keys()), outs, mode=get_mode("NUMBA"))
+    numba_fn = pytensor.function(list(test), outs, mode=get_mode("NUMBA"))
     scan_nodes = [
         node for node in numba_fn.maker.fgraph.apply_nodes if isinstance(node.op, Scan)
     ]
     assert len(scan_nodes) == 1
     numba_res = numba_fn(*test.values())
 
-    ref_fn = pytensor.function(list(test.keys()), outs, mode=get_mode("FAST_COMPILE"))
+    ref_fn = pytensor.function(list(test), outs, mode=get_mode("FAST_COMPILE"))
     ref_res = ref_fn(*test.values())
-    for numba_r, ref_r in zip(numba_res, ref_res):
+    for numba_r, ref_r in zip(numba_res, ref_res, strict=True):
         np.testing.assert_array_almost_equal(numba_r, ref_r)
 
     benchmark(numba_fn, *test.values())

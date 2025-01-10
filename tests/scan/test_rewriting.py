@@ -18,9 +18,8 @@ from pytensor.scan.utils import until
 from pytensor.tensor import stack
 from pytensor.tensor.blas import Dot22
 from pytensor.tensor.elemwise import Elemwise
-from pytensor.tensor.math import Dot, dot, sigmoid
+from pytensor.tensor.math import Dot, dot, sigmoid, tanh
 from pytensor.tensor.math import sum as pt_sum
-from pytensor.tensor.math import tanh
 from pytensor.tensor.shape import reshape, shape, specify_shape
 from pytensor.tensor.type import (
     dmatrix,
@@ -271,7 +270,7 @@ class TestPushOutDot:
 
         f = function([h0, W1, W2], o, mode=self.mode)
 
-        scan_node = [x for x in f.maker.fgraph.toposort() if isinstance(x.op, Scan)][0]
+        scan_node = next(x for x in f.maker.fgraph.toposort() if isinstance(x.op, Scan))
         assert (
             len(
                 [
@@ -305,7 +304,7 @@ class TestPushOutDot:
 
 class TestPushOutNonSeqScan:
     """
-    Tests for the `push_out_non_seq_scan` optimization in the case where the inner
+    Tests for the `scan_push_out_non_seq` optimization in the case where the inner
     function of a `Scan` `Op` has an output which is the result of a `Dot` product
     on a non-sequence matrix input to `Scan` and a vector that is the result of
     computation in the inner function.
@@ -445,9 +444,9 @@ class TestPushOutNonSeqScan:
         # Ensure that the optimization was performed correctly in f_opt
         # The inner function of scan should have only one output and it should
         # not be the result of a Dot
-        scan_node = [
+        scan_node = next(
             node for node in f_opt.maker.fgraph.toposort() if isinstance(node.op, Scan)
-        ][0]
+        )
         assert len(scan_node.op.inner_outputs) == 1
         assert not isinstance(scan_node.op.inner_outputs[0], Dot)
 
@@ -489,9 +488,9 @@ class TestPushOutNonSeqScan:
         # Ensure that the optimization was performed correctly in f_opt
         # The inner function of scan should have only one output and it should
         # not be the result of a Dot
-        scan_node = [
+        scan_node = next(
             node for node in f_opt.maker.fgraph.toposort() if isinstance(node.op, Scan)
-        ][0]
+        )
         # NOTE: WHEN INFER_SHAPE IS RE-ENABLED, BELOW THE SCAN MUST
         # HAVE ONLY 1 OUTPUT.
         assert len(scan_node.op.inner_outputs) == 2
@@ -537,9 +536,9 @@ class TestPushOutNonSeqScan:
         # Ensure that the optimization was performed correctly in f_opt
         # The inner function of scan should have only one output and it should
         # not be the result of a Dot
-        scan_node = [
+        scan_node = next(
             node for node in f_opt.maker.fgraph.toposort() if isinstance(node.op, Scan)
-        ][0]
+        )
         assert len(scan_node.op.inner_outputs) == 2
         assert not isinstance(scan_node.op.inner_outputs[0], Dot)
 
@@ -596,7 +595,7 @@ class TestPushOutNonSeqScan:
 
 class TestPushOutAddScan:
     """
-    Test case for the `push_out_add_scan` optimization in the case where the `Scan`
+    Test case for the `scan_push_out_add` optimization in the case where the `Scan`
     is used to compute the sum over the dot products between the corresponding
     elements of two list of matrices.
 
@@ -1098,8 +1097,8 @@ class TestScanInplaceOptimizer:
             allow_input_downcast=True,
         )
         scan_node = [x for x in f9.maker.fgraph.toposort() if isinstance(x.op, Scan)]
-        assert 0 in scan_node[0].op.destroy_map.keys()
-        assert 1 in scan_node[0].op.destroy_map.keys()
+        assert 0 in scan_node[0].op.destroy_map
+        assert 1 in scan_node[0].op.destroy_map
         # compute output in numpy
         numpy_x0 = np.zeros((3,))
         numpy_x1 = np.zeros((3,))
@@ -1164,8 +1163,8 @@ class TestScanInplaceOptimizer:
         )
 
         scan_node = [x for x in f9.maker.fgraph.toposort() if isinstance(x.op, Scan)]
-        assert 0 in scan_node[0].op.destroy_map.keys()
-        assert 1 in scan_node[0].op.destroy_map.keys()
+        assert 0 in scan_node[0].op.destroy_map
+        assert 1 in scan_node[0].op.destroy_map
         # compute output in numpy
         numpy_x0 = np.zeros((3,))
         numpy_x1 = np.zeros((3,))
@@ -1204,12 +1203,12 @@ class TestScanInplaceOptimizer:
 
         f9 = function([], outputs, updates=updates, mode=self.mode)
         scan_node = [x for x in f9.maker.fgraph.toposort() if isinstance(x.op, Scan)]
-        assert 0 not in scan_node[0].op.destroy_map.keys()
-        assert 1 in scan_node[0].op.destroy_map.keys()
+        assert 0 not in scan_node[0].op.destroy_map
+        assert 1 in scan_node[0].op.destroy_map
 
 
 class TestSaveMem:
-    mode = get_default_mode().including("scan_save_mem", "save_mem_new_scan")
+    mode = get_default_mode().including("scan_save_mem", "scan_save_mem")
 
     def test_save_mem(self):
         rng = np.random.default_rng(utt.fetch_seed())
@@ -1640,7 +1639,7 @@ def test_alloc_inputs1():
     )
 
     f = function([h0, W1, W2], o, mode=get_default_mode().including("scan"))
-    scan_node = [x for x in f.maker.fgraph.toposort() if isinstance(x.op, Scan)][0]
+    scan_node = next(x for x in f.maker.fgraph.toposort() if isinstance(x.op, Scan))
     assert (
         len(
             [
@@ -1674,7 +1673,7 @@ def test_alloc_inputs2():
     )
 
     f = function([h0, W1, W2], o, mode=get_default_mode().including("scan"))
-    scan_node = [x for x in f.maker.fgraph.toposort() if isinstance(x.op, Scan)][0]
+    scan_node = next(x for x in f.maker.fgraph.toposort() if isinstance(x.op, Scan))
 
     assert (
         len(
@@ -1710,7 +1709,7 @@ def test_alloc_inputs3():
 
     # TODO FIXME: This result depends on unrelated rewrites in the "fast" mode.
     f = function([_h0, _W1, _W2], o, mode="FAST_RUN")
-    scan_node = [x for x in f.maker.fgraph.toposort() if isinstance(x.op, Scan)][0]
+    scan_node = next(x for x in f.maker.fgraph.toposort() if isinstance(x.op, Scan))
 
     assert len(scan_node.op.inner_inputs) == 1
 

@@ -42,7 +42,7 @@ class QuadraticOpFunc(COp):
 
     def c_support_code_apply(self, node, name):
         float_type = node.inputs[0].type.dtype_specs()[1]
-        return """
+        return f"""
         /* Computes: x = a*x*x + b*x + c for x in tensor. */
         int quadratic_{name}(PyArrayObject* tensor, {float_type} a, {float_type} b, {float_type} c) {{
             NpyIter* iterator = NpyIter_New(tensor,
@@ -70,34 +70,27 @@ class QuadraticOpFunc(COp):
             NpyIter_Deallocate(iterator);
             return 0;
         }}
-        """.format(
-            name=name,
-            float_type=float_type,
-        )
+        """
 
     def c_code(self, node, name, inputs, outputs, sub):
-        return """
-        %(float_type)s a = (%(float_type)s) (*(npy_float64*) PyArray_GETPTR1(%(coeff)s->a, 0)); // 0-D TensorType.
-        %(float_type)s b =                                                   %(coeff)s->b;      // ScalarType.
-        %(float_type)s c =                 (%(float_type)s) PyFloat_AsDouble(%(coeff)s->c);     // Generic.
-        Py_XDECREF(%(Y)s);
-        %(Y)s = (PyArrayObject*)PyArray_EMPTY(PyArray_NDIM(%(X)s), PyArray_DIMS(%(X)s), PyArray_TYPE(%(X)s), PyArray_IS_F_CONTIGUOUS(%(X)s));
-        if (PyArray_CopyInto(%(Y)s, %(X)s) != 0) {
+        X = inputs[0]
+        Y = outputs[0]
+        float_type = node.inputs[0].type.c_element_type()
+        return f"""
+        {float_type} a = ({float_type}) (*(npy_float64*) PyArray_GETPTR1({sub['params']}->a, 0)); // 0-D TensorType.
+        {float_type} b =                                                   {sub['params']}->b;      // ScalarType.
+        {float_type} c =                 ({float_type}) PyFloat_AsDouble({sub['params']}->c);     // Generic.
+        Py_XDECREF({Y});
+        {Y} = (PyArrayObject*)PyArray_EMPTY(PyArray_NDIM({X}), PyArray_DIMS({X}), PyArray_TYPE({X}), PyArray_IS_F_CONTIGUOUS({X}));
+        if (PyArray_CopyInto({Y}, {X}) != 0) {{
             PyErr_SetString(PyExc_RuntimeError, "Unable to copy input into output.");
-            %(fail)s
-        };
-        if (quadratic_%(name)s(%(Y)s, a, b, c) != 0) {
+            {sub['fail']}
+        }};
+        if (quadratic_{name}({Y}, a, b, c) != 0) {{
             PyErr_SetString(PyExc_RuntimeError, "Unable to compute quadratic function.");
-            %(fail)s
-        }
-        """ % dict(
-            name=name,
-            coeff=sub["params"],
-            fail=sub["fail"],
-            X=inputs[0],
-            Y=outputs[0],
-            float_type=node.inputs[0].type.c_element_type(),
-        )
+            {sub['fail']}
+        }}
+        """
 
 
 # Same op as above, but implemented as a ExternalCOp (with C code in an

@@ -1,6 +1,6 @@
 import functools
 import typing
-from typing import Callable, Optional
+from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
@@ -21,20 +21,24 @@ from pytensor.scalar.basic import (
     Sub,
 )
 from pytensor.scalar.math import (
+    BetaIncInv,
     Erf,
     Erfc,
     Erfcinv,
     Erfcx,
     Erfinv,
+    GammaIncCInv,
+    GammaIncInv,
     Iv,
     Ive,
+    Kve,
     Log1mexp,
     Psi,
     TriGamma,
 )
 
 
-def try_import_tfp_jax_op(op: ScalarOp, jax_op_name: Optional[str] = None) -> Callable:
+def try_import_tfp_jax_op(op: ScalarOp, jax_op_name: str | None = None) -> Callable:
     try:
         import tensorflow_probability.substrates.jax.math as tfp_jax_math
     except ModuleNotFoundError:
@@ -92,7 +96,7 @@ def jax_funcify_ScalarOp(op, node, **kwargs):
 
     func_name = nfunc_spec[0]
     if "." in func_name:
-        jax_func = functools.reduce(getattr, [jax] + func_name.split("."))
+        jax_func = functools.reduce(getattr, [jax, *func_name.split(".")])
     else:
         jax_func = getattr(jnp, func_name)
 
@@ -226,6 +230,20 @@ def jax_funcify_Second(op, **kwargs):
     return second
 
 
+@jax_funcify.register(GammaIncInv)
+def jax_funcify_GammaIncInv(op, **kwargs):
+    gammaincinv = try_import_tfp_jax_op(op, jax_op_name="igammainv")
+
+    return gammaincinv
+
+
+@jax_funcify.register(GammaIncCInv)
+def jax_funcify_GammaIncCInv(op, **kwargs):
+    gammainccinv = try_import_tfp_jax_op(op, jax_op_name="igammacinv")
+
+    return gammainccinv
+
+
 @jax_funcify.register(Erf)
 def jax_funcify_Erf(op, node, **kwargs):
     def erf(x):
@@ -250,6 +268,7 @@ def jax_funcify_Erfinv(op, **kwargs):
     return erfinv
 
 
+@jax_funcify.register(BetaIncInv)
 @jax_funcify.register(Erfcx)
 @jax_funcify.register(Erfcinv)
 def jax_funcify_from_tfp(op, **kwargs):
@@ -270,9 +289,12 @@ def jax_funcify_Iv(op, **kwargs):
 
 @jax_funcify.register(Ive)
 def jax_funcify_Ive(op, **kwargs):
-    ive = try_import_tfp_jax_op(op, jax_op_name="bessel_ive")
+    return try_import_tfp_jax_op(op, jax_op_name="bessel_ive")
 
-    return ive
+
+@jax_funcify.register(Kve)
+def jax_funcify_Kve(op, **kwargs):
+    return try_import_tfp_jax_op(op, jax_op_name="bessel_kve")
 
 
 @jax_funcify.register(Log1mexp)

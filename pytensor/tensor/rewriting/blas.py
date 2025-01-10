@@ -63,7 +63,7 @@ from pytensor.tensor.rewriting.basic import register_specialize
 
 
 try:
-    import numpy.__config__  # noqa
+    import numpy.__config__
 except ImportError:
     pass
 
@@ -96,7 +96,15 @@ from pytensor.tensor.blas import (
 )
 from pytensor.tensor.elemwise import DimShuffle, Elemwise
 from pytensor.tensor.exceptions import NotScalarConstantError
-from pytensor.tensor.math import Dot, _matrix_matrix_matmul, add, mul, neg, sub
+from pytensor.tensor.math import (
+    Dot,
+    _matrix_matrix_matmul,
+    add,
+    mul,
+    neg,
+    sub,
+    variadic_add,
+)
 from pytensor.tensor.rewriting.elemwise import local_dimshuffle_lift
 from pytensor.tensor.type import (
     DenseTensorType,
@@ -386,10 +394,7 @@ def _gemm_from_factored_list(fgraph, lst):
                     item_to_var(input) for k, input in enumerate(lst) if k not in (i, j)
                 ]
                 add_inputs.extend(gemm_of_sM_list)
-                if len(add_inputs) > 1:
-                    rval = [add(*add_inputs)]
-                else:
-                    rval = add_inputs
+                rval = [variadic_add(*add_inputs)]
                 # print "RETURNING GEMM THING", rval
                 return rval, old_dot22
 
@@ -475,12 +480,10 @@ class GemmOptimizer(GraphRewriter):
                     isinstance(node.op, Elemwise)
                     and isinstance(
                         node.op.scalar_op,
-                        (
-                            pytensor.scalar.Add,
-                            pytensor.scalar.Sub,
-                            pytensor.scalar.Neg,
-                            pytensor.scalar.Mul,
-                        ),
+                        pytensor.scalar.Add
+                        | pytensor.scalar.Sub
+                        | pytensor.scalar.Neg
+                        | pytensor.scalar.Mul,
                     )
                 ):
                     continue
@@ -504,7 +507,7 @@ class GemmOptimizer(GraphRewriter):
                     ].tag.values_eq_approx = values_eq_approx_remove_inf_nan
                     try:
                         fgraph.replace_all_validate_remove(
-                            list(zip(node.outputs, new_outputs)),
+                            list(zip(node.outputs, new_outputs, strict=True)),
                             [old_dot22],
                             reason="GemmOptimizer",
                             # For now we disable the warning as we know case
@@ -759,8 +762,6 @@ blas_optdb.register(
 )
 
 
-# After destroyhandler(49.5) but before we try to make elemwise things
-# inplace (75)
 blas_opt_inplace = in2out(
     local_inplace_gemm, local_inplace_gemv, local_inplace_ger, name="blas_opt_inplace"
 )
@@ -770,7 +771,8 @@ optdb.register(
     "fast_run",
     "inplace",
     "blas_opt_inplace",
-    position=70.0,
+    # Before we try to make elemwise things inplace (70.5)
+    position=50.2,
 )
 
 

@@ -6,10 +6,11 @@ import pytest
 import pytensor
 import pytensor.tensor as pt
 from pytensor import config
+from pytensor.graph import FunctionGraph
+from tests.link.numba.test_basic import compare_numba_and_py
 
 
 numba = pytest.importorskip("numba")
-
 
 ATOL = 0 if config.floatX.endswith("64") else 1e-6
 RTOL = 1e-7 if config.floatX.endswith("64") else 1e-6
@@ -99,6 +100,71 @@ def test_solve_triangular_raises_on_nan_inf(value):
     b = np.full((5, 1), value)
 
     with pytest.raises(
-        ValueError, match=re.escape("Non-numeric values (nan or inf) returned ")
+        np.linalg.LinAlgError,
+        match=re.escape("Non-numeric values"),
     ):
         f(A_tri, b)
+
+
+@pytest.mark.parametrize("lower", [True, False], ids=["lower=True", "lower=False"])
+@pytest.mark.parametrize("trans", [True, False], ids=["trans=True", "trans=False"])
+def test_numba_Cholesky(lower, trans):
+    cov = pt.matrix("cov")
+
+    if trans:
+        cov_ = cov.T
+    else:
+        cov_ = cov
+    chol = pt.linalg.cholesky(cov_, lower=lower)
+
+    fg = FunctionGraph(outputs=[chol])
+
+    x = np.array([0.1, 0.2, 0.3])
+    val = np.eye(3) + x[None, :] * x[:, None]
+
+    compare_numba_and_py(fg, [val])
+
+
+def test_numba_Cholesky_raises_on_nan_input():
+    test_value = rng.random(size=(3, 3)).astype(config.floatX)
+    test_value[0, 0] = np.nan
+
+    x = pt.tensor(dtype=config.floatX, shape=(3, 3))
+    x = x.T.dot(x)
+    g = pt.linalg.cholesky(x, check_finite=True)
+    f = pytensor.function([x], g, mode="NUMBA")
+
+    with pytest.raises(np.linalg.LinAlgError, match=r"Non-numeric values"):
+        f(test_value)
+
+
+@pytest.mark.parametrize("on_error", ["nan", "raise"])
+def test_numba_Cholesky_raise_on(on_error):
+    test_value = rng.random(size=(3, 3)).astype(config.floatX)
+
+    x = pt.tensor(dtype=config.floatX, shape=(3, 3))
+    g = pt.linalg.cholesky(x, on_error=on_error)
+    f = pytensor.function([x], g, mode="NUMBA")
+
+    if on_error == "raise":
+        with pytest.raises(
+            np.linalg.LinAlgError, match=r"Input to cholesky is not positive definite"
+        ):
+            f(test_value)
+    else:
+        assert np.all(np.isnan(f(test_value)))
+
+
+def test_block_diag():
+    A = pt.matrix("A")
+    B = pt.matrix("B")
+    C = pt.matrix("C")
+    D = pt.matrix("D")
+    X = pt.linalg.block_diag(A, B, C, D)
+
+    A_val = np.random.normal(size=(5, 5))
+    B_val = np.random.normal(size=(3, 3))
+    C_val = np.random.normal(size=(2, 2))
+    D_val = np.random.normal(size=(4, 4))
+    out_fg = pytensor.graph.FunctionGraph([A, B, C, D], [X])
+    compare_numba_and_py(out_fg, [A_val, B_val, C_val, D_val])

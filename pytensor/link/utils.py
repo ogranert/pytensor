@@ -5,7 +5,7 @@ import sys
 import traceback
 import warnings
 from collections import Counter, defaultdict
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from keyword import iskeyword
 from operator import itemgetter
 from tempfile import NamedTemporaryFile
@@ -13,12 +13,10 @@ from textwrap import dedent, indent
 from typing import (
     TYPE_CHECKING,
     Any,
-    Callable,
     NoReturn,
     Optional,
     TextIO,
     TypeVar,
-    Union,
     cast,
 )
 
@@ -90,7 +88,7 @@ def map_storage(
         assert len(fgraph.inputs) == len(input_storage)
 
     # add input storage into storage_map
-    for r, storage in zip(fgraph.inputs, input_storage):
+    for r, storage in zip(fgraph.inputs, input_storage, strict=True):
         if r in storage_map:
             assert storage_map[r] is storage, (
                 "Given input_storage conflicts "
@@ -110,7 +108,7 @@ def map_storage(
     # allocate output storage
     if output_storage is not None:
         assert len(fgraph.outputs) == len(output_storage)
-        for r, storage in zip(fgraph.outputs, output_storage):
+        for r, storage in zip(fgraph.outputs, output_storage, strict=True):
             if r in storage_map:
                 assert storage_map[r] is storage, (
                     "Given output_storage confl"
@@ -147,8 +145,8 @@ def streamline(
     fgraph: FunctionGraph,
     thunks: Sequence[Callable[[], None]],
     order: Sequence[Apply],
-    post_thunk_old_storage: Optional[list["StorageCellType"]] = None,
-    no_recycling: Optional[list["StorageCellType"]] = None,
+    post_thunk_old_storage: list["StorageCellType"] | None = None,
+    no_recycling: list["StorageCellType"] | None = None,
     nice_errors: bool = True,
 ) -> "BasicThunkType":
     """Construct a single thunk that runs a list of thunks.
@@ -192,8 +190,9 @@ def streamline(
             for x in no_recycling:
                 x[0] = None
             try:
+                # strict=False because we are in a hot loop
                 for thunk, node, old_storage in zip(
-                    thunks, order, post_thunk_old_storage
+                    thunks, order, post_thunk_old_storage, strict=False
                 ):
                     thunk()
                     for old_s in old_storage:
@@ -208,7 +207,8 @@ def streamline(
             for x in no_recycling:
                 x[0] = None
             try:
-                for thunk, node in zip(thunks, order):
+                # strict=False because we are in a hot loop
+                for thunk, node in zip(thunks, order, strict=False):
                     thunk()
             except Exception:
                 raise_with_op(fgraph, node, thunk)
@@ -309,7 +309,7 @@ def raise_with_op(
     if exc_info is None:
         exc_info = sys.exc_info()
     exc_type, exc_value, exc_trace = exc_info
-    if exc_type == KeyboardInterrupt:
+    if exc_type is KeyboardInterrupt:
         # print a simple traceback from KeyboardInterrupt
         raise exc_value.with_traceback(exc_trace)
 
@@ -332,9 +332,9 @@ def raise_with_op(
     types = [getattr(ipt, "type", "No type") for ipt in node.inputs]
     detailed_err_msg += f"\nInputs types: {types}\n"
 
-    shapes: Union[list, str]
-    strides: Union[list, str]
-    scalar_values: Union[list, str]
+    shapes: list | str
+    strides: list | str
+    scalar_values: list | str
 
     if thunk is not None:
         if hasattr(thunk, "inputs"):
@@ -353,13 +353,14 @@ def raise_with_op(
         clients = [[c[0] for c in fgraph.clients[var]] for var in node.outputs]
         detailed_err_msg += (
             f"Inputs shapes: {shapes}"
-            + f"\nInputs strides: {strides}"
-            + f"\nInputs values: {scalar_values}"
+            f"\nInputs strides: {strides}"
+            f"\nInputs values: {scalar_values}"
         )
         if verbosity == "high":
-            detailed_err_msg += "\nInputs type_num: %s" % str(
-                [getattr(getattr(i[0], "dtype", ""), "num", "") for i in thunk.inputs]
-            )
+            inpts = [
+                getattr(getattr(i[0], "dtype", ""), "num", "") for i in thunk.inputs
+            ]
+            detailed_err_msg += f"\nInputs type_num: {inpts}"
 
         detailed_err_msg += f"\nOutputs clients: {clients}\n"
     else:
@@ -442,7 +443,7 @@ def raise_with_op(
                     sz = np.dtype(dtype).itemsize * np.prod(shapeinfo)
                     storage_map_item.append(sz)
                     total_size += sz
-                    if not k.owner:
+                    if k.owner is None:
                         total_size_inputs += sz
                     else:
                         # If it is a view, don't count it twice.
@@ -503,14 +504,8 @@ def raise_with_op(
                 detailed_err_msg += f", TotalSize: {item[3]} Byte(s)\n"
             else:
                 detailed_err_msg += "\n"
-        detailed_err_msg += " TotalSize: {} Byte(s) {:.3f} GB\n".format(
-            total_size,
-            total_size / 1024 / 1024 / 1024,
-        )
-        detailed_err_msg += " TotalSize inputs: {} Byte(s) {:.3f} GB\n".format(
-            total_size_inputs,
-            total_size_inputs / 1024 / 1024 / 1024,
-        )
+        detailed_err_msg += f" TotalSize: {total_size} Byte(s) {total_size / 1024 / 1024 / 1024:.3f} GB\n"
+        detailed_err_msg += f" TotalSize inputs: {total_size_inputs} Byte(s) {total_size_inputs / 1024 / 1024 / 1024:.3f} GB\n"
 
     else:
         hints.append(
@@ -585,8 +580,8 @@ register_thunk_trace_excepthook()
 def compile_function_src(
     src: str,
     function_name: str,
-    global_env: Optional[dict[Any, Any]] = None,
-    local_env: Optional[dict[Any, Any]] = None,
+    global_env: dict[Any, Any] | None = None,
+    local_env: dict[Any, Any] | None = None,
 ) -> Callable:
     with NamedTemporaryFile(delete=False) as f:
         filename = f.name
@@ -633,7 +628,7 @@ def get_name_for_object(x: Any) -> str:
 
 
 def unique_name_generator(
-    external_names: Optional[list[str]] = None, suffix_sep: str = "_"
+    external_names: list[str] | None = None, suffix_sep: str = "_"
 ) -> Callable:
     """Create a function that generates unique names."""
 
@@ -673,13 +668,14 @@ def fgraph_to_python(
     op_conversion_fn: Callable,
     *,
     type_conversion_fn: Callable = lambda x, **kwargs: x,
-    order: Optional[list[Apply]] = None,
+    order: list[Apply] | None = None,
     storage_map: Optional["StorageMapType"] = None,
     fgraph_name: str = "fgraph_to_python",
-    global_env: Optional[dict[Any, Any]] = None,
-    local_env: Optional[dict[Any, Any]] = None,
+    global_env: dict[Any, Any] | None = None,
+    local_env: dict[Any, Any] | None = None,
     get_name_for_object: Callable[[Any], str] = get_name_for_object,
     squeeze_output: bool = False,
+    unique_name: Callable | None = None,
     **kwargs,
 ) -> Callable:
     """Convert a `FunctionGraph` into a regular Python function.
@@ -711,6 +707,8 @@ def fgraph_to_python(
     get_name_for_object
         A function used to provide names for the objects referenced within the
         generated function.
+    unique_name
+        A function to make random function names for generated code
     squeeze_output
         If the `FunctionGraph` has only one output and this option is
         ``True``, return the single output instead of a tuple with the output.
@@ -724,7 +722,11 @@ def fgraph_to_python(
     if storage_map is None:
         storage_map = {}
 
-    unique_name = unique_name_generator([fgraph_name])
+    if not unique_name:
+        unique_name = unique_name_generator([fgraph_name])
+
+    # make sure we plumb this through
+    kwargs["unique_name"] = unique_name
 
     if global_env is None:
         global_env = {}
@@ -818,7 +820,7 @@ def get_destroy_dependencies(fgraph: FunctionGraph) -> dict[Apply, list[Variable
     in destroy_dependencies.
     """
     order = fgraph.orderings()
-    destroy_dependencies = defaultdict(lambda: [])
+    destroy_dependencies = defaultdict(list)
     for node in fgraph.apply_nodes:
         for prereq in order.get(node, []):
             destroy_dependencies[node].extend(prereq.outputs)

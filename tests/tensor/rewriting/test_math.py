@@ -27,20 +27,21 @@ from pytensor.graph.rewriting.basic import (
 )
 from pytensor.graph.rewriting.db import RewriteDatabaseQuery
 from pytensor.graph.rewriting.utils import is_same_graph, rewrite_graph
-from pytensor.misc.safe_asarray import _asarray
 from pytensor.printing import debugprint
-from pytensor.scalar import PolyGamma, Pow, Psi, TriGamma
+from pytensor.scalar import PolyGamma, Psi, TriGamma
 from pytensor.tensor import inplace
 from pytensor.tensor.basic import Alloc, constant, join, second, switch
 from pytensor.tensor.blas import Dot22, Gemv
 from pytensor.tensor.blas_c import CGemv
+from pytensor.tensor.blockwise import Blockwise
 from pytensor.tensor.elemwise import CAReduce, DimShuffle, Elemwise
-from pytensor.tensor.math import Dot, MaxAndArgmax, Prod, Sum, _conj
-from pytensor.tensor.math import abs as pt_abs
-from pytensor.tensor.math import add
-from pytensor.tensor.math import all as pt_all
-from pytensor.tensor.math import any as pt_any
 from pytensor.tensor.math import (
+    Dot,
+    Max,
+    Prod,
+    Sum,
+    _conj,
+    add,
     arccosh,
     arcsinh,
     arctanh,
@@ -60,18 +61,18 @@ from pytensor.tensor.math import (
     ge,
     gt,
     int_div,
+    kv,
     le,
     log,
     log1mexp,
     log1p,
     lt,
-)
-from pytensor.tensor.math import max as pt_max
-from pytensor.tensor.math import maximum
-from pytensor.tensor.math import min as pt_min
-from pytensor.tensor.math import minimum, mul, neg, neq, polygamma
-from pytensor.tensor.math import pow as pt_pow
-from pytensor.tensor.math import (
+    maximum,
+    minimum,
+    mul,
+    neg,
+    neq,
+    polygamma,
     prod,
     rad2deg,
     reciprocal,
@@ -82,16 +83,28 @@ from pytensor.tensor.math import (
     sqr,
     sqrt,
     sub,
+    tanh,
+    true_div,
+    xor,
 )
+from pytensor.tensor.math import abs as pt_abs
+from pytensor.tensor.math import all as pt_all
+from pytensor.tensor.math import any as pt_any
+from pytensor.tensor.math import max as pt_max
+from pytensor.tensor.math import min as pt_min
+from pytensor.tensor.math import pow as pt_pow
 from pytensor.tensor.math import sum as pt_sum
-from pytensor.tensor.math import tanh, true_div, xor
 from pytensor.tensor.rewriting.elemwise import local_dimshuffle_lift
 from pytensor.tensor.rewriting.math import (
     compute_mul,
     is_1pexp,
+    local_div_switch_sink,
     local_grad_log_erfc_neg,
     local_greedy_distributor,
     local_mul_canonizer,
+    local_mul_switch_sink,
+    local_reduce_chain,
+    local_reduce_join,
     local_sum_prod_of_mul_or_div,
     mul_canonizer,
     parse_mul_tree,
@@ -151,7 +164,7 @@ _fast_run_rewrites = optdb.query(_fast_run_rewrites)
 
 
 def ds(x, y):
-    return DimShuffle(x.type.broadcastable, y)(x)
+    return x.dimshuffle(y)
 
 
 def rewrite(g, level="fast_run"):
@@ -176,7 +189,7 @@ def inputs(xbc=(0, 0), ybc=(0, 0), zbc=(0, 0)):
 def test_add_canonizer_problem0():
     n_segments = 10
     label = lscalar("label")
-    segment_labels = label + _asarray([0] * n_segments, dtype="int64")
+    segment_labels = label + np.asarray([0] * n_segments, dtype="int64")
 
     r = segment_labels * 5
     f = function([label], r)
@@ -268,14 +281,14 @@ class TestAlgebraicCanonizer:
         dx, dy, dz = dmatrices("xyz")
         # fv = fvector('r').dimshuffle('x', 0)
         # dv = dvector('s').dimshuffle('x', 0)
-        fxv = _asarray(np.random.random(shp), dtype="float32")
-        fyv = _asarray(np.random.random(shp), dtype="float32")
-        fzv = _asarray(np.random.random(shp), dtype="float32")
-        # fvv = _asarray(np.random.random((shp[0]), dtype='float32').reshape(1, shp[0])
-        # dxv = _asarray(np.random.random((*shp), dtype='float64')
-        # dyv = _asarray(np.random.random((*shp), dtype='float64')
-        # dzv = _asarray(np.random.random((*shp), dtype='float64')
-        # dvv = _asarray(np.random.random((shp[0]), dtype='float64').reshape(1, shp[0])
+        fxv = np.asarray(np.random.random(shp), dtype="float32")
+        fyv = np.asarray(np.random.random(shp), dtype="float32")
+        fzv = np.asarray(np.random.random(shp), dtype="float32")
+        # fvv = np.asarray(np.random.random((shp[0]), dtype='float32').reshape(1, shp[0])
+        # dxv = np.asarray(np.random.random((*shp), dtype='float64')
+        # dyv = np.asarray(np.random.random((*shp), dtype='float64')
+        # dzv = np.asarray(np.random.random((*shp), dtype='float64')
+        # dvv = np.asarray(np.random.random((shp[0]), dtype='float64').reshape(1, shp[0])
         cases = [
             (fx + fy, (fx, fy), (fxv, fyv), 1, "float32"),
             (fx * fy, (fx, fy), (fxv, fyv), 1, "float32"),
@@ -399,14 +412,14 @@ class TestAlgebraicCanonizer:
         dx, dy, dz = dmatrices("xyz")
         fv = fvector("r").dimshuffle("x", 0)
         dv = dvector("s").dimshuffle("x", 0)
-        fxv = _asarray(np.random.random(shp), dtype="float32")
-        fyv = _asarray(np.random.random(shp), dtype="float32")
-        fzv = _asarray(np.random.random(shp), dtype="float32")
-        fvv = _asarray(np.random.random(shp[0]), dtype="float32").reshape(1, shp[0])
-        dxv = _asarray(np.random.random(shp), dtype="float64")
-        dyv = _asarray(np.random.random(shp), dtype="float64")
-        dzv = _asarray(np.random.random(shp), dtype="float64")
-        dvv = _asarray(np.random.random(shp[0]), dtype="float64").reshape(1, shp[0])
+        fxv = np.asarray(np.random.random(shp), dtype="float32")
+        fyv = np.asarray(np.random.random(shp), dtype="float32")
+        fzv = np.asarray(np.random.random(shp), dtype="float32")
+        fvv = np.asarray(np.random.random(shp[0]), dtype="float32").reshape(1, shp[0])
+        dxv = np.asarray(np.random.random(shp), dtype="float64")
+        dyv = np.asarray(np.random.random(shp), dtype="float64")
+        dzv = np.asarray(np.random.random(shp), dtype="float64")
+        dvv = np.asarray(np.random.random(shp[0]), dtype="float64").reshape(1, shp[0])
         cases = [
             (fx + fy, (fx, fy), (fxv, fyv), 1, "float32"),
             (fx * fy, (fx, fy), (fxv, fyv), 1, "float32"),
@@ -538,16 +551,16 @@ class TestAlgebraicCanonizer:
         dx, dy, dz, dw = dmatrices("xyzw")
         fv = fvector("r").dimshuffle("x", 0)
         dv = dvector("s").dimshuffle("x", 0)
-        fxv = _asarray(np.random.random(shp), dtype="float32")
-        fyv = _asarray(np.random.random(shp), dtype="float32")
-        fzv = _asarray(np.random.random(shp), dtype="float32")
-        fwv = _asarray(np.random.random(shp), dtype="float32")
-        fvv = _asarray(np.random.random(shp[0]), dtype="float32").reshape(1, shp[0])
-        dxv = _asarray(np.random.random(shp), dtype="float64")
-        dyv = _asarray(np.random.random(shp), dtype="float64")
-        dzv = _asarray(np.random.random(shp), dtype="float64")
-        dwv = _asarray(np.random.random(shp), dtype="float64")
-        dvv = _asarray(np.random.random(shp[0]), dtype="float64").reshape(1, shp[0])
+        fxv = np.asarray(np.random.random(shp), dtype="float32")
+        fyv = np.asarray(np.random.random(shp), dtype="float32")
+        fzv = np.asarray(np.random.random(shp), dtype="float32")
+        fwv = np.asarray(np.random.random(shp), dtype="float32")
+        fvv = np.asarray(np.random.random(shp[0]), dtype="float32").reshape(1, shp[0])
+        dxv = np.asarray(np.random.random(shp), dtype="float64")
+        dyv = np.asarray(np.random.random(shp), dtype="float64")
+        dzv = np.asarray(np.random.random(shp), dtype="float64")
+        dwv = np.asarray(np.random.random(shp), dtype="float64")
+        dvv = np.asarray(np.random.random(shp[0]), dtype="float64").reshape(1, shp[0])
 
         # We must be sure that the `AlgebraicCanonizer` is working, but that we don't have other
         # rewrites that could hide bugs in the `AlgebraicCanonizer` as `local_elemwise_fusion`
@@ -591,7 +604,7 @@ class TestAlgebraicCanonizer:
                 # must broadcast as there is a dimshuffle in the computation
                 ((dx * dv) / dx, [dx, dv], [dxv, dvv], 1, "float64"),
                 # topo: [Elemwise{second,no_inplace}(x, <TensorType(float64, row)>)]
-                ((fx * fv) / fx, [fx, fv], [fxv, fvv], 1, "float32")
+                ((fx * fv) / fx, [fx, fv], [fxv, fvv], 1, "float32"),
                 # topo: [Elemwise{second,no_inplace}(x, <TensorType(float32, row)>)]
             ]
         ):
@@ -622,11 +635,11 @@ class TestAlgebraicCanonizer:
             topo = f.maker.fgraph.toposort()
             elem = [t for t in topo if isinstance(t.op, Elemwise)]
             assert len(elem) == nb_elemwise
-            assert isinstance(elem[0].op, (Elemwise,))
+            assert isinstance(elem[0].op, Elemwise)
             assert any(
                 isinstance(
                     el.op.scalar_op,
-                    (ps.basic.Reciprocal, ps.basic.TrueDiv),
+                    ps.basic.Reciprocal | ps.basic.TrueDiv,
                 )
                 for el in elem
             )
@@ -702,7 +715,7 @@ class TestAlgebraicCanonizer:
             utt.assert_allclose(out, (val_inputs[0] / val_inputs[3]))
             topo = f.maker.fgraph.toposort()
             assert len(topo) == 1
-            assert isinstance(topo[0].op, (Elemwise,))
+            assert isinstance(topo[0].op, Elemwise)
             assert isinstance(topo[0].op.scalar_op, ps.basic.TrueDiv)
             assert len(topo[0].inputs) == 2
             assert out_dtype == out.dtype
@@ -752,10 +765,10 @@ class TestAlgebraicCanonizer:
             utt.assert_allclose(out, (0.5 * val_inputs[0] / val_inputs[1]))
             topo = f.maker.fgraph.toposort()
             assert len(topo) == 2
-            assert isinstance(topo[0].op, (Elemwise,))
+            assert isinstance(topo[0].op, Elemwise)
             assert isinstance(topo[0].op.scalar_op, ps.basic.Mul)
             assert len(topo[0].inputs) == 2
-            assert isinstance(topo[1].op, (Elemwise,))
+            assert isinstance(topo[1].op, Elemwise)
             assert isinstance(topo[1].op.scalar_op, ps.basic.TrueDiv)
             assert len(topo[1].inputs) == 2
             assert out_dtype == out.dtype
@@ -901,13 +914,13 @@ class TestAlgebraicCanonizer:
         shp = (4, 4)
         fx, fy, fz = fmatrices("xyz")
         dx, dy, dz = dmatrices("xyz")
-        fxv = _asarray(np.random.random(shp), dtype="float32")
-        fyv = _asarray(np.random.random(shp), dtype="float32")
-        fzv = _asarray(np.random.random(shp), dtype="float32")
-        dxv = _asarray(np.random.random(shp), dtype="float32")
-        dyv = _asarray(np.random.random(shp), dtype="float32")
-        dzv = _asarray(np.random.random(shp), dtype="float32")
-        # fvv = _asarray(np.random.random((shp[0]), dtype='float32').reshape(1, shp[0])
+        fxv = np.asarray(np.random.random(shp), dtype="float32")
+        fyv = np.asarray(np.random.random(shp), dtype="float32")
+        fzv = np.asarray(np.random.random(shp), dtype="float32")
+        dxv = np.asarray(np.random.random(shp), dtype="float32")
+        dyv = np.asarray(np.random.random(shp), dtype="float32")
+        dzv = np.asarray(np.random.random(shp), dtype="float32")
+        # fvv = np.asarray(np.random.random((shp[0]), dtype='float32').reshape(1, shp[0])
 
         mode = get_default_mode()
 
@@ -925,7 +938,7 @@ class TestAlgebraicCanonizer:
             utt.assert_allclose(out, val_inputs[0] / val_inputs[1] / val_inputs[2])
             topo = f.maker.fgraph.toposort()
             assert len(topo) == 2
-            assert isinstance(topo[0].op, (Elemwise,))
+            assert isinstance(topo[0].op, Elemwise)
             assert isinstance(topo[0].op.scalar_op, ps.basic.Reciprocal)
             assert len(topo[0].inputs) == 1
             assert out_dtype == out.dtype
@@ -940,7 +953,7 @@ class TestAlgebraicCanonizer:
             utt.assert_allclose(out, val_inputs[0] / (val_inputs[1] / val_inputs[2]))
             topo = f.maker.fgraph.toposort()
             assert len(topo) == 2
-            assert isinstance(topo[0].op, (Elemwise,))
+            assert isinstance(topo[0].op, Elemwise)
             assert isinstance(topo[0].op.scalar_op, ps.basic.Reciprocal)
             assert len(topo[0].inputs) == 1
             assert out_dtype == out.dtype
@@ -1204,7 +1217,7 @@ def test_local_subtensor_of_dot():
     topo = f.maker.fgraph.toposort()
     assert test_equality(f(d1, d2), np.dot(d1, d2)[1])
     # DimShuffle happen in FAST_COMPILE
-    assert isinstance(topo[-1].op, (CGemv, Gemv, DimShuffle))
+    assert isinstance(topo[-1].op, CGemv | Gemv | DimShuffle)
 
     # slice
     f = function([m1, m2], pytensor.tensor.dot(m1, m2)[1:2], mode=mode)
@@ -1748,7 +1761,7 @@ def test_local_pow_to_nested_squaring():
     utt.assert_allclose(f(val_no0), val_no0 ** (-16))
 
 
-def test_local_pow_to_nested_squaring_fails_gracefully():
+def test_local_pow_to_nested_squaring_works_with_static_type():
     # Reported in #456
 
     x = vector("x", shape=(1,))
@@ -1761,12 +1774,6 @@ def test_local_pow_to_nested_squaring_fails_gracefully():
     y = node.default_output()
 
     fn = function([x], y)
-
-    # Check rewrite is not applied (this could change in the future)
-    assert any(
-        (isinstance(node.op, Elemwise) and isinstance(node.op.scalar_op, Pow))
-        for node in fn.maker.fgraph.apply_nodes
-    )
 
     np.testing.assert_allclose(fn([2.0]), np.array([4.0]))
 
@@ -1859,7 +1866,7 @@ class TestExpLog:
             node
             for node in graph
             if isinstance(node.op, Elemwise)
-            and isinstance(node.op.scalar_op, (ps.Log, ps.Exp))
+            and isinstance(node.op.scalar_op, ps.Log | ps.Exp)
         ]
         assert len(ops_graph) == 0
         np.testing.assert_array_equal(f(data), data)
@@ -1871,7 +1878,7 @@ class TestExpLog:
             node
             for node in f.maker.fgraph.toposort()
             if isinstance(node.op, Elemwise)
-            and isinstance(node.op.scalar_op, (ps.Log, ps.Exp))
+            and isinstance(node.op.scalar_op, ps.Log | ps.Exp)
         ]
         assert len(ops_graph) == 0
 
@@ -1886,7 +1893,7 @@ class TestExpLog:
             node
             for node in graph
             if isinstance(node.op, Elemwise)
-            and isinstance(node.op.scalar_op, (ps.Log, ps.Exp, ps.Log1p, ps.Expm1))
+            and isinstance(node.op.scalar_op, ps.Log | ps.Exp | ps.Log1p | ps.Expm1)
         ]
         assert len(ops_graph) == 0
         np.testing.assert_array_equal(f(data), data)
@@ -1906,7 +1913,7 @@ class TestExpLog:
             node
             for node in graph
             if isinstance(node.op, Elemwise)
-            and isinstance(node.op.scalar_op, (ps.Log, ps.Log1p, ps.Exp, ps.Expm1))
+            and isinstance(node.op.scalar_op, ps.Log | ps.Log1p | ps.Exp | ps.Expm1)
         ]
         assert len(ops_graph) == 0
 
@@ -1932,7 +1939,7 @@ class TestExpLog:
             node
             for node in graph
             if isinstance(node.op, Elemwise)
-            and isinstance(node.op.scalar_op, (ps.Log, ps.Log1p, ps.Exp, ps.Expm1))
+            and isinstance(node.op.scalar_op, ps.Log | ps.Log1p | ps.Exp | ps.Expm1)
         ]
         assert len(ops_graph) == 0
 
@@ -1958,7 +1965,9 @@ class TestExpLog:
             node
             for node in graph
             if isinstance(node.op, Elemwise)
-            and isinstance(node.op.scalar_op, (ps.Log, ps.Log1p, ps.Log1mexp, ps.Expm1))
+            and isinstance(
+                node.op.scalar_op, ps.Log | ps.Log1p | ps.Log1mexp | ps.Expm1
+            )
         ]
         assert len(ops_graph) == 0
 
@@ -1984,7 +1993,7 @@ class TestExpLog:
             if isinstance(node.op, Elemwise)
             and isinstance(
                 node.op.scalar_op,
-                (ps.Log, ps.Log1p, ps.Softplus, ps.Expm1, ps.Switch),
+                ps.Log | ps.Log1p | ps.Softplus | ps.Expm1 | ps.Switch,
             )
         ]
         assert len(ops_graph) == 0
@@ -2091,7 +2100,7 @@ class TestLocalSwitchSink:
                 f = self.function_remove_nan(
                     [condition[0], x[0], c], [y], mode=self.mode
                 )
-                if type(condition[1]) is list:
+                if isinstance(condition[1], list):
                     for i in range(len(condition[1])):
                         res = f(condition[1][i], x[1], -1)
                         assert (
@@ -2110,7 +2119,6 @@ class TestLocalSwitchSink:
         f = self.function_remove_nan([x], pytensor.gradient.grad(y, x), self.mode)
         assert f(5) == 1, f(5)
 
-    @pytest.mark.slow
     def test_local_div_switch_sink(self):
         c = dscalar()
         idx = 0
@@ -2131,7 +2139,7 @@ class TestLocalSwitchSink:
                 f = self.function_remove_nan(
                     [condition[0], x[0], c], [y], mode=self.mode
                 )
-                if type(condition[1]) is list:
+                if isinstance(condition[1], list):
                     for i in range(len(condition[1])):
                         res = f(condition[1][i], x[1], -1)
                         assert (
@@ -2143,6 +2151,49 @@ class TestLocalSwitchSink:
                         idx
                     ].size
                 idx += 1
+
+    @pytest.mark.parametrize(
+        "op, rewrite", [(mul, local_mul_switch_sink), (true_div, local_div_switch_sink)]
+    )
+    def test_local_mul_div_switch_sink_cast(self, op, rewrite):
+        """Check that we don't downcast during the rewrite.
+
+        Regression test for: https://github.com/pymc-devs/pytensor/issues/1037
+        """
+        cond = scalar("cond", dtype="bool")
+        # The zero branch upcasts the output, so we can't ignore its dtype
+        zero_branch = constant(np.array(0, dtype="float64"), name="zero_branch")
+        other_branch = scalar("other_branch", dtype="float32")
+        outer_var = scalar("outer_var", dtype="bool")
+
+        out = op(switch(cond, zero_branch, other_branch), outer_var)
+        fgraph = FunctionGraph(outputs=[out], clone=False)
+        [new_out] = rewrite.transform(fgraph, out.owner)
+        assert new_out.type.dtype == out.type.dtype
+
+        expected_out = switch(cond, zero_branch, op(other_branch, outer_var))
+        assert equal_computations([new_out], [expected_out])
+
+    @pytest.mark.parametrize(
+        "op, rewrite", [(mul, local_mul_switch_sink), (true_div, local_div_switch_sink)]
+    )
+    def test_local_mul_div_switch_sink_branch_order(self, op, rewrite):
+        cond = scalar("cond", dtype="bool")
+        zero_branch = constant(np.array(0.0, dtype="float64"), "zero_branch")
+        other_branch = scalar("other_branch", dtype="float64")
+        outer_var = scalar("outer_var", dtype="float64")
+
+        left = op(switch(cond, zero_branch, other_branch), outer_var)
+        right = op(switch(cond, other_branch, zero_branch), outer_var)
+        fgraph = FunctionGraph(outputs=[left, right], clone=False)
+        [new_left] = rewrite.transform(fgraph, left.owner)
+        [new_right] = rewrite.transform(fgraph, right.owner)
+
+        expected_left = switch(cond, zero_branch, op(other_branch, outer_var))
+        expected_right = switch(cond, op(other_branch, outer_var), zero_branch)
+        assert equal_computations(
+            [new_left, new_right], [expected_left, expected_right]
+        )
 
 
 @pytest.mark.skipif(
@@ -2199,9 +2250,7 @@ class TestLocalErf:
         assert len(topo) == 2
         assert topo[0].op == erf
         assert isinstance(topo[1].op, Elemwise)
-        assert isinstance(topo[1].op.scalar_op, ps.Add) or isinstance(
-            topo[1].op.scalar_op, ps.Sub
-        )
+        assert isinstance(topo[1].op.scalar_op, ps.Add | ps.Sub)
 
     def test_local_erf_minus_one(self):
         val = np.asarray([-30, -3, -2, -1, 0, 1, 2, 3, 30], dtype=config.floatX)
@@ -2222,9 +2271,7 @@ class TestLocalErf:
         assert len(topo) == 2
         assert topo[0].op == erf
         assert isinstance(topo[1].op, Elemwise)
-        assert isinstance(topo[1].op.scalar_op, ps.Add) or isinstance(
-            topo[1].op.scalar_op, ps.Sub
-        )
+        assert isinstance(topo[1].op.scalar_op, ps.Add | ps.Sub)
 
 
 @pytest.mark.skipif(
@@ -2492,8 +2539,170 @@ class TestLocalMergeSwitchSameCond:
         u, v = matrices("uv")
         s3 = pt.switch(c, u, v)
         for op in (add, mul):
-            g = rewrite(FunctionGraph(mats + [u, v], [op(s1, s2, s3)]))
+            g = rewrite(FunctionGraph([*mats, u, v], [op(s1, s2, s3)]))
             assert debugprint(g, file="str").count("Switch") == 1
+
+
+class TestReduceChain:
+    def setup_method(self):
+        self.mode = get_default_mode().including("canonicalize", "specialize")
+
+    def test_local_sum_prod_all_to_none(self):
+        a = tensor3()
+        input = np.arange(3 * 4 * 5, dtype=config.floatX).reshape(3, 4, 5)
+        # test sum
+        f = function([a], a.sum(), mode=self.mode)
+        assert len(f.maker.fgraph.apply_nodes) == 1
+        utt.assert_allclose(f(input), input.sum())
+        # test prod
+        f = function([a], a.prod(), mode=self.mode)
+        assert len(f.maker.fgraph.apply_nodes) == 1
+        utt.assert_allclose(f(input), input.prod())
+        # test sum
+        f = function([a], a.sum([0, 1, 2]), mode=self.mode)
+        assert len(f.maker.fgraph.apply_nodes) == 1
+        utt.assert_allclose(f(input), input.sum())
+        # test prod
+        f = function([a], a.prod([0, 1, 2]), mode=self.mode)
+        assert len(f.maker.fgraph.apply_nodes) == 1
+        utt.assert_allclose(f(input), input.prod())
+
+        f = function([a], a.sum(0).sum(0).sum(0), mode=self.mode)
+        assert len(f.maker.fgraph.apply_nodes) == 1
+        utt.assert_allclose(f(input), input.sum())
+
+    def test_local_sum_sum_prod_prod(self):
+        a = tensor3()
+        input = np.arange(3 * 4 * 5, dtype=config.floatX).reshape(3, 4, 5)
+        dims = [
+            (0, 0),
+            (1, 0),
+            (2, 0),
+            (0, 1),
+            (1, 1),
+            (2, 1),
+            ((0, 1), 0),
+            ((1, 2), 0),
+            (0, (0, 1)),
+            (1, (0, 1)),
+            (2, (0, 1)),
+        ]
+
+        def my_prod(data, d, dd):
+            # This prod when d or dd is a tuple of 2 dimensions.
+            if not isinstance(d, tuple) and not isinstance(dd, tuple):
+                return data.prod(d).prod(dd)
+            if isinstance(d, tuple):
+                d = sorted(d)
+                return data.prod(d[1]).prod(d[0]).prod(dd)
+            else:
+                dd = sorted(dd)
+                return data.prod(d).prod(dd[1]).prod(dd[0])
+
+        def my_sum(data, d, dd):
+            # This sum when d or dd is a tuple of 2 dimensions.
+            if not isinstance(d, tuple) and not isinstance(dd, tuple):
+                return data.sum(d).sum(dd)
+            if isinstance(d, tuple):
+                d = sorted(d)
+                return data.sum(d[1]).sum(d[0]).sum(dd)
+            else:
+                dd = sorted(dd)
+                return data.sum(d).sum(dd[1]).sum(dd[0])
+
+        def my_sum_prod(data, d, dd):
+            # This sum when d or dd is a tuple of 2 dimensions.
+            if not isinstance(d, tuple) and not isinstance(dd, tuple):
+                return data.sum(d).prod(dd)
+            if isinstance(d, tuple):
+                d = sorted(d)
+                return data.sum(d[1]).sum(d[0]).prod(dd)
+            else:
+                dd = sorted(dd)
+                return data.sum(d).prod(dd[1]).prod(dd[0])
+
+        for d, dd in dims:
+            expected = my_sum(input, d, dd)
+            f = function([a], a.sum(d).sum(dd), mode=self.mode)
+            utt.assert_allclose(f(input), expected)
+            assert len(f.maker.fgraph.apply_nodes) == 1
+        for d, dd in dims[:6]:
+            f = function([a], a.sum(d).sum(dd).sum(0), mode=self.mode)
+            utt.assert_allclose(f(input), input.sum(d).sum(dd).sum(0))
+            assert len(f.maker.fgraph.apply_nodes) == 1
+        for d in [0, 1, 2]:
+            f = function([a], a.sum(d).sum(None), mode=self.mode)
+            utt.assert_allclose(f(input), input.sum(d).sum())
+            assert len(f.maker.fgraph.apply_nodes) == 1
+        f = function([a], a.sum(None).sum(), mode=self.mode)
+        utt.assert_allclose(f(input), input.sum())
+        assert len(f.maker.fgraph.apply_nodes) == 1
+
+        # test prod
+        for d, dd in dims:
+            expected = my_prod(input, d, dd)
+            f = function([a], a.prod(d).prod(dd), mode=self.mode)
+            utt.assert_allclose(f(input), expected)
+            assert len(f.maker.fgraph.apply_nodes) == 1
+        for d, dd in dims[:6]:
+            f = function([a], a.prod(d).prod(dd).prod(0), mode=self.mode)
+            utt.assert_allclose(f(input), input.prod(d).prod(dd).prod(0))
+            assert len(f.maker.fgraph.apply_nodes) == 1
+        for d in [0, 1, 2]:
+            f = function([a], a.prod(d).prod(None), mode=self.mode)
+            utt.assert_allclose(f(input), input.prod(d).prod())
+            assert len(f.maker.fgraph.apply_nodes) == 1
+        f = function([a], a.prod(None).prod(), mode=self.mode)
+        utt.assert_allclose(f(input), input.prod())
+        assert len(f.maker.fgraph.apply_nodes) == 1
+
+        # Test that sum prod didn't get rewritten.
+        for d, dd in dims:
+            expected = my_sum_prod(input, d, dd)
+            f = function([a], a.sum(d).prod(dd), mode=self.mode)
+            utt.assert_allclose(f(input), expected)
+            assert len(f.maker.fgraph.apply_nodes) == 2
+        for d, dd in dims[:6]:
+            f = function([a], a.sum(d).prod(dd).prod(0), mode=self.mode)
+            utt.assert_allclose(f(input), input.sum(d).prod(dd).prod(0))
+            assert len(f.maker.fgraph.apply_nodes) == 2
+        for d in [0, 1, 2]:
+            f = function([a], a.sum(d).prod(None), mode=self.mode)
+            utt.assert_allclose(f(input), input.sum(d).prod())
+            assert len(f.maker.fgraph.apply_nodes) == 2
+        f = function([a], a.sum(None).prod(), mode=self.mode)
+        utt.assert_allclose(f(input), input.sum())
+        assert len(f.maker.fgraph.apply_nodes) == 1
+
+    def test_local_sum_sum_int8(self):
+        """Test that `local_sum_sum` works when combining two sums on an int8 array.
+
+        This is a regression test for ticket gh-356.
+        """
+
+        x = tensor3(dtype="int8")
+        y = x.sum(axis=0).sum(axis=1)
+
+        with config.change_flags(on_opt_error="raise"):
+            # This compilation would fail prior to fix.
+            function([x], y)
+
+    def test_local_sum_sum_dtype(self):
+        """Test that `local_sum_sum` works when specifying dtypes manually."""
+
+        x = tensor3(dtype="int8")
+        y = x.sum(axis=0, dtype="int32").sum(axis=1, dtype="int64")
+
+        with config.change_flags(on_opt_error="raise"):
+            # This compilation would fail prior to fix.
+            function([x], y)
+
+    def test_all(self):
+        x = tensor3(dtype=bool)
+        out = x.all(axis=-1).all(axis=0)
+        fg = FunctionGraph([x], [out], clone=False)
+        [new_out] = local_reduce_chain.transform(fg, out.owner)
+        assert equal_computations([new_out], [x.all(axis=(0, 2))])
 
 
 class TestLocalSumProd:
@@ -2812,133 +3021,6 @@ class TestLocalSumProd:
                 rewritten_out_fn(*test_vals),
             )
 
-    def test_local_sum_prod_all_to_none(self):
-        a = tensor3()
-        input = np.arange(3 * 4 * 5, dtype=config.floatX).reshape(3, 4, 5)
-        # test sum
-        f = function([a], a.sum(), mode=self.mode)
-        assert len(f.maker.fgraph.apply_nodes) == 1
-        utt.assert_allclose(f(input), input.sum())
-        # test prod
-        f = function([a], a.prod(), mode=self.mode)
-        assert len(f.maker.fgraph.apply_nodes) == 1
-        utt.assert_allclose(f(input), input.prod())
-        # test sum
-        f = function([a], a.sum([0, 1, 2]), mode=self.mode)
-        assert len(f.maker.fgraph.apply_nodes) == 1
-        utt.assert_allclose(f(input), input.sum())
-        # test prod
-        f = function([a], a.prod([0, 1, 2]), mode=self.mode)
-        assert len(f.maker.fgraph.apply_nodes) == 1
-        utt.assert_allclose(f(input), input.prod())
-
-        f = function([a], a.sum(0).sum(0).sum(0), mode=self.mode)
-        assert len(f.maker.fgraph.apply_nodes) == 1
-        utt.assert_allclose(f(input), input.sum())
-
-    def test_local_sum_sum_prod_prod(self):
-        a = tensor3()
-        input = np.arange(3 * 4 * 5, dtype=config.floatX).reshape(3, 4, 5)
-        dims = [
-            (0, 0),
-            (1, 0),
-            (2, 0),
-            (0, 1),
-            (1, 1),
-            (2, 1),
-            ((0, 1), 0),
-            ((1, 2), 0),
-            (0, (0, 1)),
-            (1, (0, 1)),
-            (2, (0, 1)),
-        ]
-
-        def my_prod(data, d, dd):
-            # This prod when d or dd is a tuple of 2 dimensions.
-            if not isinstance(d, tuple) and not isinstance(dd, tuple):
-                return data.prod(d).prod(dd)
-            if isinstance(d, tuple):
-                d = sorted(d)
-                return data.prod(d[1]).prod(d[0]).prod(dd)
-            else:
-                dd = sorted(dd)
-                return data.prod(d).prod(dd[1]).prod(dd[0])
-
-        def my_sum(data, d, dd):
-            # This sum when d or dd is a tuple of 2 dimensions.
-            if not isinstance(d, tuple) and not isinstance(dd, tuple):
-                return data.sum(d).sum(dd)
-            if isinstance(d, tuple):
-                d = sorted(d)
-                return data.sum(d[1]).sum(d[0]).sum(dd)
-            else:
-                dd = sorted(dd)
-                return data.sum(d).sum(dd[1]).sum(dd[0])
-
-        def my_sum_prod(data, d, dd):
-            # This sum when d or dd is a tuple of 2 dimensions.
-            if not isinstance(d, tuple) and not isinstance(dd, tuple):
-                return data.sum(d).prod(dd)
-            if isinstance(d, tuple):
-                d = sorted(d)
-                return data.sum(d[1]).sum(d[0]).prod(dd)
-            else:
-                dd = sorted(dd)
-                return data.sum(d).prod(dd[1]).prod(dd[0])
-
-        for d, dd in dims:
-            expected = my_sum(input, d, dd)
-            f = function([a], a.sum(d).sum(dd), mode=self.mode)
-            utt.assert_allclose(f(input), expected)
-            assert len(f.maker.fgraph.apply_nodes) == 1
-        for d, dd in dims[:6]:
-            f = function([a], a.sum(d).sum(dd).sum(0), mode=self.mode)
-            utt.assert_allclose(f(input), input.sum(d).sum(dd).sum(0))
-            assert len(f.maker.fgraph.apply_nodes) == 1
-        for d in [0, 1, 2]:
-            f = function([a], a.sum(d).sum(None), mode=self.mode)
-            utt.assert_allclose(f(input), input.sum(d).sum())
-            assert len(f.maker.fgraph.apply_nodes) == 1
-        f = function([a], a.sum(None).sum(), mode=self.mode)
-        utt.assert_allclose(f(input), input.sum())
-        assert len(f.maker.fgraph.apply_nodes) == 1
-
-        # test prod
-        for d, dd in dims:
-            expected = my_prod(input, d, dd)
-            f = function([a], a.prod(d).prod(dd), mode=self.mode)
-            utt.assert_allclose(f(input), expected)
-            assert len(f.maker.fgraph.apply_nodes) == 1
-        for d, dd in dims[:6]:
-            f = function([a], a.prod(d).prod(dd).prod(0), mode=self.mode)
-            utt.assert_allclose(f(input), input.prod(d).prod(dd).prod(0))
-            assert len(f.maker.fgraph.apply_nodes) == 1
-        for d in [0, 1, 2]:
-            f = function([a], a.prod(d).prod(None), mode=self.mode)
-            utt.assert_allclose(f(input), input.prod(d).prod())
-            assert len(f.maker.fgraph.apply_nodes) == 1
-        f = function([a], a.prod(None).prod(), mode=self.mode)
-        utt.assert_allclose(f(input), input.prod())
-        assert len(f.maker.fgraph.apply_nodes) == 1
-
-        # Test that sum prod didn't get rewritten.
-        for d, dd in dims:
-            expected = my_sum_prod(input, d, dd)
-            f = function([a], a.sum(d).prod(dd), mode=self.mode)
-            utt.assert_allclose(f(input), expected)
-            assert len(f.maker.fgraph.apply_nodes) == 2
-        for d, dd in dims[:6]:
-            f = function([a], a.sum(d).prod(dd).prod(0), mode=self.mode)
-            utt.assert_allclose(f(input), input.sum(d).prod(dd).prod(0))
-            assert len(f.maker.fgraph.apply_nodes) == 2
-        for d in [0, 1, 2]:
-            f = function([a], a.sum(d).prod(None), mode=self.mode)
-            utt.assert_allclose(f(input), input.sum(d).prod())
-            assert len(f.maker.fgraph.apply_nodes) == 2
-        f = function([a], a.sum(None).prod(), mode=self.mode)
-        utt.assert_allclose(f(input), input.sum())
-        assert len(f.maker.fgraph.apply_nodes) == 1
-
     def test_local_sum_prod_alloc(self):
         a = dtensor3()
         input = np.asarray(np.arange(2 * 3 * 4).reshape(2, 3, 4), dtype="float64")
@@ -3003,29 +3085,6 @@ class TestLocalSumProd:
                 topo = f.maker.fgraph.toposort()
                 assert topo[-1].op == pt.alloc
                 assert not any(isinstance(node.op, Sum) for node in topo)
-
-    def test_local_sum_sum_int8(self):
-        """Test that `local_sum_sum` works when combining two sums on an int8 array.
-
-        This is a regression test for ticket gh-356.
-        """
-
-        x = tensor3(dtype="int8")
-        y = x.sum(axis=0).sum(axis=1)
-
-        with config.change_flags(on_opt_error="raise"):
-            # This compilation would fail prior to fix.
-            function([x], y)
-
-    def test_local_sum_sum_dtype(self):
-        """Test that `local_sum_sum` works when specifying dtypes manually."""
-
-        x = tensor3(dtype="int8")
-        y = x.sum(axis=0, dtype="int32").sum(axis=1, dtype="int64")
-
-        with config.change_flags(on_opt_error="raise"):
-            # This compilation would fail prior to fix.
-            function([x], y)
 
     def test_local_sum_prod_mul_by_scalar_stack_trace(self):
         """Test that stack trace is copied over correctly for `local_sum_prod_mul_by_scalar`."""
@@ -3217,7 +3276,7 @@ class TestLocalSumProd:
 class TestLocalReduce:
     def setup_method(self):
         self.mode = get_default_mode().including(
-            "canonicalize", "specialize", "uncanonicalize", "local_max_and_argmax"
+            "canonicalize", "specialize", "uncanonicalize"
         )
 
     def test_local_reduce_broadcast_all_0(self):
@@ -3265,7 +3324,7 @@ class TestLocalReduce:
             order = f.maker.fgraph.toposort()
             assert 1 == sum(isinstance(node.op, CAReduce) for node in order)
 
-            node = [node for node in order if isinstance(node.op, CAReduce)][0]
+            node = next(node for node in order if isinstance(node.op, CAReduce))
 
             op = node.op
             assert isinstance(op, CAReduce)
@@ -3290,62 +3349,112 @@ class TestLocalReduce:
                 isinstance(node.op, CAReduce) for node in f.maker.fgraph.toposort()
             )
 
-    def test_local_reduce_join(self):
+
+class TestReduceJoin:
+    def setup_method(self):
+        self.mode = get_default_mode().including(
+            "canonicalize", "specialize", "uncanonicalize"
+        )
+
+    @pytest.mark.parametrize(
+        "op, nin", [(pt_sum, 3), (pt_max, 2), (pt_min, 2), (prod, 3)]
+    )
+    def test_local_reduce_join(self, op, nin):
         vx = matrix()
         vy = matrix()
         vz = matrix()
         x = np.asarray([[1, 0], [3, 4]], dtype=config.floatX)
         y = np.asarray([[4, 0], [2, 1]], dtype=config.floatX)
         z = np.asarray([[5, 0], [1, 2]], dtype=config.floatX)
-        # Test different reduction scalar operation
-        for out, res in [
-            (pt_max((vx, vy), 0), np.max((x, y), 0)),
-            (pt_min((vx, vy), 0), np.min((x, y), 0)),
-            (pt_sum((vx, vy, vz), 0), np.sum((x, y, z), 0)),
-            (prod((vx, vy, vz), 0), np.prod((x, y, z), 0)),
-            (prod((vx, vy.T, vz), 0), np.prod((x, y.T, z), 0)),
-        ]:
-            f = function([vx, vy, vz], out, on_unused_input="ignore", mode=self.mode)
-            assert (f(x, y, z) == res).all(), out
-            topo = f.maker.fgraph.toposort()
-            assert len(topo) <= 2, out
-            assert isinstance(topo[-1].op, Elemwise), out
 
+        inputs = (vx, vy, vz)[:nin]
+        test_values = (x, y, z)[:nin]
+
+        out = op(inputs, axis=0)
+        f = function(inputs, out, mode=self.mode)
+        np.testing.assert_allclose(
+            f(*test_values), getattr(np, op.__name__)(test_values, axis=0)
+        )
+        topo = f.maker.fgraph.toposort()
+        assert len(topo) <= 2
+        assert isinstance(topo[-1].op, Elemwise)
+
+    def test_type(self):
         # Test different axis for the join and the reduction
         # We must force the dtype, of otherwise, this tests will fail
         # on 32 bit systems
         A = shared(np.array([1, 2, 3, 4, 5], dtype="int64"))
 
         f = function([], pt_sum(pt.stack([A, A]), axis=0), mode=self.mode)
-        utt.assert_allclose(f(), [2, 4, 6, 8, 10])
+        np.testing.assert_allclose(f(), [2, 4, 6, 8, 10])
         topo = f.maker.fgraph.toposort()
         assert isinstance(topo[-1].op, Elemwise)
 
         # Test a case that was bugged in a old PyTensor bug
         f = function([], pt_sum(pt.stack([A, A]), axis=1), mode=self.mode)
 
-        utt.assert_allclose(f(), [15, 15])
+        np.testing.assert_allclose(f(), [15, 15])
         topo = f.maker.fgraph.toposort()
         assert not isinstance(topo[-1].op, Elemwise)
 
         # This case could be rewritten
         A = shared(np.array([1, 2, 3, 4, 5]).reshape(5, 1))
         f = function([], pt_sum(pt.concatenate((A, A), axis=1), axis=1), mode=self.mode)
-        utt.assert_allclose(f(), [2, 4, 6, 8, 10])
+        np.testing.assert_allclose(f(), [2, 4, 6, 8, 10])
         topo = f.maker.fgraph.toposort()
         assert not isinstance(topo[-1].op, Elemwise)
 
         A = shared(np.array([1, 2, 3, 4, 5]).reshape(5, 1))
         f = function([], pt_sum(pt.concatenate((A, A), axis=1), axis=0), mode=self.mode)
-        utt.assert_allclose(f(), [15, 15])
+        np.testing.assert_allclose(f(), [15, 15])
         topo = f.maker.fgraph.toposort()
         assert not isinstance(topo[-1].op, Elemwise)
 
+    def test_not_supported_axis_none(self):
         # Test that the rewrite does not crash in one case where it
         # is not applied.  Reported at
         # https://groups.google.com/d/topic/theano-users/EDgyCU00fFA/discussion
+        vx = matrix()
+        vy = matrix()
+        vz = matrix()
+        x = np.asarray([[1, 0], [3, 4]], dtype=config.floatX)
+        y = np.asarray([[4, 0], [2, 1]], dtype=config.floatX)
+        z = np.asarray([[5, 0], [1, 2]], dtype=config.floatX)
+
         out = pt_sum([vx, vy, vz], axis=None)
-        f = function([vx, vy, vz], out)
+        f = function([vx, vy, vz], out, mode=self.mode)
+        np.testing.assert_allclose(f(x, y, z), np.sum([x, y, z]))
+
+    def test_not_supported_unequal_shapes(self):
+        # Not the same shape along the join axis
+        vx = matrix(shape=(1, 3))
+        vy = matrix(shape=(2, 3))
+        x = np.asarray([[1, 0, 1]], dtype=config.floatX)
+        y = np.asarray([[4, 0, 1], [2, 1, 1]], dtype=config.floatX)
+        out = pt_sum(join(0, vx, vy), axis=0)
+
+        f = function([vx, vy], out, mode=self.mode)
+        np.testing.assert_allclose(
+            f(x, y), np.sum(np.concatenate([x, y], axis=0), axis=0)
+        )
+
+    def test_non_ds_inputs(self):
+        """Make sure rewrite works when inputs to join are not the usual DimShuffle.
+
+        Sum{axis=1} [id A] <Vector(float64, shape=(3,))>
+         └─ Join [id B] <Matrix(float64, shape=(3, 3))>
+            ├─ 1 [id C] <Scalar(int8, shape=())>
+            ├─ ExpandDims{axis=1} [id D] <Matrix(float64, shape=(3, 1))>
+            ├─ Sub [id E] <Matrix(float64, shape=(3, 1))>
+            └─ Sub [id F] <Matrix(float64, shape=(3, 1))>
+        """
+        x = vector("x")
+        out = join(0, exp(x[None]), log(x[None])).sum(axis=0)
+
+        fg = FunctionGraph([x], [out], clone=False)
+        [rewritten_out] = local_reduce_join.transform(fg, out.owner)
+        expected_out = add(exp(x), log(x))
+        assert equal_computations([rewritten_out], [expected_out])
 
 
 def test_local_useless_adds():
@@ -3503,12 +3612,7 @@ def test_local_sumsqr2dot():
     assert any(
         isinstance(
             n.op,
-            (
-                Dot,
-                Dot22,
-                Gemv,
-                CGemv,
-            ),
+            Dot | Dot22 | Gemv | CGemv,
         )
         for n in f.maker.fgraph.toposort()
     )
@@ -3734,8 +3838,8 @@ def check_max_log_sum_exp(x, axis, dimshuffle_op=None):
             return
 
         # In mode FAST_COMPILE, the rewrites don't replace the
-        # `MaxAndArgmax` `Op`.
-        if isinstance(node.op, MaxAndArgmax):
+        # `Max` `Op`.
+        if isinstance(node.op, Max):
             return
 
     # TODO FIXME: Refactor this test so that it makes a direct assertion and
@@ -3753,7 +3857,7 @@ def test_local_log_sum_exp_maximum():
     check_max_log_sum_exp(x, axis=(0, 1, 2), dimshuffle_op=None)
 
     # If a transpose is applied to the sum
-    transpose_op = DimShuffle((False, False), (1, 0))
+    transpose_op = DimShuffle(input_ndim=2, new_order=(1, 0))
     check_max_log_sum_exp(x, axis=2, dimshuffle_op=transpose_op)
 
     # If the sum is performed with keepdims=True
@@ -3774,7 +3878,7 @@ def test_local_log_sum_exp_near_one():
     assert np.allclose(naive_ret, rewritten_ret)
 
     # If a transpose is applied
-    transpose_op = DimShuffle((False, False), (1, 0))
+    transpose_op = DimShuffle(input_ndim=2, new_order=(1, 0))
     f = compile_graph_log_sum_exp(x, axis=(1,), dimshuffle_op=transpose_op)
     naive_ret = np.log(np.sum(np.exp(x_val), axis=1).T)
     rewritten_ret = f(x_val)
@@ -4389,7 +4493,7 @@ def test_logdiffexp():
                 node
                 for node in graph
                 if isinstance(node.op, Elemwise)
-                and isinstance(node.op.scalar_op, (ps.Exp, ps.Log))
+                and isinstance(node.op.scalar_op, ps.Exp | ps.Log)
             ]
         )
         == 0
@@ -4427,3 +4531,65 @@ def test_polygamma_specialization():
     assert isinstance(fn_outs[0].owner.op.scalar_op, Psi)
     assert isinstance(fn_outs[1].owner.op.scalar_op, TriGamma)
     assert isinstance(fn_outs[2].owner.op.scalar_op, PolyGamma)
+
+
+@pytest.mark.skipif(
+    config.mode == "FAST_COMPILE",
+    reason="Rewrite is only relevant in FAST_RUN",
+)
+def test_local_batched_matmul_to_core_matmul():
+    rng = np.random.default_rng(seed=4433)
+
+    # x is batched but not y
+    x = pt.tensor("x", shape=(None, 3, 2), dtype="float64")
+    y = pt.tensor("y", shape=(2, 2), dtype="float64")
+    out = x @ y
+    assert isinstance(out.owner.op, Blockwise)
+
+    fn = pytensor.function([x, y], out)
+    assert not any(
+        isinstance(node.op, Blockwise) for node in fn.maker.fgraph.apply_nodes
+    )
+
+    x_test = rng.normal(size=(5, 3, 2))
+    y_test = rng.normal(size=(2, 2))
+    np.testing.assert_allclose(fn(x_test, y_test), x_test @ y_test)
+
+    # y is batched but not x
+    x = pt.tensor("x", shape=(1, 3, 2), dtype="float64")
+    y = pt.tensor("y", shape=(5, 2, 2), dtype="float64")
+    out = x @ y
+    assert isinstance(out.owner.op, Blockwise)
+
+    fn = pytensor.function([x, y], out)
+    assert not any(
+        isinstance(node.op, Blockwise) for node in fn.maker.fgraph.apply_nodes
+    )
+
+    x_test = rng.normal(size=(1, 3, 2))
+    y_test = rng.normal(size=(5, 2, 2))
+    np.testing.assert_allclose(fn(x_test, y_test), x_test @ y_test)
+
+    # Both x and y are batched, rewrite does not apply
+    x = pt.tensor("x", shape=(None, 3, 2), dtype="float64")
+    y = pt.tensor("y", shape=(5, 2, 2), dtype="float64")
+    out = x @ y
+
+    fn = pytensor.function([x, y], out)
+    x_test = rng.normal(size=(5, 3, 2))
+    y_test = rng.normal(size=(5, 2, 2))
+    np.testing.assert_allclose(fn(x_test, y_test), x_test @ y_test)
+
+
+def test_log_kv_stabilization():
+    x = pt.scalar("x")
+    out = log(kv(4.5, x))
+
+    # Expression would underflow to -inf without rewrite
+    mode = get_default_mode().including("stabilize")
+    # Reference value from mpmath
+    # mpmath.log(mpmath.besselk(4.5, 1000.0))
+    np.testing.assert_allclose(
+        out.eval({x: 1000.0}, mode=mode),
+        -1003.2180912984705,
+    )

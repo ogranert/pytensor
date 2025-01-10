@@ -15,7 +15,7 @@ from pytensor.graph.op import Op
 from pytensor.graph.rewriting.basic import check_stack_trace, node_rewriter, out2in
 from pytensor.graph.rewriting.utils import rewrite_graph
 from pytensor.graph.type import Type
-from pytensor.tensor.basic import as_tensor_variable
+from pytensor.tensor.basic import alloc, as_tensor_variable
 from pytensor.tensor.elemwise import DimShuffle, Elemwise
 from pytensor.tensor.math import add, exp, maximum
 from pytensor.tensor.rewriting.basic import register_specialize
@@ -23,6 +23,7 @@ from pytensor.tensor.rewriting.shape import (
     ShapeFeature,
     local_reshape_to_dimshuffle,
     local_useless_reshape,
+    local_useless_specify_shape,
 )
 from pytensor.tensor.shape import (
     Reshape,
@@ -239,6 +240,25 @@ class TestShapeRewriter:
         # FIXME: This is not a good test.
         f([[1, 2], [2, 3]])
 
+    def test_shape_of_useless_alloc(self):
+        """Test that local_shape_to_shape_i does not create circular graph.
+
+        Regression test for #565
+        """
+        alpha = vector(shape=(None,), dtype="float64")
+        channel = vector(shape=(None,), dtype="float64")
+
+        broadcast_channel = alloc(
+            channel,
+            maximum(
+                shape(alpha)[0],
+                shape(channel)[0],
+            ),
+        )
+        out = shape(broadcast_channel)
+        fn = function([alpha, channel], out)
+        assert fn([1.0, 2, 3], [1.0, 2, 3]) == (3,)
+
 
 class TestReshape:
     def setup_method(self):
@@ -316,6 +336,52 @@ class TestLocalUselessReshape:
         f2 = function([x], r, mode=m2)
         topo = f2.maker.fgraph.toposort()
         assert not any(isinstance(n.op, Reshape) for n in topo)
+
+    def test_constant_shape(self):
+        # Where reshape is a constant that matches the shape
+        x = matrix(shape=(2, 3))
+        shape = pt.as_tensor(np.array([2, 3]))
+        out = reshape(x, shape)
+        new_out = rewrite_graph(out)
+        assert new_out is x
+
+        x = matrix(shape=(2, 3))
+        shape = pt.as_tensor(np.array([-1, 3]))
+        out = reshape(x, shape)
+        new_out = rewrite_graph(out)
+        assert new_out is x
+
+        x = matrix(shape=(None, 3))
+        shape = pt.as_tensor(np.array([-1, 3]))
+        out = reshape(x, shape)
+        new_out = rewrite_graph(out)
+        assert new_out is x
+
+        x = matrix(shape=(None, 3))
+        shape = pt.as_tensor(np.array([2, 3]))
+        out = reshape(x, shape)
+        new_out = rewrite_graph(out)
+        # This could be rewritten as a specify_shape(x, (2, 3))
+        assert new_out is not x
+
+        x = matrix(shape=(2, 3))
+        shape = pt.as_tensor(np.array([3, 2]))
+        out = reshape(x, shape)
+        new_out = rewrite_graph(out)
+        assert new_out is not x
+
+    def test_all_but_one_match(self):
+        x = matrix(shape=(None, None))
+        shape = [x.shape[0], 3]
+        out = reshape(x, shape)
+        new_out = rewrite_graph(out)
+        assert equal_computations([new_out], [specify_shape(x, (None, 3))])
+
+        # Rewrite does not apply if there's also a -1
+        shape = [-1, 3]
+        out = reshape(x, shape)
+        new_out = rewrite_graph(out)
+        assert new_out is out
 
 
 class TestLocalReshapeToDimshuffle:
@@ -457,6 +523,30 @@ class TestSameShape:
             shape_feature.same_shape(x, o, 0, 1)
 
 
+def test_useless_specify_shape():
+    x = tensor("x", shape=(None, 5, 3))
+
+    # We avoid the helper specify_shape that optimizes some (but not all) cases eagerly
+    ss = SpecifyShape()
+
+    out = ss(x, None, 5, None)
+    assert isinstance(out.owner.op, SpecifyShape)
+    ret = local_useless_specify_shape.transform(None, out.owner)
+    assert ret == [x]
+
+    # SpecifyShape is needed to enfore unknown dim is 3
+    out = ss(x, 3, 5, None)
+    assert isinstance(out.owner.op, SpecifyShape)
+    ret = local_useless_specify_shape.transform(None, out.owner)
+    assert ret is None
+
+    # SpecifyShape is needed to raise mismatch between static and specified dim
+    out = ss(x, None, 5, 4)
+    assert isinstance(out.owner.op, SpecifyShape)
+    ret = local_useless_specify_shape.transform(None, out.owner)
+    assert ret is None
+
+
 @pytest.mark.parametrize(
     "shape",
     [lscalar(), iscalar()],
@@ -492,10 +582,10 @@ def test_local_Shape_of_SpecifyShape_partial(s1):
 
 def test_local_specify_shape_lift():
     x = vector("x")
-    out = specify_shape([1.0] + x, shape=(5,))
+    out = specify_shape([1.0] + x, shape=(5,))  # noqa: RUF005
 
     new_out = rewrite_graph(out)
-    assert equal_computations([new_out], [[1.0] + specify_shape(x, shape=(5,))])
+    assert equal_computations([new_out], [[1.0] + specify_shape(x, shape=(5,))])  # noqa: RUF005
 
 
 def test_local_Shape_i_ground():

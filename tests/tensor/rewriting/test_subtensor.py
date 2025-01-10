@@ -10,7 +10,7 @@ from pytensor.compile.mode import Mode, get_default_mode, get_mode
 from pytensor.compile.ops import DeepCopyOp
 from pytensor.configdefaults import config
 from pytensor.graph import FunctionGraph, vectorize_graph
-from pytensor.graph.basic import Constant, Variable, ancestors
+from pytensor.graph.basic import Constant, Variable, ancestors, equal_computations
 from pytensor.graph.rewriting.basic import check_stack_trace
 from pytensor.graph.rewriting.db import RewriteDatabaseQuery
 from pytensor.graph.rewriting.utils import rewrite_graph
@@ -448,14 +448,12 @@ def test_local_subtensor_remove_broadcastable_index():
     for elem in f.maker.fgraph.toposort():
         assert not isinstance(
             elem.op,
-            (
-                Subtensor,
-                AdvancedSubtensor,
-                AdvancedSubtensor1,
-                IncSubtensor,
-                AdvancedIncSubtensor,
-                AdvancedIncSubtensor1,
-            ),
+            Subtensor
+            | AdvancedSubtensor
+            | AdvancedSubtensor1
+            | IncSubtensor
+            | AdvancedIncSubtensor
+            | AdvancedIncSubtensor1,
         )
     rng = np.random.default_rng(seed=utt.fetch_seed())
     xn = rng.random((5, 5))
@@ -535,7 +533,7 @@ class TestSubtensorIncSubtensor:
         y = set_subtensor((2 * x)[indices], val, inplace=False)
         assert y.owner.op.inplace is False
         f = function(
-            [x, val] + list(indices),
+            [x, val, *indices],
             y,
             mode=self.mode.including("inplace"),
         )
@@ -1378,7 +1376,7 @@ class TestLocalSubtensorMerge:
             slice1 = slice(*slice_inputs[:3])
             slice2 = slice(*slice_inputs[3:])
             sub_x = x[slice1][slice2]
-            f = function([x] + input_vars, sub_x, mode=mode_opt)
+            f = function([x, *input_vars], sub_x, mode=mode_opt)
 
             # Check stacktrace was copied over correctly after opt was applied
             # for some cases, the optimization may remove all Subtensors,
@@ -1391,7 +1389,7 @@ class TestLocalSubtensorMerge:
 
             for x_s in self.x_shapes:
                 x_val = self.rng.uniform(size=x_s).astype(config.floatX)
-                for i_val in zip(*values):
+                for i_val in zip(*values, strict=True):
                     f(x_val, *i_val)
 
     def test_none_index(self):
@@ -1438,7 +1436,7 @@ class TestLocalSubtensorMerge:
 
             symbol_slice = slice(*slice_inputs[:3])
             sub_x = x[symbol_slice][i]
-            f = function([x] + input_vars, sub_x, mode=mode_opt)
+            f = function([x, *input_vars], sub_x, mode=mode_opt)
 
             # Check stacktrace was copied over correctly after opt was applied
             assert check_stack_trace(f, ops_to_check=Subtensor)
@@ -1449,7 +1447,7 @@ class TestLocalSubtensorMerge:
 
             for x_s in self.x_shapes:
                 x_val = self.rng.uniform(size=x_s).astype(config.floatX)
-                for i_val in zip(*values):
+                for i_val in zip(*values, strict=True):
                     # The index could be out of bounds
                     # In that case, an Exception should be raised,
                     # otherwise, we let DebugMode check f
@@ -1515,7 +1513,7 @@ class TestLocalAdvSub1AdvIncSub1:
             utt.assert_allclose(dy, res)
             topo = f.maker.fgraph.toposort()
             assert len(topo) == 1
-            assert isinstance(topo[0].op, (DeepCopyOp, Elemwise))
+            assert isinstance(topo[0].op, DeepCopyOp | Elemwise)
 
             # inc_subtensor(data[idx], y)
             inc = inc_subtensor(x[idx], y)
@@ -1570,7 +1568,7 @@ class TestLocalAdvSub1AdvIncSub1:
         incs = [set_subtensor(x[idx], y) for y in ys]
         outs = [inc[idx] for inc in incs]
 
-        for y, out in zip(ys, outs):
+        for y, out in zip(ys, outs, strict=True):
             f = function([x, y, idx], out, self.mode)
             assert check_stack_trace(f, ops_to_check=(Assert, ps.Cast))
 
@@ -1806,11 +1804,7 @@ def test_local_IncSubtensor_serialize():
             inp.owner
             and isinstance(
                 inp.owner.op,
-                (
-                    IncSubtensor,
-                    AdvancedIncSubtensor,
-                    AdvancedIncSubtensor1,
-                ),
+                IncSubtensor | AdvancedIncSubtensor | AdvancedIncSubtensor1,
             )
             for inp in a.inputs
         )
@@ -2015,10 +2009,8 @@ def test_local_subtensor_SpecifyShape_lift(x, s, idx, x_val, s_val):
     rewrites = RewriteDatabaseQuery(include=[None])
     no_rewrites_mode = Mode(optimizer=rewrites)
 
-    y_val_fn = function(
-        [x] + list(s), y, on_unused_input="ignore", mode=no_rewrites_mode
-    )
-    y_val = y_val_fn(*([x_val] + list(s_val)))
+    y_val_fn = function([x, *s], y, on_unused_input="ignore", mode=no_rewrites_mode)
+    y_val = y_val_fn(*([x_val, *s_val]))
 
     # This optimization should appear in the canonicalizations
     y_opt = rewrite_graph(y, clone=False)
@@ -2030,8 +2022,8 @@ def test_local_subtensor_SpecifyShape_lift(x, s, idx, x_val, s_val):
     else:
         assert isinstance(y_opt.owner.op, SpecifyShape)
 
-    y_opt_fn = function([x] + list(s), y_opt, on_unused_input="ignore")
-    y_opt_val = y_opt_fn(*([x_val] + list(s_val)))
+    y_opt_fn = function([x, *s], y_opt, on_unused_input="ignore")
+    y_opt_val = y_opt_fn(*([x_val, *s_val]))
 
     assert np.allclose(y_val, y_opt_val)
 
@@ -2410,3 +2402,76 @@ def test_local_blockwise_advanced_inc_subtensor(set_instead_of_inc):
     else:
         expected_out[:, :, core_idxs] += test_y
     np.testing.assert_allclose(fn(test_x, test_y), expected_out)
+
+
+class TestUselessSlice:
+    def test_positive_step(self):
+        # When steps are positive, default start and end are `0` and `len(dim)`
+        x = tensor(shape=(3, 5, None, 9), dtype="float64")
+        test_x = np.random.normal(size=(3, 5, 8, 9))
+
+        y = x[0:3:1, 1:5:2, 0:7:1, 0:9:1]
+        f = pytensor.function([x], y)
+
+        # Get the DeepCopy input and assert that the Op is a DeepCopy
+        deep_copy_node = f.maker.fgraph.outputs[0].owner
+        assert isinstance(deep_copy_node.op, DeepCopyOp)
+
+        rewritten_y = deep_copy_node.inputs[0]
+        expected_y = x[None:None:None, 1:None:2, None:7:None]
+        assert equal_computations([rewritten_y], [expected_y])
+
+        np.testing.assert_allclose(
+            f(test_x),
+            # Use the unoptimized slice to make sure our rewrite logic is correct
+            test_x[0:3:1, 1:5:2, 0:7:1, 0:9:1],
+        )
+
+    def test_negative_step(self):
+        # When steps are negative, default start and end are `-1` and `-len(dim) - 1`
+        x = tensor(shape=(3, 5, None, 9), dtype="float64")
+        test_x = np.random.normal(size=(3, 5, 8, 9))
+
+        y = x[-1:-4:-1, 0:5:-2, -1:-9:-1, 0:9:None]
+        f = pytensor.function([x], y)
+
+        # Get the DeepCopy input and assert that the Op is a DeepCopy
+        deep_copy_node = f.maker.fgraph.outputs[0].owner
+        assert isinstance(deep_copy_node.op, DeepCopyOp)
+
+        rewritten_y = deep_copy_node.inputs[0]
+        expected_y = x[None:None:-1, 0:5:-2, None:-9:-1]
+        assert equal_computations([rewritten_y], [expected_y])
+
+        np.testing.assert_allclose(
+            f(test_x),
+            test_x[-1:-4:-1, 0:5:-2, -1:-9:-1, 0:9:None],
+        )
+
+    def test_unknown_step(self):
+        # If step isn't known, we can't canonicalize start and stop points
+        step = pt.scalar("step", dtype=int)
+        x = tensor(shape=(3, 5, None), dtype="float64")
+        test_x = np.random.normal(size=(3, 5, 7))
+
+        y = x[0:3:step, -1:-6:-step, ::]
+        # Need this rewrite when `FAST_COMPILE` otherwise step = -1 * step instead of neg(step)
+        mode = get_default_mode().including("local_mul_specialize")
+        f = pytensor.function([x, step], y, mode=mode)
+
+        # Get the DeepCopy input and assert that the Op is a DeepCopy
+        deep_copy_node = f.maker.fgraph.outputs[0].owner
+        assert isinstance(deep_copy_node.op, DeepCopyOp)
+
+        rewritten_y = deep_copy_node.inputs[0]
+        expected_y = x[0:3:step, -1:-6:-step]
+        assert equal_computations([rewritten_y], [expected_y])
+
+        np.testing.assert_allclose(
+            f(test_x, 1),
+            test_x[0:3:1, -1:-6:-1, ::],
+        )
+        np.testing.assert_allclose(
+            f(test_x, -2),
+            test_x[0:3:-2, -1:-6:2, ::],
+        )

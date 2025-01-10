@@ -1,7 +1,7 @@
 from abc import ABC, abstractmethod
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from copy import copy, deepcopy
-from typing import TYPE_CHECKING, Any, Callable, Optional, Union
+from typing import TYPE_CHECKING, Any, Optional, Union
 
 from pytensor.configdefaults import config
 from pytensor.graph.basic import Apply, Variable
@@ -54,15 +54,15 @@ class Container:
 
     def __init__(
         self,
-        r: Union[Variable, Type],
+        r: Variable | Type,
         storage: list[Any],
         *,
         readonly: bool = False,
         strict: bool = False,
-        allow_downcast: Optional[bool] = None,
-        name: Optional[str] = None,
+        allow_downcast: bool | None = None,
+        name: str | None = None,
     ) -> None:
-        if not isinstance(storage, list) or not len(storage) >= 1:
+        if not (isinstance(storage, list) and len(storage) >= 1):
             raise TypeError("storage must be a list of length at least one")
         if isinstance(r, Variable):
             self.type = r.type
@@ -106,7 +106,7 @@ class Container:
                 self.storage[0] = self.type.filter(value, **kwargs)
 
         except Exception as e:
-            e.args = e.args + (f'Container name "{self.name}"',)
+            e.args = (*e.args, f'Container name "{self.name}"')
             raise
 
     data = property(__get__, __set__)
@@ -160,15 +160,15 @@ class Linker(ABC):
     def __init__(
         self,
         *,
-        allow_gc: Optional[bool] = None,
-        scheduler: Optional[Callable[[FunctionGraph], list[Apply]]] = None,
+        allow_gc: bool | None = None,
+        scheduler: Callable[[FunctionGraph], list[Apply]] | None = None,
     ) -> None:
         self._allow_gc = allow_gc
         self._scheduler = scheduler
         super().__init__()
 
     @property
-    def allow_gc(self) -> Optional[bool]:
+    def allow_gc(self) -> bool | None:
         """Determines if the linker may allow garbage collection.
 
         Returns
@@ -178,7 +178,7 @@ class Linker(ABC):
         """
         return self._allow_gc
 
-    def clone(self, allow_gc: Optional[bool] = None) -> "Linker":
+    def clone(self, allow_gc: bool | None = None) -> "Linker":
         new = copy(self)
         if allow_gc is not None:
             new._allow_gc = allow_gc
@@ -281,18 +281,18 @@ class PerformLinker(LocalLinker):
     """
 
     def __init__(
-        self, allow_gc: Optional[bool] = None, schedule: Optional[Callable] = None
+        self, allow_gc: bool | None = None, schedule: Callable | None = None
     ) -> None:
         if allow_gc is None:
             allow_gc = config.allow_gc
-        self.fgraph: Optional[FunctionGraph] = None
+        self.fgraph: FunctionGraph | None = None
         super().__init__(allow_gc=allow_gc, scheduler=schedule)
 
     def accept(
         self,
         fgraph: FunctionGraph,
-        no_recycling: Optional[Sequence[Variable]] = None,
-        profile: Optional[Union[bool, "ProfileStats"]] = None,
+        no_recycling: Sequence[Variable] | None = None,
+        profile: Union[bool, "ProfileStats"] | None = None,
     ) -> "PerformLinker":
         """Associate a `FunctionGraph` with this `Linker`.
 
@@ -322,7 +322,7 @@ class PerformLinker(LocalLinker):
         output_storage=None,
         storage_map=None,
     ):
-        fgraph: Any = self.fgraph
+        fgraph = self.fgraph
         order = self.schedule(fgraph)
         no_recycling = self.no_recycling
 
@@ -347,7 +347,7 @@ class PerformLinker(LocalLinker):
             thunks[-1].outputs = [storage_map[v] for v in node.outputs]
 
         computed, last_user = gc_helper(order)
-        post_thunk_old_storage: Any = [] if self.allow_gc else None
+        post_thunk_old_storage = [] if self.allow_gc else None
 
         for node in order:
             if self.allow_gc:
@@ -385,11 +385,11 @@ class PerformLinker(LocalLinker):
             f,
             [
                 Container(input, storage)
-                for input, storage in zip(fgraph.inputs, input_storage)
+                for input, storage in zip(fgraph.inputs, input_storage, strict=True)
             ],
             [
                 Container(output, storage, readonly=True)
-                for output, storage in zip(fgraph.outputs, output_storage)
+                for output, storage in zip(fgraph.outputs, output_storage, strict=True)
             ],
             thunks,
             order,
@@ -435,7 +435,7 @@ class WrapLinker(Linker):
         linkers: Sequence[PerformLinker],
         wrapper: Callable,
     ) -> None:
-        self.fgraph: Optional[FunctionGraph] = None
+        self.fgraph: FunctionGraph | None = None
         self.linkers = linkers
         self.wrapper = wrapper
 
@@ -468,8 +468,8 @@ class WrapLinker(Linker):
     def accept(
         self,
         fgraph: FunctionGraph,
-        no_recycling: Optional[Sequence["TensorVariable"]] = None,
-        profile: Optional[Union[bool, "ProfileStats"]] = None,
+        no_recycling: Sequence["TensorVariable"] | None = None,
+        profile: Union[bool, "ProfileStats"] | None = None,
     ) -> "WrapLinker":
         """
 
@@ -496,7 +496,7 @@ class WrapLinker(Linker):
     def pre(
         self,
         f: "WrapLinker",
-        inputs: Union[list["NDArray"], list[Optional[float]]],
+        inputs: list["NDArray"] | list[float | None],
         order: list[Apply],
         thunk_groups: list[tuple[Callable]],
     ) -> None:
@@ -509,7 +509,9 @@ class WrapLinker(Linker):
         kwargs.pop("input_storage", None)
         make_all += [x.make_all(**kwargs) for x in self.linkers[1:]]
 
-        fns, input_lists, output_lists, thunk_lists, order_lists = zip(*make_all)
+        fns, input_lists, output_lists, thunk_lists, order_lists = zip(
+            *make_all, strict=True
+        )
 
         order_list0 = order_lists[0]
         for order_list in order_lists[1:]:
@@ -521,27 +523,30 @@ class WrapLinker(Linker):
         inputs0 = input_lists[0]
         outputs0 = output_lists[0]
 
-        thunk_groups = list(zip(*thunk_lists))
-        order = [x[0] for x in zip(*order_lists)]
+        thunk_groups = list(zip(*thunk_lists, strict=True))
+        order = [x[0] for x in zip(*order_lists, strict=True)]
 
-        to_reset = []
-        for thunks, node in zip(thunk_groups, order):
-            for j, output in enumerate(node.outputs):
-                if output in no_recycling:
-                    for thunk in thunks:
-                        to_reset.append(thunk.outputs[j])
+        to_reset = [
+            thunk.outputs[j]
+            for thunks, node in zip(thunk_groups, order, strict=True)
+            for j, output in enumerate(node.outputs)
+            if output in no_recycling
+            for thunk in thunks
+        ]
 
         wrapper = self.wrapper
         pre = self.pre
 
         def f():
             for inputs in input_lists[1:]:
-                for input1, input2 in zip(inputs0, inputs):
+                # strict=False because we are in a hot loop
+                for input1, input2 in zip(inputs0, inputs, strict=False):
                     input2.storage[0] = copy(input1.storage[0])
             for x in to_reset:
                 x[0] = None
             pre(self, [input.data for input in input_lists[0]], order, thunk_groups)
-            for i, (thunks, node) in enumerate(zip(thunk_groups, order)):
+            # strict=False because we are in a hot loop
+            for i, (thunks, node) in enumerate(zip(thunk_groups, order, strict=False)):
                 try:
                     wrapper(self.fgraph, i, node, *thunks)
                 except Exception:
@@ -600,6 +605,10 @@ class JITLinker(PerformLinker):
     def jit_compile(self, fn: Callable) -> Callable:
         """JIT compile a converted ``FunctionGraph``."""
 
+    def input_filter(self, inp: Any) -> Any:
+        """Apply a filter to the data input."""
+        return inp
+
     def output_filter(self, var: Variable, out: Any) -> Any:
         """Apply a filter to the data output by a JITed function call."""
         return out
@@ -644,38 +653,36 @@ class JITLinker(PerformLinker):
         )
 
         thunk_inputs = self.create_thunk_inputs(storage_map)
-
-        thunks = []
-
         thunk_outputs = [storage_map[n] for n in self.fgraph.outputs]
-
         fgraph_jit = self.jit_compile(converted_fgraph)
 
         def thunk(
-            fgraph=self.fgraph,
             fgraph_jit=fgraph_jit,
             thunk_inputs=thunk_inputs,
             thunk_outputs=thunk_outputs,
         ):
-            outputs = fgraph_jit(*[x[0] for x in thunk_inputs])
+            try:
+                outputs = fgraph_jit(*(x[0] for x in thunk_inputs))
+            except Exception:
+                # TODO: Should we add a fake node that combines all outputs,
+                #  since the error may come from any of them?
+                raise_with_op(self.fgraph, output_nodes[0], thunk)
 
-            for o_var, o_storage, o_val in zip(fgraph.outputs, thunk_outputs, outputs):
-                compute_map[o_var][0] = True
-                o_storage[0] = self.output_filter(o_var, o_val)
-            return outputs
+            # strict=False because we are in a hot loop
+            for o_storage, o_val in zip(thunk_outputs, outputs, strict=False):
+                o_storage[0] = o_val
 
         thunk.inputs = thunk_inputs
         thunk.outputs = thunk_outputs
         thunk.lazy = False
 
-        thunks.append(thunk)
+        thunks = [thunk]
 
         return thunks, output_nodes, fgraph_jit
 
     def make_all(self, input_storage=None, output_storage=None, storage_map=None):
         fgraph = self.fgraph
         nodes = self.schedule(fgraph)
-        no_recycling = self.no_recycling
 
         input_storage, output_storage, storage_map = map_storage(
             fgraph, nodes, input_storage, output_storage, storage_map
@@ -689,36 +696,7 @@ class JITLinker(PerformLinker):
             compute_map, nodes, input_storage, output_storage, storage_map
         )
 
-        computed, last_user = gc_helper(nodes)
-
-        if self.allow_gc:
-            post_thunk_old_storage = []
-
-            for node in nodes:
-                post_thunk_old_storage.append(
-                    [
-                        storage_map[input]
-                        for input in node.inputs
-                        if (input in computed)
-                        and (input not in fgraph.outputs)
-                        and (node == last_user[input])
-                    ]
-                )
-        else:
-            post_thunk_old_storage = None
-
-        if no_recycling is True:
-            no_recycling = list(storage_map.values())
-            no_recycling = difference(no_recycling, input_storage)
-        else:
-            no_recycling = [
-                storage_map[r] for r in no_recycling if r not in fgraph.inputs
-            ]
-
-        fn = streamline(
-            fgraph, thunks, nodes, post_thunk_old_storage, no_recycling=no_recycling
-        )
-
+        [fn] = thunks
         fn.jit_fn = jit_fn
         fn.allow_gc = self.allow_gc
         fn.storage_map = storage_map
@@ -727,11 +705,11 @@ class JITLinker(PerformLinker):
             fn,
             [
                 Container(input, storage)
-                for input, storage in zip(fgraph.inputs, input_storage)
+                for input, storage in zip(fgraph.inputs, input_storage, strict=True)
             ],
             [
                 Container(output, storage, readonly=True)
-                for output, storage in zip(fgraph.outputs, output_storage)
+                for output, storage in zip(fgraph.outputs, output_storage, strict=True)
             ],
             thunks,
             nodes,

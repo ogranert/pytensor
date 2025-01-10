@@ -1,21 +1,17 @@
 import abc
 import warnings
-from typing import Optional, Union
 
 import numpy as np
 import scipy.stats as stats
 
 import pytensor
-from pytensor.tensor.basic import arange, as_tensor_variable
+from pytensor.tensor import get_vector_length, specify_shape
+from pytensor.tensor.basic import as_tensor_variable
+from pytensor.tensor.math import sqrt
 from pytensor.tensor.random.op import RandomVariable
-from pytensor.tensor.random.type import RandomGeneratorType, RandomStateType
 from pytensor.tensor.random.utils import (
     broadcast_params,
-    supp_shape_from_ref_param_shape,
-)
-from pytensor.tensor.random.var import (
-    RandomGeneratorSharedVariable,
-    RandomStateSharedVariable,
+    normalize_size_param,
 )
 
 
@@ -87,9 +83,9 @@ class UniformRV(RandomVariable):
         \end{split}
 
     """
+
     name = "uniform"
-    ndim_supp = 0
-    ndims_params = [0, 0]
+    signature = "(),()->()"
     dtype = "floatX"
     _print_name = ("Uniform", "\\operatorname{Uniform}")
 
@@ -141,9 +137,9 @@ class TriangularRV(RandomVariable):
         \end{split}
 
     """
+
     name = "triangular"
-    ndim_supp = 0
-    ndims_params = [0, 0, 0]
+    signature = "(),(),()->()"
     dtype = "floatX"
     _print_name = ("Triangular", "\\operatorname{Triangular}")
 
@@ -196,9 +192,9 @@ class BetaRV(RandomVariable):
         B(\alpha, \beta) = \int_0^1 t^{\alpha-1} (1-t)^{\beta-1} \mathrm{d}t
 
     """
+
     name = "beta"
-    ndim_supp = 0
-    ndims_params = [0, 0]
+    signature = "(),()->()"
     dtype = "floatX"
     _print_name = ("Beta", "\\operatorname{Beta}")
 
@@ -242,9 +238,9 @@ class NormalRV(RandomVariable):
     for :math:`\sigma > 0`.
 
     """
+
     name = "normal"
-    ndim_supp = 0
-    ndims_params = [0, 0]
+    signature = "(),()->()"
     dtype = "floatX"
     _print_name = ("Normal", "\\operatorname{Normal}")
 
@@ -275,38 +271,24 @@ class NormalRV(RandomVariable):
 normal = NormalRV()
 
 
-class StandardNormalRV(NormalRV):
-    r"""A standard normal continuous random variable.
+def standard_normal(*, size=None, rng=None, dtype=None):
+    """Draw samples from a standard normal distribution.
 
-    The probability density function for `standard_normal` is:
+    Signature
+    ---------
 
-    .. math::
+    `nil -> ()`
 
-        f(x) = \frac{1}{\sqrt{2 \pi}} e^{-\frac{x^2}{2}}
+    Parameters
+    ----------
+    size
+        Sample shape. If the given size is, e.g. `(m, n, k)` then `m * n * k`
+        independent, identically distributed random variables are
+        returned. Default is `None` in which case a single random variable
+        is returned.
 
     """
-
-    def __call__(self, size=None, **kwargs):
-        """Draw samples from a standard normal distribution.
-
-        Signature
-        ---------
-
-        `nil -> ()`
-
-        Parameters
-        ----------
-        size
-            Sample shape. If the given size is, e.g. `(m, n, k)` then `m * n * k`
-            independent, identically distributed random variables are
-            returned. Default is `None` in which case a single random variable
-            is returned.
-
-        """
-        return super().__call__(loc=0.0, scale=1.0, size=size, **kwargs)
-
-
-standard_normal = StandardNormalRV()
+    return normal(0.0, 1.0, size=size, rng=rng, dtype=dtype)
 
 
 class HalfNormalRV(ScipyRandomVariable):
@@ -322,9 +304,9 @@ class HalfNormalRV(ScipyRandomVariable):
     for :math:`x \geq 0` and :math:`\sigma > 0`.
 
     """
+
     name = "halfnormal"
-    ndim_supp = 0
-    ndims_params = [0, 0]
+    signature = "(),()->()"
     dtype = "floatX"
     _print_name = ("HalfNormal", "\\operatorname{HalfNormal}")
 
@@ -387,9 +369,9 @@ class LogNormalRV(RandomVariable):
     for :math:`x > 0` and :math:`\sigma > 0`.
 
     """
+
     name = "lognormal"
-    ndim_supp = 0
-    ndims_params = [0, 0]
+    signature = "(),()->()"
     dtype = "floatX"
     _print_name = ("LogNormal", "\\operatorname{LogNormal}")
 
@@ -438,9 +420,9 @@ class GammaRV(RandomVariable):
         \Gamma(x) = \int_0^{\infty} t^{x-1} e^{-t} \mathrm{d}t
 
     """
+
     name = "gamma"
-    ndim_supp = 0
-    ndims_params = [0, 0]
+    signature = "(),()->()"
     dtype = "floatX"
     _print_name = ("Gamma", "\\operatorname{Gamma}")
 
@@ -520,6 +502,43 @@ def chisquare(df, size=None, **kwargs):
     return gamma(shape=df / 2.0, scale=2.0, size=size, **kwargs)
 
 
+def rayleigh(scale=1.0, *, size=None, **kwargs):
+    r"""Draw samples from a Rayleigh distribution.
+
+    The probability density function for `rayleigh` with parameter `scale` is given by:
+
+    .. math::
+        f(x; s) = \frac{x}{s^2} e^{-x^2/(2 s^2)}
+
+    where :math:`s` is the scale parameter.
+
+    This variable is obtained by taking the square root of the sum of the squares of
+    two independent, standard normally distributed random variables.
+
+    Signature
+    ---------
+    `() -> ()`
+
+    Parameters
+    ----------
+    scale : float or array_like of floats, optional
+        Scale parameter of the distribution (positive). Default is 1.0.
+    size : int or tuple of ints, optional
+        Output shape. If the given shape is, e.g., `(m, n, k)`, then `m * n * k` samples
+        are drawn. Default is None, in which case the output shape is determined by the
+        shape of `scale`.
+
+    Notes
+    -----
+    `Rayleigh` is a special case of `chisquare` with ``df=2``.
+    """
+
+    scale = as_tensor_variable(scale)
+    if size is None:
+        size = scale.shape
+    return sqrt(chisquare(df=2, size=size, **kwargs)) * scale
+
+
 class ParetoRV(ScipyRandomVariable):
     r"""A pareto continuous random variable.
 
@@ -533,9 +552,9 @@ class ParetoRV(ScipyRandomVariable):
     and is defined for :math:`x \geq x_m`.
 
     """
+
     name = "pareto"
-    ndim_supp = 0
-    ndims_params = [0, 0]
+    signature = "(),()->()"
     dtype = "floatX"
     _print_name = ("Pareto", "\\operatorname{Pareto}")
 
@@ -583,17 +602,17 @@ class GumbelRV(ScipyRandomVariable):
     for :math:`\beta > 0`.
 
     """
+
     name = "gumbel"
-    ndim_supp = 0
-    ndims_params = [0, 0]
+    signature = "(),()->()"
     dtype = "floatX"
     _print_name = ("Gumbel", "\\operatorname{Gumbel}")
 
     def __call__(
         self,
-        loc: Union[np.ndarray, float],
-        scale: Union[np.ndarray, float] = 1.0,
-        size: Optional[Union[list[int], int]] = None,
+        loc: np.ndarray | float,
+        scale: np.ndarray | float = 1.0,
+        size: list[int] | int | None = None,
         **kwargs,
     ) -> RandomVariable:
         r"""Draw samples from a gumbel distribution.
@@ -621,10 +640,10 @@ class GumbelRV(ScipyRandomVariable):
     @classmethod
     def rng_fn_scipy(
         cls,
-        rng: Union[np.random.Generator, np.random.RandomState],
-        loc: Union[np.ndarray, float],
-        scale: Union[np.ndarray, float],
-        size: Optional[Union[list[int], int]],
+        rng: np.random.Generator,
+        loc: np.ndarray | float,
+        scale: np.ndarray | float,
+        size: list[int] | int | None,
     ) -> np.ndarray:
         return stats.gumbel_r.rvs(loc=loc, scale=scale, size=size, random_state=rng)
 
@@ -644,9 +663,9 @@ class ExponentialRV(RandomVariable):
     for :math:`x \geq 0` and :math:`\beta > 0`.
 
     """
+
     name = "exponential"
-    ndim_supp = 0
-    ndims_params = [0]
+    signature = "()->()"
     dtype = "floatX"
     _print_name = ("Exponential", "\\operatorname{Exponential}")
 
@@ -687,9 +706,9 @@ class WeibullRV(RandomVariable):
     for :math:`x \geq 0` and :math:`k > 0`.
 
     """
+
     name = "weibull"
-    ndim_supp = 0
-    ndims_params = [0]
+    signature = "()->()"
     dtype = "floatX"
     _print_name = ("Weibull", "\\operatorname{Weibull}")
 
@@ -731,9 +750,9 @@ class LogisticRV(RandomVariable):
     for :math:`s > 0`.
 
     """
+
     name = "logistic"
-    ndim_supp = 0
-    ndims_params = [0, 0]
+    signature = "(),()->()"
     dtype = "floatX"
     _print_name = ("Logistic", "\\operatorname{Logistic}")
 
@@ -779,9 +798,9 @@ class VonMisesRV(RandomVariable):
     function of order 0.
 
     """
+
     name = "vonmises"
-    ndim_supp = 0
-    ndims_params = [0, 0]
+    signature = "(),()->()"
     dtype = "floatX"
     _print_name = ("VonMises", "\\operatorname{VonMises}")
 
@@ -828,7 +847,7 @@ def safe_multivariate_normal(mean, cov, size=None, rng=None):
     )
 
     if size is not None:
-        res = res.reshape(list(size) + [-1])
+        res = res.reshape([*size, -1])
 
     return res
 
@@ -846,19 +865,11 @@ class MvNormalRV(RandomVariable):
     where :math:`\Sigma` is a positive semi-definite matrix.
 
     """
+
     name = "multivariate_normal"
-    ndim_supp = 1
-    ndims_params = [1, 2]
+    signature = "(n),(n,n)->(n)"
     dtype = "floatX"
     _print_name = ("MultivariateNormal", "\\operatorname{MultivariateNormal}")
-
-    def _supp_shape_from_params(self, dist_params, param_shapes=None):
-        return supp_shape_from_ref_param_shape(
-            ndim_supp=self.ndim_supp,
-            dist_params=dist_params,
-            param_shapes=param_shapes,
-            ref_param_idx=0,
-        )
 
     def __call__(self, mean=None, cov=None, size=None, **kwargs):
         r""" "Draw samples from a multivariate normal distribution.
@@ -898,12 +909,11 @@ class MvNormalRV(RandomVariable):
             # multivariate normals (or any other multivariate distributions),
             # so we need to implement that here
 
-            size = tuple(size or ())
-            if size:
+            if size is None:
+                mean, cov = broadcast_params([mean, cov], [1, 2])
+            else:
                 mean = np.broadcast_to(mean, size + mean.shape[-1:])
                 cov = np.broadcast_to(cov, size + cov.shape[-2:])
-            else:
-                mean, cov = broadcast_params([mean, cov], cls.ndims_params)
 
             res = np.empty(mean.shape)
             for idx in np.ndindex(mean.shape[:-1]):
@@ -932,19 +942,11 @@ class DirichletRV(RandomVariable):
     :math:`\sum_{i=1}^k x_i = 1`.
 
     """
+
     name = "dirichlet"
-    ndim_supp = 1
-    ndims_params = [1]
+    signature = "(a)->(a)"
     dtype = "floatX"
     _print_name = ("Dirichlet", "\\operatorname{Dirichlet}")
-
-    def _supp_shape_from_params(self, dist_params, param_shapes=None):
-        return supp_shape_from_ref_param_shape(
-            ndim_supp=self.ndim_supp,
-            dist_params=dist_params,
-            param_shapes=param_shapes,
-            ref_param_idx=0,
-        )
 
     def __call__(self, alphas, size=None, **kwargs):
         r"""Draw samples from a dirichlet distribution.
@@ -1005,9 +1007,9 @@ class PoissonRV(RandomVariable):
     for :math:`\lambda > 0`.
 
     """
+
     name = "poisson"
-    ndim_supp = 0
-    ndims_params = [0]
+    signature = "()->()"
     dtype = "int64"
     _print_name = ("Poisson", "\\operatorname{Poisson}")
 
@@ -1050,9 +1052,9 @@ class GeometricRV(RandomVariable):
     for :math:`0 \geq p \geq 1`.
 
     """
+
     name = "geometric"
-    ndim_supp = 0
-    ndims_params = [0]
+    signature = "()->()"
     dtype = "int64"
     _print_name = ("Geometric", "\\operatorname{Geometric}")
 
@@ -1092,9 +1094,9 @@ class HyperGeometricRV(RandomVariable):
         f(k; n, N, K) = \frac{{K \choose k} {N-K \choose n-k}}{{N \choose n}}
 
     """
+
     name = "hypergeometric"
-    ndim_supp = 0
-    ndims_params = [0, 0, 0]
+    signature = "(),(),()->()"
     dtype = "int64"
     _print_name = ("HyperGeometric", "\\operatorname{HyperGeometric}")
 
@@ -1140,9 +1142,9 @@ class CauchyRV(ScipyRandomVariable):
     where :math:`\gamma > 0`.
 
     """
+
     name = "cauchy"
-    ndim_supp = 0
-    ndims_params = [0, 0]
+    signature = "(),()->()"
     dtype = "floatX"
     _print_name = ("Cauchy", "\\operatorname{Cauchy}")
 
@@ -1190,9 +1192,9 @@ class HalfCauchyRV(ScipyRandomVariable):
     for :math:`x \geq 0` where :math:`\gamma > 0`.
 
     """
+
     name = "halfcauchy"
-    ndim_supp = 0
-    ndims_params = [0, 0]
+    signature = "(),()->()"
     dtype = "floatX"
     _print_name = ("HalfCauchy", "\\operatorname{HalfCauchy}")
 
@@ -1244,9 +1246,9 @@ class InvGammaRV(ScipyRandomVariable):
         \Gamma(x) = \int_0^{\infty} t^{x-1} e^{-t} \mathrm{d}t
 
     """
+
     name = "invgamma"
-    ndim_supp = 0
-    ndims_params = [0, 0]
+    signature = "(),()->()"
     dtype = "floatX"
     _print_name = ("InverseGamma", "\\operatorname{InverseGamma}")
 
@@ -1294,9 +1296,9 @@ class WaldRV(RandomVariable):
     for :math:`x > 0`, where :math:`\mu > 0` and :math:`\lambda > 0`.
 
     """
+
     name = "wald"
-    ndim_supp = 0
-    ndims_params = [0, 0]
+    signature = "(),()->()"
     dtype = "floatX"
     _print_name_ = ("Wald", "\\operatorname{Wald}")
 
@@ -1341,9 +1343,9 @@ class TruncExponentialRV(ScipyRandomVariable):
     for :math:`0 \leq x \leq b` and :math:`\beta > 0`.
 
     """
+
     name = "truncexpon"
-    ndim_supp = 0
-    ndims_params = [0, 0, 0]
+    signature = "(),(),()->()"
     dtype = "floatX"
     _print_name = ("TruncatedExponential", "\\operatorname{TruncatedExponential}")
 
@@ -1396,9 +1398,9 @@ class StudentTRV(ScipyRandomVariable):
     for :math:`\nu > 0`, :math:`\sigma > 0`.
 
     """
+
     name = "t"
-    ndim_supp = 0
-    ndims_params = [0, 0, 0]
+    signature = "(),(),()->()"
     dtype = "floatX"
     _print_name = ("StudentT", "\\operatorname{StudentT}")
 
@@ -1455,9 +1457,9 @@ class BernoulliRV(ScipyRandomVariable):
     where :math:`0 \leq p \leq 1`.
 
     """
+
     name = "bernoulli"
-    ndim_supp = 0
-    ndims_params = [0]
+    signature = "()->()"
     dtype = "int64"
     _print_name = ("Bernoulli", "\\operatorname{Bernoulli}")
 
@@ -1502,9 +1504,9 @@ class LaplaceRV(RandomVariable):
     with :math:`\lambda > 0`.
 
     """
+
     name = "laplace"
-    ndim_supp = 0
-    ndims_params = [0, 0]
+    signature = "(),()->()"
     dtype = "floatX"
     _print_name = ("Laplace", "\\operatorname{Laplace}")
 
@@ -1548,9 +1550,9 @@ class BinomialRV(RandomVariable):
             f(k; p, n) = {n \choose k} p^k (1-p)^{n-k}
 
     """
+
     name = "binomial"
-    ndim_supp = 0
-    ndims_params = [0, 0]
+    signature = "(),()->()"
     dtype = "int64"
     _print_name = ("Binomial", "\\operatorname{Binomial}")
 
@@ -1592,9 +1594,9 @@ class NegBinomialRV(ScipyRandomVariable):
             f(k; p, n) = {k+n-1 \choose n-1} p^n (1-p)^{k}
 
     """
-    name = "nbinom"
-    ndim_supp = 0
-    ndims_params = [0, 0]
+
+    name = "negative_binomial"
+    signature = "(),()->()"
     dtype = "int64"
     _print_name = ("NegativeBinomial", "\\operatorname{NegativeBinomial}")
 
@@ -1647,9 +1649,9 @@ class BetaBinomialRV(ScipyRandomVariable):
         \operatorname{B}(a, b) = \int_0^1 t^{a-1} (1-t)^{b-1} \mathrm{d}t
 
     """
+
     name = "beta_binomial"
-    ndim_supp = 0
-    ndims_params = [0, 0, 0]
+    signature = "(),(),()->()"
     dtype = "int64"
     _print_name = ("BetaBinomial", "\\operatorname{BetaBinomial}")
 
@@ -1698,9 +1700,9 @@ class GenGammaRV(ScipyRandomVariable):
     for :math:`x > 0`, where :math:`\alpha, \lambda, p > 0`.
 
     """
+
     name = "gengamma"
-    ndim_supp = 0
-    ndims_params = [0, 0, 0]
+    signature = "(),(),()->()"
     dtype = "floatX"
     _print_name = ("GeneralizedGamma", "\\operatorname{GeneralizedGamma}")
 
@@ -1760,9 +1762,9 @@ class MultinomialRV(RandomVariable):
     dimension in the *second* parameter (i.e.  the probabilities vector).
 
     """
+
     name = "multinomial"
-    ndim_supp = 1
-    ndims_params = [0, 1]
+    signature = "(),(p)->(p)"
     dtype = "int64"
     _print_name = ("Multinomial", "\\operatorname{Multinomial}")
 
@@ -1789,24 +1791,14 @@ class MultinomialRV(RandomVariable):
         """
         return super().__call__(n, p, size=size, **kwargs)
 
-    def _supp_shape_from_params(self, dist_params, param_shapes=None):
-        return supp_shape_from_ref_param_shape(
-            ndim_supp=self.ndim_supp,
-            dist_params=dist_params,
-            param_shapes=param_shapes,
-            ref_param_idx=1,
-        )
-
     @classmethod
     def rng_fn(cls, rng, n, p, size):
         if n.ndim > 0 or p.ndim > 1:
-            size = tuple(size or ())
-
-            if size:
+            if size is None:
+                n, p = broadcast_params([n, p], [0, 1])
+            else:
                 n = np.broadcast_to(n, size)
                 p = np.broadcast_to(p, size + p.shape[-1:])
-            else:
-                n, p = broadcast_params([n, p], cls.ndims_params)
 
             res = np.empty(p.shape, dtype=cls.dtype)
             for idx in np.ndindex(p.shape[:-1]):
@@ -1836,8 +1828,7 @@ class CategoricalRV(RandomVariable):
     """
 
     name = "categorical"
-    ndim_supp = 0
-    ndims_params = [1]
+    signature = "(p)->()"
     dtype = "int64"
     _print_name = ("Categorical", "\\operatorname{Categorical}")
 
@@ -1871,7 +1862,8 @@ class CategoricalRV(RandomVariable):
             # to `p.shape[:-1]` in the call to `vsearchsorted` below.
             if len(size) < (p.ndim - 1):
                 raise ValueError("`size` is incompatible with the shape of `p`")
-            for s, ps in zip(reversed(size), reversed(p.shape[:-1])):
+            # strict=False because we are in a hot loop
+            for s, ps in zip(reversed(size), reversed(p.shape[:-1]), strict=False):
                 if s == 1 and ps != 1:
                     raise ValueError("`size` is incompatible with the shape of `p`")
 
@@ -1884,68 +1876,15 @@ class CategoricalRV(RandomVariable):
 categorical = CategoricalRV()
 
 
-class RandIntRV(RandomVariable):
-    r"""A discrete uniform random variable.
-
-    Only available for `RandomStateType`. Use `integers` with `RandomGeneratorType`\s.
-
-    """
-
-    name = "randint"
-    ndim_supp = 0
-    ndims_params = [0, 0]
-    dtype = "int64"
-    _print_name = ("randint", "\\operatorname{randint}")
-
-    def __call__(self, low, high=None, size=None, **kwargs):
-        r"""Draw samples from a discrete uniform distribution.
-
-        Signature
-        ---------
-
-        `() -> ()`
-
-        Parameters
-        ----------
-        low
-            Lower boundary of the output interval. All values generated will
-            be greater than or equal to `low`, unless `high=None`, in which case
-            all values generated are greater than or equal to `0` and
-            smaller than `low` (exclusive).
-        high
-            Upper boundary of the output interval.  All values generated
-            will be smaller than `high` (exclusive).
-        size
-            Sample shape. If the given size is `(m, n, k)`, then `m * n * k`
-            independent, identically distributed samples are
-            returned. Default is `None`, in which case a single
-            sample is returned.
-
-        """
-        if high is None:
-            low, high = 0, low
-        return super().__call__(low, high, size=size, **kwargs)
-
-    def make_node(self, rng, *args, **kwargs):
-        if not isinstance(
-            getattr(rng, "type", None), (RandomStateType, RandomStateSharedVariable)
-        ):
-            raise TypeError("`randint` is only available for `RandomStateType`s")
-        return super().make_node(rng, *args, **kwargs)
-
-
-randint = RandIntRV()
-
-
 class IntegersRV(RandomVariable):
     r"""A discrete uniform random variable.
 
     Only available for `RandomGeneratorType`. Use `randint` with `RandomStateType`\s.
 
     """
+
     name = "integers"
-    ndim_supp = 0
-    ndims_params = [0, 0]
+    signature = "(),()->()"
     dtype = "int64"
     _print_name = ("integers", "\\operatorname{integers}")
 
@@ -1976,125 +1915,194 @@ class IntegersRV(RandomVariable):
             low, high = 0, low
         return super().__call__(low, high, size=size, **kwargs)
 
-    def make_node(self, rng, *args, **kwargs):
-        if not isinstance(
-            getattr(rng, "type", None),
-            (RandomGeneratorType, RandomGeneratorSharedVariable),
-        ):
-            raise TypeError("`integers` is only available for `RandomGeneratorType`s")
-        return super().make_node(rng, *args, **kwargs)
-
 
 integers = IntegersRV()
 
 
-class ChoiceRV(RandomVariable):
+class ChoiceWithoutReplacement(RandomVariable):
     """Randomly choose an element in a sequence."""
 
-    name = "choice"
-    ndim_supp = 0
-    ndims_params = [1, 1, 0]
+    name = "choice_without_replacement"
     dtype = None
-    _print_name = ("choice", "\\operatorname{choice}")
+    _print_name = (
+        "choice_without_replacement",
+        "\\operatorname{choice_without_replacement}",
+    )
 
-    @classmethod
-    def rng_fn(cls, rng, a, p, replace, size):
-        return rng.choice(a, size, replace, p)
+    @property
+    def has_p_param(self) -> bool:
+        return len(self.ndims_params) == 3
 
-    def _supp_shape_from_params(self, *args, **kwargs):
-        raise NotImplementedError()
+    def _supp_shape_from_params(self, dist_params, param_shapes=None):
+        a, *_, core_shape = dist_params
+        a_shape = tuple(a.shape) if param_shapes is None else tuple(param_shapes[0])
+        a_batch_ndim = len(a_shape) - self.ndims_params[0]
+        a_core_shape = a_shape[a_batch_ndim:]
+        core_shape_ndim = core_shape.type.ndim
+        if core_shape_ndim > 1:
+            # Batch core shapes are only valid if homogeneous or broadcasted,
+            # as otherwise they would imply ragged choice arrays
+            core_shape = core_shape[(0,) * (core_shape_ndim - 1)]
+        return tuple(core_shape) + a_core_shape[1:]
 
-    def _infer_shape(self, size, dist_params, param_shapes=None):
-        a, p, _ = dist_params
-        if isinstance(p.type, pytensor.tensor.type_other.NoneTypeT):
-            param_shapes = param_shapes[:1] if param_shapes is not None else None
-            shape = super()._infer_shape(size, (a,), param_shapes)
+    def rng_fn(self, *params):
+        if self.has_p_param:
+            rng, a, p, core_shape, size = params
         else:
-            param_shapes = param_shapes[:2] if param_shapes is not None else None
-            shape = super()._infer_shape(size, (a, p), param_shapes)
+            rng, a, core_shape, size = params
+            p = None
 
-        return shape
+        if core_shape.ndim > 1:
+            core_shape = core_shape[(0,) * (core_shape.ndim - 1)]
+        core_shape = tuple(core_shape)
 
-    def __call__(self, a, size=None, replace=True, p=None, **kwargs):
-        r"""Generate a random sample from an array.
+        batch_ndim = a.ndim - self.ndims_params[0]
 
-        Signature
-        ---------
+        if batch_ndim == 0:
+            # Numpy choice fails with size=() if a.ndim > 1 is batched
+            # https://github.com/numpy/numpy/issues/26518
+            if core_shape == ():
+                core_shape = None
+            return rng.choice(a, p=p, size=core_shape, replace=False)
 
-        `(x) -> ()`
+        # Numpy choice doesn't have a concept of batch dims
+        if size is None:
+            if p is None:
+                size = a.shape[:batch_ndim]
+            else:
+                size = np.broadcast_shapes(
+                    a.shape[:batch_ndim],
+                    p.shape[:batch_ndim],
+                )
 
-        Parameters
-        ----------
-        a
-            The array from which to randomly sample an element. If an int,
-            a sample is generated from `pytensor.tensor.arange(a)`.
-        size
-            Sample shape. If the given size is `(m, n, k)`, then `m * n *
-            k` independent samples are returned. Default is `None`, in
-            which case a single sample is returned.
-        replace
-            When `True`, sampling is performed with replacement.
-        p
-            The probabilities associated with each entry in `a`. If not
-            given, all elements have equal probability.
-        """
-        a = as_tensor_variable(a)
+        a = np.broadcast_to(a, size + a.shape[batch_ndim:])
+        if p is not None:
+            p = np.broadcast_to(p, size + p.shape[batch_ndim:])
 
-        if a.ndim == 0:
-            a = pytensor.tensor.arange(a)
+        a_indexed_shape = a.shape[len(size) + 1 :]
+        out = np.empty(size + core_shape + a_indexed_shape, dtype=a.dtype)
+        for idx in np.ndindex(size):
+            out[idx] = rng.choice(
+                a[idx], p=None if p is None else p[idx], size=core_shape, replace=False
+            )
+        return out
 
+
+def choice(a, size=None, replace=True, p=None, rng=None):
+    r"""Generate a random sample from an array.
+
+
+    Parameters
+    ----------
+    a
+        The array from which to randomly sample an element. If an int,
+        a sample is generated from `pytensor.tensor.arange(a)`.
+    p
+        The probabilities associated with each entry in `a`. If not
+        given, all elements have equal probability.
+    replace
+        When `True`, sampling is performed with replacement.
+    size
+        Sample shape. If the given size is `(m, n, k)`, then `m * n *
+        k` independent samples are returned. Default is `None`, in
+        which case a single sample is returned.
+    """
+    a = as_tensor_variable(a)
+    a_size = a if (a.type.ndim == 0) else a.shape[0]
+
+    if p is not None:
+        p = specify_shape(p, (a_size,))
+
+    if replace or size is None:
+        # In this case we build an expression out of simpler RVs
+        # This is equivalent to the numpy implementation:
+        # https://github.com/numpy/numpy/blob/2a9b9134270371b43223fc848b753fceab96b4a5/numpy/random/_generator.pyx#L905-L914
         if p is None:
-            p = pytensor.tensor.type_other.NoneConst
+            idxs = integers(0, a_size, size=size, rng=rng)
+        else:
+            idxs = categorical(p, size=size, rng=rng)
 
-        if isinstance(replace, bool):
-            replace = pytensor.tensor.constant(np.array(replace))
+        if a.type.ndim == 0:
+            # A was an implicit arange, we don't need to do any indexing
+            # TODO: Add rewrite for this optimization if users passed arange
+            return idxs
 
-        return super().__call__(a, p, replace, size=size, dtype=a.dtype, **kwargs)
+        # TODO: Can use take(a, idxs, axis) to support numpy axis argument to choice
+        return a[idxs]
 
+    # Sampling with p is not as trivial
+    # It involves some form of rejection sampling or iterative shuffling under the hood.
+    # We use a specialized RandomVariable Op for these case.
 
-choice = ChoiceRV()
+    # Because choice happens on a single axis, the core case includes a.ndim-1 dimensions
+    # Furthermore, due to replace=False the draws are not independent, and the core case of
+    # this RV includes the user provided size.
+    # If we have a tensor3 and a size=(2, 3) the signature of the underlying RV is
+    # "(a0, a1, a2), (2) -> (s0, s1, a1, a2)" if p is None and
+    # "(a0, a1, a2), (a0), (2) -> (s0, s1, a1, a2)" otherwise
+
+    core_shape = normalize_size_param(size)
+    core_shape_length = get_vector_length(core_shape)
+    a_ndim = a.type.ndim
+    dtype = a.type.dtype
+
+    a_dims = [f"a{i}" for i in range(a_ndim)]
+    a_sig = ",".join(a_dims)
+    idx_dims = [f"s{i}" for i in range(core_shape_length)]
+    if a_ndim == 0:
+        p_sig = "a"
+        out_dims = idx_dims
+    else:
+        p_sig = a_dims[0]
+        out_dims = idx_dims + a_dims[1:]
+    out_sig = ",".join(out_dims)
+
+    if p is None:
+        signature = f"({a_sig}),({core_shape_length})->({out_sig})"
+    else:
+        signature = f"({a_sig}),({p_sig}),({core_shape_length})->({out_sig})"
+
+    op = ChoiceWithoutReplacement(signature=signature, dtype=dtype)
+
+    params = (a, core_shape) if p is None else (a, p, core_shape)
+    return op(*params, size=None, rng=rng)
 
 
 class PermutationRV(RandomVariable):
     """Randomly shuffle a sequence."""
 
     name = "permutation"
-    ndim_supp = 1
-    ndims_params = [1]
-    dtype = None
     _print_name = ("permutation", "\\operatorname{permutation}")
 
-    @classmethod
-    def rng_fn(cls, rng, x, size):
-        return rng.permutation(x)
-
     def _supp_shape_from_params(self, dist_params, param_shapes=None):
-        return supp_shape_from_ref_param_shape(
-            ndim_supp=self.ndim_supp,
-            dist_params=dist_params,
-            param_shapes=param_shapes,
-            ref_param_idx=0,
-        )
+        [x] = dist_params
+        x_shape = tuple(x.shape if param_shapes is None else param_shapes[0])
+        if self.ndims_params[0] == 0:
+            # Implicit arange, this is only valid for homogeneous arrays
+            # Otherwise it would imply a ragged permutation array.
+            return (x.ravel()[0],)
+        else:
+            batch_x_ndim = x.type.ndim - self.ndims_params[0]
+            return x_shape[batch_x_ndim:]
 
-    def __call__(self, x, **kwargs):
-        r"""Randomly permute a sequence or a range of values.
+    def rng_fn(self, rng, x, size):
+        # We don't have access to the node in rng_fn :(
+        batch_ndim = x.ndim - self.ndims_params[0]
 
-        Signature
-        ---------
+        if batch_ndim:
+            # rng.permutation has no concept of batch dims
+            if size is None:
+                size = x.shape[:batch_ndim]
+            else:
+                x = np.broadcast_to(x, size + x.shape[batch_ndim:])
 
-        `(x) -> (x)`
+            out = np.empty(size + x.shape[batch_ndim:], dtype=x.dtype)
+            for idx in np.ndindex(size):
+                out[idx] = rng.permutation(x[idx])
+            return out
 
-        Parameters
-        ----------
-        x
-            Elements to be shuffled.
-
-        """
-        x = as_tensor_variable(x)
-        return super().__call__(x, dtype=x.dtype, **kwargs)
-
-
-_permutation = PermutationRV()
+        else:
+            return rng.permutation(x.item() if self.ndims_params[0] == 0 else x)
 
 
 def permutation(x, **kwargs):
@@ -2103,7 +2111,7 @@ def permutation(x, **kwargs):
     Signature
     ---------
 
-    `(x) -> (x)`
+    `() -> (x)` if x is a scalar, `(*x) -> (*x)` otherwise
 
     Parameters
     ----------
@@ -2113,16 +2121,22 @@ def permutation(x, **kwargs):
 
     """
     x = as_tensor_variable(x)
-    if x.type.ndim == 0:
-        x = arange(x)
-    return _permutation(x, **kwargs)
+    x_ndim = x.type.ndim
+    x_dtype = x.type.dtype
+    # PermutationRV has a signature () -> (x) if x is a scalar
+    # and (*x) -> (*x) otherwise, with has many entries as the dimensionsality of x
+    if x_ndim == 0:
+        signature = "()->(x)"
+    else:
+        arg_sig = ",".join(f"x{i}" for i in range(x_ndim))
+        signature = f"({arg_sig})->({arg_sig})"
+    return PermutationRV(signature=signature, dtype=x_dtype)(x, **kwargs)
 
 
 __all__ = [
     "permutation",
     "choice",
     "integers",
-    "randint",
     "categorical",
     "multinomial",
     "betabinom",

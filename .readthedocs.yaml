@@ -1,0 +1,9 @@
+version: 2
+sphinx:
+  configuration: doc/conf.py
+conda:
+  environment: doc/environment.yml
+build:
+  os: "ubuntu-lts-latest"
+  tools:
+    python: "mambaforge-latest"

@@ -5,7 +5,6 @@ from contextlib import contextmanager
 from copy import copy
 from functools import singledispatch
 from textwrap import dedent
-from typing import Union
 
 import numba
 import numba.np.unsafe.ndarray as numba_ndarray
@@ -14,11 +13,12 @@ import scipy
 import scipy.special
 from llvmlite import ir
 from numba import types
-from numba.core.errors import TypingError
+from numba.core.errors import NumbaWarning, TypingError
 from numba.cpython.unsafe.tuple import tuple_setitem  # noqa: F401
 from numba.extending import box, overload
 
 from pytensor import config
+from pytensor.compile import NUMBA
 from pytensor.compile.builders import OpFromGraph
 from pytensor.compile.ops import DeepCopyOp
 from pytensor.graph.basic import Apply
@@ -29,7 +29,6 @@ from pytensor.link.numba.dispatch.sparse import CSCMatrixType, CSRMatrixType
 from pytensor.link.utils import (
     compile_function_src,
     fgraph_to_python,
-    unique_name_generator,
 )
 from pytensor.scalar.basic import ScalarType
 from pytensor.scalar.math import Softplus
@@ -37,15 +36,7 @@ from pytensor.sparse import SparseTensorType
 from pytensor.tensor.blas import BatchedDot
 from pytensor.tensor.math import Dot
 from pytensor.tensor.shape import Reshape, Shape, Shape_i, SpecifyShape
-from pytensor.tensor.slinalg import Cholesky, Solve
-from pytensor.tensor.subtensor import (
-    AdvancedIncSubtensor,
-    AdvancedIncSubtensor1,
-    AdvancedSubtensor,
-    AdvancedSubtensor1,
-    IncSubtensor,
-    Subtensor,
-)
+from pytensor.tensor.slinalg import Solve
 from pytensor.tensor.type import TensorType
 from pytensor.tensor.type_other import MakeSlice, NoneConst
 
@@ -58,13 +49,41 @@ def global_numba_func(func):
     return func
 
 
-def numba_njit(*args, **kwargs):
+def numba_njit(*args, fastmath=None, **kwargs):
     kwargs.setdefault("cache", config.numba__cache)
+    kwargs.setdefault("no_cpython_wrapper", True)
+    kwargs.setdefault("no_cfunc_wrapper", True)
+    if fastmath is None:
+        if config.numba__fastmath:
+            # Opinionated default on fastmath flags
+            # https://llvm.org/docs/LangRef.html#fast-math-flags
+            fastmath = {
+                "arcp",  # Allow Reciprocal
+                "contract",  # Allow floating-point contraction
+                "afn",  # Approximate functions
+                "reassoc",
+                "nsz",  # no-signed zeros
+            }
+        else:
+            fastmath = False
+
+    # Suppress cache warning for internal functions
+    # We have to add an ansi escape code for optional bold text by numba
+    warnings.filterwarnings(
+        "ignore",
+        message=(
+            "(\x1b\\[1m)*"  # ansi escape code for bold text
+            "Cannot cache compiled function "
+            '"(numba_funcified_fgraph|store_core_outputs)" '
+            "as it uses dynamic globals"
+        ),
+        category=NumbaWarning,
+    )
 
     if len(args) > 0 and callable(args[0]):
-        return numba.njit(*args[1:], **kwargs)(args[0])
+        return numba.njit(*args[1:], fastmath=fastmath, **kwargs)(args[0])
 
-    return numba.njit(*args, **kwargs)
+    return numba.njit(*args, fastmath=fastmath, **kwargs)
 
 
 def numba_vectorize(*args, **kwargs):
@@ -120,26 +139,24 @@ def get_numba_type(
 
 
 def create_numba_signature(
-    node_or_fgraph: Union[FunctionGraph, Apply],
+    node_or_fgraph: FunctionGraph | Apply,
     force_scalar: bool = False,
     reduce_to_scalar: bool = False,
 ) -> numba.types.Type:
     """Create a Numba type for the signature of an `Apply` node or `FunctionGraph`."""
-    input_types = []
-    for inp in node_or_fgraph.inputs:
-        input_types.append(
-            get_numba_type(
-                inp.type, force_scalar=force_scalar, reduce_to_scalar=reduce_to_scalar
-            )
+    input_types = [
+        get_numba_type(
+            inp.type, force_scalar=force_scalar, reduce_to_scalar=reduce_to_scalar
         )
+        for inp in node_or_fgraph.inputs
+    ]
 
-    output_types = []
-    for out in node_or_fgraph.outputs:
-        output_types.append(
-            get_numba_type(
-                out.type, force_scalar=force_scalar, reduce_to_scalar=reduce_to_scalar
-            )
+    output_types = [
+        get_numba_type(
+            out.type, force_scalar=force_scalar, reduce_to_scalar=reduce_to_scalar
         )
+        for out in node_or_fgraph.outputs
+    ]
 
     if len(output_types) > 1:
         return numba.types.Tuple(output_types)(*input_types)
@@ -218,7 +235,7 @@ def to_scalar(x):
 
 @numba.extending.overload(to_scalar)
 def impl_to_scalar(x):
-    if isinstance(x, (numba.types.Number, numba.types.Boolean)):
+    if isinstance(x, numba.types.Number | numba.types.Boolean):
         return lambda x: x
     elif isinstance(x, numba.types.Array):
         return lambda x: x.item()
@@ -330,7 +347,7 @@ def create_tuple_creator(f, n):
 
         @numba_njit
         def creator(args, creator=creator, i=i):
-            return creator(args) + (f(i, *args),)
+            return (*creator(args), f(i, *args))
 
     return numba_njit(lambda *args: creator(args))
 
@@ -397,9 +414,10 @@ def generate_fallback_impl(op, node=None, storage_map=None, **kwargs):
     else:
 
         def py_perform_return(inputs):
+            # strict=False because we are in a hot loop
             return tuple(
                 out_type.filter(out[0])
-                for out_type, out in zip(output_types, py_perform(inputs))
+                for out_type, out in zip(output_types, py_perform(inputs), strict=False)
             )
 
     @numba_njit
@@ -413,7 +431,12 @@ def generate_fallback_impl(op, node=None, storage_map=None, **kwargs):
 
 @singledispatch
 def numba_funcify(op, node=None, storage_map=None, **kwargs):
-    """Generate a numba function for a given op and apply node."""
+    """Generate a numba function for a given op and apply node.
+
+    The resulting function will usually use the `no_cpython_wrapper`
+    argument in numba, so it can not be called directly from python,
+    but only from other jit functions.
+    """
     return generate_fallback_impl(op, node, storage_map, **kwargs)
 
 
@@ -421,6 +444,11 @@ def numba_funcify(op, node=None, storage_map=None, **kwargs):
 def numba_funcify_OpFromGraph(op, node=None, **kwargs):
     _ = kwargs.pop("storage_map", None)
 
+    # Apply inner rewrites
+    # TODO: Not sure this is the right place to do this, should we have a rewrite that
+    #  explicitly triggers the optimization of the inner graphs of OpFromGraph?
+    #  The C-code defers it to the make_thunk phase
+    NUMBA.optimizer(op.fgraph)
     fgraph_fn = numba_njit(numba_funcify(op.fgraph, **kwargs))
 
     if len(op.fgraph.outputs) == 1:
@@ -452,183 +480,6 @@ def numba_funcify_FunctionGraph(
         fgraph_name=fgraph_name,
         **kwargs,
     )
-
-
-def create_index_func(node, objmode=False):
-    """Create a Python function that assembles and uses an index on an array."""
-
-    unique_names = unique_name_generator(
-        ["subtensor", "incsubtensor", "z"], suffix_sep="_"
-    )
-
-    def convert_indices(indices, entry):
-        if indices and isinstance(entry, Type):
-            rval = indices.pop(0)
-            return unique_names(rval)
-        elif isinstance(entry, slice):
-            return (
-                f"slice({convert_indices(indices, entry.start)}, "
-                f"{convert_indices(indices, entry.stop)}, "
-                f"{convert_indices(indices, entry.step)})"
-            )
-        elif isinstance(entry, type(None)):
-            return "None"
-        else:
-            raise ValueError()
-
-    set_or_inc = isinstance(
-        node.op, (IncSubtensor, AdvancedIncSubtensor1, AdvancedIncSubtensor)
-    )
-    index_start_idx = 1 + int(set_or_inc)
-
-    input_names = [unique_names(v, force_unique=True) for v in node.inputs]
-    op_indices = list(node.inputs[index_start_idx:])
-    idx_list = getattr(node.op, "idx_list", None)
-
-    indices_creation_src = (
-        tuple(convert_indices(op_indices, idx) for idx in idx_list)
-        if idx_list
-        else tuple(input_names[index_start_idx:])
-    )
-
-    if len(indices_creation_src) == 1:
-        indices_creation_src = f"indices = ({indices_creation_src[0]},)"
-    else:
-        indices_creation_src = ", ".join(indices_creation_src)
-        indices_creation_src = f"indices = ({indices_creation_src})"
-
-    if set_or_inc:
-        fn_name = "incsubtensor"
-        if node.op.inplace:
-            index_prologue = f"z = {input_names[0]}"
-        else:
-            index_prologue = f"z = np.copy({input_names[0]})"
-
-        if node.inputs[1].ndim == 0:
-            # TODO FIXME: This is a hack to get around a weird Numba typing
-            # issue.  See https://github.com/numba/numba/issues/6000
-            y_name = f"{input_names[1]}.item()"
-        else:
-            y_name = input_names[1]
-
-        if node.op.set_instead_of_inc:
-            index_body = f"z[indices] = {y_name}"
-        else:
-            index_body = f"z[indices] += {y_name}"
-    else:
-        fn_name = "subtensor"
-        index_prologue = ""
-        index_body = f"z = {input_names[0]}[indices]"
-
-    if objmode:
-        output_var = node.outputs[0]
-
-        if not set_or_inc:
-            # Since `z` is being "created" while in object mode, it's
-            # considered an "outgoing" variable and needs to be manually typed
-            output_sig = f"z='{output_var.dtype}[{', '.join([':'] * output_var.ndim)}]'"
-        else:
-            output_sig = ""
-
-        index_body = f"""
-    with objmode({output_sig}):
-        {index_body}
-        """
-
-    subtensor_def_src = f"""
-def {fn_name}({", ".join(input_names)}):
-    {index_prologue}
-    {indices_creation_src}
-    {index_body}
-    return np.asarray(z)
-    """
-
-    return subtensor_def_src
-
-
-@numba_funcify.register(Subtensor)
-@numba_funcify.register(AdvancedSubtensor1)
-def numba_funcify_Subtensor(op, node, **kwargs):
-    objmode = isinstance(op, AdvancedSubtensor)
-    if objmode:
-        warnings.warn(
-            ("Numba will use object mode to allow run " "AdvancedSubtensor."),
-            UserWarning,
-        )
-
-    subtensor_def_src = create_index_func(node, objmode=objmode)
-
-    global_env = {"np": np}
-    if objmode:
-        global_env["objmode"] = numba.objmode
-
-    subtensor_fn = compile_function_src(
-        subtensor_def_src, "subtensor", {**globals(), **global_env}
-    )
-
-    return numba_njit(subtensor_fn, boundscheck=True)
-
-
-@numba_funcify.register(IncSubtensor)
-def numba_funcify_IncSubtensor(op, node, **kwargs):
-    objmode = isinstance(op, AdvancedIncSubtensor)
-    if objmode:
-        warnings.warn(
-            ("Numba will use object mode to allow run " "AdvancedIncSubtensor."),
-            UserWarning,
-        )
-
-    incsubtensor_def_src = create_index_func(node, objmode=objmode)
-
-    global_env = {"np": np}
-    if objmode:
-        global_env["objmode"] = numba.objmode
-
-    incsubtensor_fn = compile_function_src(
-        incsubtensor_def_src, "incsubtensor", {**globals(), **global_env}
-    )
-
-    return numba_njit(incsubtensor_fn, boundscheck=True)
-
-
-@numba_njit(boundscheck=True)
-def advancedincsubtensor1_inplace_set(x, vals, idxs):
-    for idx, val in zip(idxs, vals):
-        x[idx] = val
-    return x
-
-
-@numba_njit(boundscheck=True)
-def advancedincsubtensor1_inplace_inc(x, vals, idxs):
-    for idx, val in zip(idxs, vals):
-        x[idx] += val
-    return x
-
-
-@numba_funcify.register(AdvancedIncSubtensor1)
-def numba_funcify_AdvancedIncSubtensor1(op, node, **kwargs):
-    inplace = op.inplace
-    set_instead_of_inc = op.set_instead_of_inc
-
-    if set_instead_of_inc:
-        advancedincsubtensor1_inplace = global_numba_func(
-            advancedincsubtensor1_inplace_set
-        )
-    else:
-        advancedincsubtensor1_inplace = global_numba_func(
-            advancedincsubtensor1_inplace_inc
-        )
-
-    if inplace:
-        return global_numba_func(advancedincsubtensor1_inplace)
-    else:
-
-        @numba_njit
-        def advancedincsubtensor1(x, vals, idxs):
-            x = x.copy()
-            return advancedincsubtensor1_inplace(x, vals, idxs)
-
-        return advancedincsubtensor1
 
 
 def deepcopyop(x):
@@ -729,7 +580,7 @@ def numba_funcify_SpecifyShape(op, node, **kwargs):
     func_conditions = [
         f"assert x.shape[{i}] == {shape_input_names}"
         for i, (shape_input, shape_input_names) in enumerate(
-            zip(shape_inputs, shape_input_names)
+            zip(shape_inputs, shape_input_names, strict=True)
         )
         if shape_input is not NoneConst
     ]
@@ -807,41 +658,6 @@ def numba_funcify_Softplus(op, node, **kwargs):
         return direct_cast(value, x_dtype)
 
     return softplus
-
-
-@numba_funcify.register(Cholesky)
-def numba_funcify_Cholesky(op, node, **kwargs):
-    lower = op.lower
-
-    out_dtype = node.outputs[0].type.numpy_dtype
-
-    if lower:
-        inputs_cast = int_to_float_fn(node.inputs, out_dtype)
-
-        @numba_njit
-        def cholesky(a):
-            return np.linalg.cholesky(inputs_cast(a)).astype(out_dtype)
-
-    else:
-        # TODO: Use SciPy's BLAS/LAPACK Cython wrappers.
-
-        warnings.warn(
-            (
-                "Numba will use object mode to allow the "
-                "`lower` argument to `scipy.linalg.cholesky`."
-            ),
-            UserWarning,
-        )
-
-        ret_sig = get_numba_type(node.outputs[0].type)
-
-        @numba_njit
-        def cholesky(a):
-            with numba.objmode(ret=ret_sig):
-                ret = scipy.linalg.cholesky(a, lower=lower).astype(out_dtype)
-            return ret
-
-    return cholesky
 
 
 @numba_funcify.register(Solve)

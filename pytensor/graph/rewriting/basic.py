@@ -1,4 +1,5 @@
 """This module defines the base classes for graph rewriting."""
+
 import abc
 import copy
 import functools
@@ -9,13 +10,12 @@ import sys
 import time
 import traceback
 import warnings
-from collections import UserList, defaultdict, deque
-from collections.abc import Iterable
+from collections import Counter, UserList, defaultdict, deque
+from collections.abc import Callable, Iterable, Sequence
 from collections.abc import Iterable as IterableType
-from collections.abc import Sequence
 from functools import _compose_mro, partial, reduce  # type: ignore
 from itertools import chain
-from typing import TYPE_CHECKING, Callable, Literal, Optional, Union, cast
+from typing import TYPE_CHECKING, Literal
 
 import pytensor
 from pytensor.configdefaults import config
@@ -30,7 +30,7 @@ from pytensor.graph.basic import (
     vars_between,
 )
 from pytensor.graph.features import AlreadyThere, Feature, NodeFinder
-from pytensor.graph.fg import FunctionGraph
+from pytensor.graph.fg import FunctionGraph, Output
 from pytensor.graph.op import Op
 from pytensor.graph.utils import AssocList, InconsistencyError
 from pytensor.misc.ordered_set import OrderedSet
@@ -44,11 +44,11 @@ if TYPE_CHECKING:
 _logger = logging.getLogger("pytensor.graph.rewriting.basic")
 
 RemoveKeyType = Literal["remove"]
-TransformOutputType = Union[
-    bool,
-    Sequence[Variable],
-    dict[Union[Variable, Literal["remove"]], Union[Variable, Sequence[Variable]]],
-]
+TransformOutputType = (
+    bool
+    | Sequence[Variable]
+    | dict[Variable | Literal["remove"], Variable | Sequence[Variable]]
+)
 FailureCallbackType = Callable[
     [
         Exception,
@@ -72,7 +72,7 @@ class MetaNodeRewriterSkip(AssertionError):
 class Rewriter(abc.ABC):
     """Abstract base class for graph/term rewriters."""
 
-    name: Optional[str] = None
+    name: str | None = None
 
     @abc.abstractmethod
     def add_requirements(self, fgraph: FunctionGraph):
@@ -124,8 +124,7 @@ class GraphRewriter(Rewriter):
         """Rewrite a `FunctionGraph`."""
         return self.rewrite(fgraph)
 
-    def add_requirements(self, fgraph):
-        ...
+    def add_requirements(self, fgraph): ...
 
     def print_summary(self, stream=sys.stdout, level=0, depth=-1):
         name = getattr(self, "name", None)
@@ -146,7 +145,7 @@ class GraphRewriter(Rewriter):
 class NodeRewriter(Rewriter):
     """A `Rewriter` that is applied to an `Apply` node."""
 
-    def tracks(self) -> Optional[Sequence[Op]]:
+    def tracks(self) -> Sequence[Op] | None:
         """Return the list of `Op` classes to which this rewrite applies.
 
         Returns ``None`` when the rewrite applies to all nodes.
@@ -250,7 +249,7 @@ class SequentialGraphRewriter(GraphRewriter, UserList):
             A callback used when a failure happens during rewriting.
 
         """
-        if len(rewrites) == 1 and isinstance(rewrites[0], (list, tuple)):
+        if len(rewrites) == 1 and isinstance(rewrites[0], list | tuple):
             rewrites = rewrites[0]
 
         super().__init__(rewrites)
@@ -400,14 +399,14 @@ class SequentialGraphRewriter(GraphRewriter, UserList):
                 file=stream,
             )
         ll = []
-        for rewrite, nb_n in zip(rewrites, nb_nodes):
+        for rewrite, nb_n in zip(rewrites, nb_nodes, strict=True):
             if hasattr(rewrite, "__name__"):
                 name = rewrite.__name__
             else:
                 name = rewrite.name
             idx = rewrites.index(rewrite)
-            ll.append((name, rewrite.__class__.__name__, idx) + nb_n)
-        lll = sorted(zip(prof, ll), key=lambda a: a[0])
+            ll.append((name, rewrite.__class__.__name__, idx, *nb_n))
+        lll = sorted(zip(prof, ll, strict=True), key=lambda a: a[0])
 
         for t, rewrite in lll[::-1]:
             i = rewrite[2]
@@ -480,9 +479,10 @@ class SequentialGraphRewriter(GraphRewriter, UserList):
             new_sub_profile.append(p[6][idx])
 
         new_rewrite = SequentialGraphRewriter(*new_l)
-        new_nb_nodes = []
-        for p1, p2 in zip(prof1[8], prof2[8]):
-            new_nb_nodes.append((p1[0] + p2[0], p1[1] + p2[1]))
+        new_nb_nodes = [
+            (p1[0] + p2[0], p1[1] + p2[1])
+            for p1, p2 in zip(prof1[8], prof2[8], strict=True)
+        ]
         new_nb_nodes.extend(prof1[8][len(new_nb_nodes) :])
         new_nb_nodes.extend(prof2[8][len(new_nb_nodes) :])
 
@@ -636,7 +636,7 @@ class MergeFeature(Feature):
 
             inputs_match = all(
                 node_in is cand_in
-                for node_in, cand_in in zip(node.inputs, candidate.inputs)
+                for node_in, cand_in in zip(node.inputs, candidate.inputs, strict=True)
             )
 
             if inputs_match and node.op == candidate.op:
@@ -650,6 +650,7 @@ class MergeFeature(Feature):
                         node.outputs,
                         candidate.outputs,
                         ["merge"] * len(node.outputs),
+                        strict=True,
                     )
                 )
 
@@ -722,7 +723,9 @@ class MergeOptimizer(GraphRewriter):
                         inputs_match = all(
                             node_in is cand_in
                             for node_in, cand_in in zip(
-                                var.owner.inputs, candidate_var.owner.inputs
+                                var.owner.inputs,
+                                candidate_var.owner.inputs,
+                                strict=True,
                             )
                         )
 
@@ -739,7 +742,7 @@ class MergeOptimizer(GraphRewriter):
                         if any(
                             i in flatten(c.op.destroy_map.values())
                             for c, i in clients
-                            if c != "output" and c.op.destroy_map
+                            if c.op.destroy_map
                         ):
                             continue
 
@@ -951,8 +954,8 @@ class MetaNodeRewriter(NodeRewriter):
 
     def __init__(self):
         self.verbose = config.metaopt__verbose
-        self.track_dict = defaultdict(lambda: [])
-        self.tag_dict = defaultdict(lambda: [])
+        self.track_dict = defaultdict(list)
+        self.tag_dict = defaultdict(list)
         self._tracks = []
         self.rewriters = []
 
@@ -961,9 +964,9 @@ class MetaNodeRewriter(NodeRewriter):
 
         tracks = rewriter.tracks()
         if tracks:
+            self._tracks.extend(tracks)
             for c in tracks:
                 self.track_dict[c].append(rewriter)
-                self._tracks.append(c)
 
         for tag in tag_list:
             self.tag_dict[tag].append(rewriter)
@@ -1092,16 +1095,16 @@ class FromFunctionNodeRewriter(NodeRewriter):
         return getattr(self, "__name__", repr(self))
 
     def __repr__(self):
-        return f"FromFunctionNodeRewriter({repr(self.fn)}, {repr(self._tracks)}, {repr(self.requirements)})"
+        return f"FromFunctionNodeRewriter({self.fn!r}, {self._tracks!r}, {self.requirements!r})"
 
     def print_summary(self, stream=sys.stdout, level=0, depth=-1):
         print(f"{' ' * level}{self.transform} id={id(self)}", file=stream)
 
 
 def node_rewriter(
-    tracks: Optional[Sequence[Union[Op, type]]],
+    tracks: Sequence[Op | type] | None,
     inplace: bool = False,
-    requirements: Optional[tuple[type, ...]] = (),
+    requirements: tuple[type, ...] | None = (),
 ):
     r"""A decorator used to construct `FromFunctionNodeRewriter` instances.
 
@@ -1139,7 +1142,8 @@ def node_rewriter(
         req = requirements
         if inplace:
             dh_handler = dh.DestroyHandler
-            req = tuple(requirements) + (
+            req = (
+                *requirements,
                 lambda fgraph: fgraph.attach_feature(dh_handler()),
             )
         rval = FromFunctionNodeRewriter(f, tracks, req)
@@ -1153,8 +1157,8 @@ class OpToRewriterTracker:
     r"""A container that maps `NodeRewriter`\s to `Op` instances and `Op`-type inheritance."""
 
     def __init__(self):
-        self.tracked_instances: dict[Op, list[NodeRewriter]] = {}
-        self.tracked_types: dict[type, list[NodeRewriter]] = {}
+        self.tracked_instances: dict[Op, list[NodeRewriter]] = defaultdict(list)
+        self.tracked_types: dict[type, list[NodeRewriter]] = defaultdict(list)
         self.untracked_rewrites: list[NodeRewriter] = []
 
     def add_tracker(self, rw: NodeRewriter):
@@ -1166,9 +1170,9 @@ class OpToRewriterTracker:
         else:
             for c in tracks:
                 if isinstance(c, type):
-                    self.tracked_types.setdefault(c, []).append(rw)
+                    self.tracked_types[c].append(rw)
                 else:
-                    self.tracked_instances.setdefault(c, []).append(rw)
+                    self.tracked_instances[c].append(rw)
 
     def _find_impl(self, cls) -> list[NodeRewriter]:
         r"""Returns the `NodeRewriter`\s that apply to `cls` based on inheritance.
@@ -1250,27 +1254,21 @@ class SequentialNodeRewriter(NodeRewriter):
 
         self.profile = profile
         if self.profile:
-            self.time_rewrites: dict[Rewriter, float] = {}
-            self.process_count: dict[Rewriter, int] = {}
-            self.applied_true: dict[Rewriter, int] = {}
-            self.node_created: dict[Rewriter, int] = {}
+            self.time_rewrites: dict[Rewriter, float] = defaultdict(float)
+            self.process_count: dict[Rewriter, int] = Counter()
+            self.applied_true: dict[Rewriter, int] = Counter()
+            self.node_created: dict[Rewriter, int] = Counter()
 
         self.tracker = OpToRewriterTracker()
 
         for o in self.rewrites:
             self.tracker.add_tracker(o)
 
-            if self.profile:
-                self.time_rewrites.setdefault(o, 0.0)
-                self.process_count.setdefault(o, 0)
-                self.applied_true.setdefault(o, 0)
-                self.node_created.setdefault(o, 0)
-
     def __str__(self):
         return getattr(
             self,
             "__name__",
-            f"{type(self).__name__}({','.join([str(o) for o in self.rewrites])})",
+            f"{type(self).__name__}({','.join(str(o) for o in self.rewrites)})",
         )
 
     def tracks(self):
@@ -1300,7 +1298,7 @@ class SequentialNodeRewriter(NodeRewriter):
                     self.process_count[rewrite] += 1
                 if not new_repl:
                     continue
-                if isinstance(new_repl, (tuple, list)):
+                if isinstance(new_repl, tuple | list):
                     new_vars = new_repl
                 else:  # It must be a dict
                     new_vars = list(new_repl.values())
@@ -1321,7 +1319,7 @@ class SequentialNodeRewriter(NodeRewriter):
             # only 1 iteration
             if not self.apply_all_rewrites:
                 return new_repl
-            if not new_vars[0].owner:
+            if new_vars[0].owner is None:
                 # We are at the start of the graph.
                 return new_repl
             if len(new_repl) > 1:
@@ -1440,7 +1438,7 @@ class SubstitutionNodeRewriter(NodeRewriter):
         repl = self.op2.make_node(*node.inputs)
         if self.transfer_tags:
             repl.tag = copy.copy(node.tag)
-            for output, new_output in zip(node.outputs, repl.outputs):
+            for output, new_output in zip(node.outputs, repl.outputs, strict=True):
                 new_output.tag = copy.copy(output.tag)
         return repl.outputs
 
@@ -1541,7 +1539,7 @@ class PatternNodeRewriter(NodeRewriter):
         out_pattern,
         allow_multiple_clients: bool = False,
         skip_identities_fn=None,
-        name: Optional[str] = None,
+        name: str | None = None,
         tracks=(),
         get_nodes=None,
         values_eq_approx=None,
@@ -1577,11 +1575,11 @@ class PatternNodeRewriter(NodeRewriter):
         """
         from pytensor.graph.rewriting.unify import convert_strs_to_vars
 
-        var_map: dict[str, "Var"] = {}
+        var_map: dict[str, Var] = {}
         self.in_pattern = convert_strs_to_vars(in_pattern, var_map=var_map)
         self.out_pattern = convert_strs_to_vars(out_pattern, var_map=var_map)
         self.values_eq_approx = values_eq_approx
-        if isinstance(in_pattern, (list, tuple)):
+        if isinstance(in_pattern, list | tuple):
             self.op = self.in_pattern[0]
         elif isinstance(in_pattern, dict):
             self.op = self.in_pattern["pattern"][0]
@@ -1616,21 +1614,11 @@ class PatternNodeRewriter(NodeRewriter):
         from etuples.core import ExpressionTuple
         from unification import reify, unify
 
-        # TODO: We shouldn't need to iterate like this.
-        if not self.allow_multiple_clients and any(
-            len(fgraph.clients.get(v)) > 1
-            for v in vars_between(fgraph.inputs, node.outputs)
-            if v not in fgraph.inputs
-        ):
-            return False
-
         if get_nodes and self.get_nodes is not None:
             for real_node in self.get_nodes(fgraph, node):
-                if real_node == "output":
-                    continue
                 ret = self.transform(fgraph, real_node, get_nodes=False)
                 if ret is not False and ret is not None:
-                    return dict(zip(real_node.outputs, ret))
+                    return dict(zip(real_node.outputs, ret, strict=True))
 
         if node.op != self.op:
             return False
@@ -1648,12 +1636,21 @@ class PatternNodeRewriter(NodeRewriter):
         if self.values_eq_approx:
             ret.tag.values_eq_approx = self.values_eq_approx
 
+        if not self.allow_multiple_clients:
+            input_vars = list(s.values())
+            if any(
+                len(fgraph.clients[v]) > 1
+                for v in vars_between(input_vars, node.inputs)
+                if v not in input_vars
+            ):
+                return False
+
         if ret.owner:
             if not (
                 len(node.outputs) == len(ret.owner.outputs)
                 and all(
                     o.type.is_super(new_o.type)
-                    for o, new_o in zip(node.outputs, ret.owner.outputs)
+                    for o, new_o in zip(node.outputs, ret.owner.outputs, strict=True)
                 )
             ):
                 return False
@@ -1670,22 +1667,18 @@ class PatternNodeRewriter(NodeRewriter):
             return self.__name__
 
         def pattern_to_str(pattern):
-            if isinstance(pattern, (list, tuple)):
-                return "{}({})".format(
-                    str(pattern[0]),
-                    ", ".join([pattern_to_str(p) for p in pattern[1:]]),
-                )
+            if isinstance(pattern, list | tuple):
+                args = ", ".join(pattern_to_str(p) for p in pattern[1:])
+                return f"{pattern[0]!s}({args})"
             elif isinstance(pattern, dict):
-                return "{} subject to {}".format(
-                    pattern_to_str(pattern["pattern"]),
-                    str(pattern.get("constraint", "no conditions")),
-                )
+                a = pattern_to_str(pattern["pattern"])
+                b = pattern.get("constraint", "no conditions")
+                return f"{a} subject to {b}"
             else:
                 return str(pattern)
 
-        return "{} -> {}".format(
-            pattern_to_str(self.in_pattern),
-            pattern_to_str(self.out_pattern),
+        return (
+            f"{pattern_to_str(self.in_pattern)} -> {pattern_to_str(self.out_pattern)}"
         )
 
     def __repr__(self):
@@ -1783,9 +1776,9 @@ class NodeProcessingGraphRewriter(GraphRewriter):
 
     def __init__(
         self,
-        node_rewriter: Optional[NodeRewriter],
+        node_rewriter: NodeRewriter | None,
         ignore_newtrees: Literal[True, False, "auto"],
-        failure_callback: Optional[FailureCallbackType] = None,
+        failure_callback: FailureCallbackType | None = None,
     ):
         """
 
@@ -1827,11 +1820,11 @@ class NodeProcessingGraphRewriter(GraphRewriter):
     def attach_updater(
         self,
         fgraph: FunctionGraph,
-        importer: Optional[Callable],
-        pruner: Optional[Callable],
-        chin: Optional[Callable] = None,
-        name: Optional[str] = None,
-    ) -> Optional[DispatchingFeature]:
+        importer: Callable | None,
+        pruner: Callable | None,
+        chin: Callable | None = None,
+        name: str | None = None,
+    ) -> DispatchingFeature | None:
         r"""Install `FunctionGraph` listeners to help the navigator deal with the recursion-related functionality.
 
         Parameters
@@ -1862,9 +1855,7 @@ class NodeProcessingGraphRewriter(GraphRewriter):
         fgraph.attach_feature(u)
         return u
 
-    def detach_updater(
-        self, fgraph: FunctionGraph, updater: Optional[DispatchingFeature]
-    ):
+    def detach_updater(self, fgraph: FunctionGraph, updater: DispatchingFeature | None):
         """Undo the work of `attach_updater`.
 
         Parameters
@@ -1886,7 +1877,7 @@ class NodeProcessingGraphRewriter(GraphRewriter):
         self,
         fgraph: FunctionGraph,
         node: Apply,
-        node_rewriter: Optional[NodeRewriter] = None,
+        node_rewriter: NodeRewriter | None = None,
     ):
         r"""Apply `node_rewriter` to `node`.
 
@@ -1934,10 +1925,10 @@ class NodeProcessingGraphRewriter(GraphRewriter):
         remove: list[Variable] = []
         if isinstance(replacements, dict):
             if "remove" in replacements:
-                remove = list(cast(Sequence[Variable], replacements.pop("remove")))
-            old_vars = list(cast(Sequence[Variable], replacements.keys()))
-            replacements = list(cast(Sequence[Variable], replacements.values()))
-        elif not isinstance(replacements, (tuple, list)):
+                remove = list(replacements.pop("remove"))
+            old_vars = list(replacements)
+            replacements = list(replacements.values())
+        elif not isinstance(replacements, tuple | list):
             raise TypeError(
                 f"Node rewriter {node_rewriter} gave wrong type of replacement. "
                 f"Expected list or tuple; got {replacements}"
@@ -1948,7 +1939,7 @@ class NodeProcessingGraphRewriter(GraphRewriter):
             )
         # None in the replacement mean that this variable isn't used
         # and we want to remove it
-        for r, rnew in zip(old_vars, replacements):
+        for r, rnew in zip(old_vars, replacements, strict=True):
             if rnew is None and len(fgraph.clients[r]) > 0:
                 raise ValueError(
                     f"Node rewriter {node_rewriter} tried to remove a variable"
@@ -1958,7 +1949,7 @@ class NodeProcessingGraphRewriter(GraphRewriter):
         # the replacement
         repl_pairs = [
             (r, rnew)
-            for r, rnew in zip(old_vars, replacements)
+            for r, rnew in zip(old_vars, replacements, strict=True)
             if rnew is not r and rnew is not None
         ]
 
@@ -2003,7 +1994,7 @@ class WalkingGraphRewriter(NodeProcessingGraphRewriter):
         node_rewriter: NodeRewriter,
         order: Literal["out_to_in", "in_to_out"] = "in_to_out",
         ignore_newtrees: bool = False,
-        failure_callback: Optional[FailureCallbackType] = None,
+        failure_callback: FailureCallbackType | None = None,
     ):
         if order not in ("out_to_in", "in_to_out"):
             raise ValueError("order must be 'out_to_in' or 'in_to_out'")
@@ -2159,7 +2150,7 @@ class OpKeyGraphRewriter(NodeProcessingGraphRewriter):
 
     def apply(self, fgraph):
         op = self.node_rewriter.op_key()
-        if isinstance(op, (list, tuple)):
+        if isinstance(op, list | tuple):
             q = reduce(list.__iadd__, map(fgraph.get_nodes, op))
         else:
             q = list(fgraph.get_nodes(op))
@@ -2231,12 +2222,12 @@ class EquilibriumGraphRewriter(NodeProcessingGraphRewriter):
     def __init__(
         self,
         rewriters: Sequence[Rewriter],
-        failure_callback: Optional[FailureCallbackType] = None,
+        failure_callback: FailureCallbackType | None = None,
         ignore_newtrees: bool = True,
         tracks_on_change_inputs: bool = False,
-        max_use_ratio: Optional[float] = None,
-        final_rewriters: Optional[Sequence[GraphRewriter]] = None,
-        cleanup_rewriters: Optional[Sequence[GraphRewriter]] = None,
+        max_use_ratio: float | None = None,
+        final_rewriters: Sequence[GraphRewriter] | None = None,
+        cleanup_rewriters: Sequence[GraphRewriter] | None = None,
     ):
         """
 
@@ -2318,7 +2309,7 @@ class EquilibriumGraphRewriter(NodeProcessingGraphRewriter):
         changed = True
         max_use_abort = False
         rewriter_name = None
-        global_process_count = {}
+        global_process_count = Counter()
         start_nb_nodes = len(fgraph.apply_nodes)
         max_nb_nodes = len(fgraph.apply_nodes)
         max_use = max_nb_nodes * self.max_use_ratio
@@ -2326,22 +2317,21 @@ class EquilibriumGraphRewriter(NodeProcessingGraphRewriter):
         loop_timing = []
         loop_process_count = []
         global_rewriter_timing = []
-        time_rewriters = {}
+        time_rewriters = defaultdict(float)
         io_toposort_timing = []
         nb_nodes = []
-        node_created = {}
+        node_created = Counter()
         global_sub_profs = []
         final_sub_profs = []
         cleanup_sub_profs = []
-        for rewriter in (
-            self.global_rewriters
-            + list(self.get_node_rewriters())
-            + self.final_rewriters
-            + self.cleanup_rewriters
-        ):
-            global_process_count.setdefault(rewriter, 0)
-            time_rewriters.setdefault(rewriter, 0)
-            node_created.setdefault(rewriter, 0)
+
+        for rewriter in [
+            *self.global_rewriters,
+            *self.get_node_rewriters(),
+            *self.final_rewriters,
+            *self.cleanup_rewriters,
+        ]:
+            time_rewriters[rewriter] += 0
 
         def apply_cleanup(profs_dict):
             changed = False
@@ -2353,7 +2343,6 @@ class EquilibriumGraphRewriter(NodeProcessingGraphRewriter):
                 time_rewriters[crewriter] += time.perf_counter() - t_rewrite
                 profs_dict[crewriter].append(sub_prof)
                 if change_tracker.changed:
-                    process_count.setdefault(crewriter, 0)
                     process_count[crewriter] += 1
                     global_process_count[crewriter] += 1
                     changed = True
@@ -2361,7 +2350,7 @@ class EquilibriumGraphRewriter(NodeProcessingGraphRewriter):
             return changed
 
         while changed and not max_use_abort:
-            process_count = {}
+            process_count = Counter()
             t0 = time.perf_counter()
             changed = False
             iter_cleanup_sub_profs = {}
@@ -2378,7 +2367,6 @@ class EquilibriumGraphRewriter(NodeProcessingGraphRewriter):
                 time_rewriters[grewrite] += time.perf_counter() - t_rewrite
                 sub_profs.append(sub_prof)
                 if change_tracker.changed:
-                    process_count.setdefault(grewrite, 0)
                     process_count[grewrite] += 1
                     global_process_count[grewrite] += 1
                     changed = True
@@ -2406,12 +2394,14 @@ class EquilibriumGraphRewriter(NodeProcessingGraphRewriter):
                 if node is not current_node:
                     q.append(node)
 
-            chin = None
+            chin: Callable | None = None
             if self.tracks_on_change_inputs:
 
-                def chin(node, i, r, new_r, reason):
-                    if node is not current_node and not isinstance(node, str):
+                def chin_(node, i, r, new_r, reason):
+                    if node is not current_node and not isinstance(node.op, Output):
                         q.append(node)
+
+                chin = chin_
 
             u = self.attach_updater(
                 fgraph, importer, None, chin=chin, name=getattr(self, "name", None)
@@ -2431,7 +2421,6 @@ class EquilibriumGraphRewriter(NodeProcessingGraphRewriter):
                         time_rewriters[node_rewriter] += time.perf_counter() - t_rewrite
                         if not node_rewriter_change:
                             continue
-                        process_count.setdefault(node_rewriter, 0)
                         process_count[node_rewriter] += 1
                         global_process_count[node_rewriter] += 1
                         changed = True
@@ -2459,7 +2448,6 @@ class EquilibriumGraphRewriter(NodeProcessingGraphRewriter):
                 time_rewriters[grewrite] += time.perf_counter() - t_rewrite
                 sub_profs.append(sub_prof)
                 if change_tracker.changed:
-                    process_count.setdefault(grewrite, 0)
                     process_count[grewrite] += 1
                     global_process_count[grewrite] += 1
                     changed = True
@@ -2514,7 +2502,7 @@ class EquilibriumGraphRewriter(NodeProcessingGraphRewriter):
             (start_nb_nodes, end_nb_nodes, max_nb_nodes),
             global_rewriter_timing,
             nb_nodes,
-            time_rewriters,
+            dict(time_rewriters),
             io_toposort_timing,
             node_created,
             global_sub_profs,
@@ -2582,7 +2570,7 @@ class EquilibriumGraphRewriter(NodeProcessingGraphRewriter):
                 d = sorted(
                     loop_process_count[i].items(), key=lambda a: a[1], reverse=True
                 )
-                loop_times = " ".join([str((str(k), v)) for k, v in d[:5]])
+                loop_times = " ".join(str((str(k), v)) for k, v in d[:5])
                 if len(d) > 5:
                     loop_times += " ..."
             print(
@@ -2597,14 +2585,7 @@ class EquilibriumGraphRewriter(NodeProcessingGraphRewriter):
         count_rewrite = []
         not_used = []
         not_used_time = 0
-        process_count = {}
-        for o in (
-            rewrite.global_rewriters
-            + list(rewrite.get_node_rewriters())
-            + list(rewrite.final_rewriters)
-            + list(rewrite.cleanup_rewriters)
-        ):
-            process_count.setdefault(o, 0)
+        process_count = Counter()
         for count in loop_process_count:
             for o, v in count.items():
                 process_count[o] += v
@@ -2651,17 +2632,23 @@ class EquilibriumGraphRewriter(NodeProcessingGraphRewriter):
         print(blanc, "Global, final, and clean up rewriters", file=stream)
         for i in range(len(loop_timing)):
             print(blanc, f"Iter {int(i)}", file=stream)
-            for o, prof in zip(rewrite.global_rewriters, global_sub_profs[i]):
+            for o, prof in zip(
+                rewrite.global_rewriters, global_sub_profs[i], strict=True
+            ):
                 try:
                     o.print_profile(stream, prof, level + 2)
                 except NotImplementedError:
                     print(blanc, "merge not implemented for ", o)
-            for o, prof in zip(rewrite.final_rewriters, final_sub_profs[i]):
+            for o, prof in zip(
+                rewrite.final_rewriters, final_sub_profs[i], strict=True
+            ):
                 try:
                     o.print_profile(stream, prof, level + 2)
                 except NotImplementedError:
                     print(blanc, "merge not implemented for ", o)
-            for o, prof in zip(rewrite.cleanup_rewriters, cleanup_sub_profs[i]):
+            for o, prof in zip(
+                rewrite.cleanup_rewriters, cleanup_sub_profs[i], strict=True
+            ):
                 try:
                     o.print_profile(stream, prof, level + 2)
                 except NotImplementedError:
@@ -2879,7 +2866,7 @@ def pre_greedy_node_rewriter(
                     outs, rewritten_vars = local_recursive_function(
                         rewrite_list, inp, rewritten_vars, depth + 1
                     )
-                    for k, v in zip(inp.owner.outputs, outs):
+                    for k, v in zip(inp.owner.outputs, outs, strict=True):
                         rewritten_vars[k] = v
                     nw_in = outs[inp.owner.outputs.index(inp)]
 
@@ -2897,7 +2884,7 @@ def pre_greedy_node_rewriter(
             if ret is not False and ret is not None:
                 assert isinstance(ret, Sequence)
                 assert len(ret) == len(node.outputs), rewrite
-                for k, v in zip(node.outputs, ret):
+                for k, v in zip(node.outputs, ret, strict=True):
                     rewritten_vars[k] = v
                 results = ret
                 if ret[0].owner:
@@ -3025,7 +3012,7 @@ def check_stack_trace(f_or_fgraph, ops_to_check="last", bug_print="raise"):
             raise ValueError("The string ops_to_check is not recognised")
 
     # if ops_to_check is a list/tuple of ops
-    elif isinstance(ops_to_check, (tuple, list)):
+    elif isinstance(ops_to_check, tuple | list):
         # Separate classes from instances in ops_to_check
         op_instances = []
         op_classes = []
@@ -3073,7 +3060,7 @@ def check_stack_trace(f_or_fgraph, ops_to_check="last", bug_print="raise"):
 
     for node in apply_nodes_to_check:
         for output in node.outputs:
-            if not hasattr(output.tag, "trace") or not output.tag.trace:
+            if not (hasattr(output.tag, "trace") and output.tag.trace):
                 return False
 
     return True
@@ -3092,7 +3079,7 @@ class CheckStackTraceFeature(Feature):
                 apply_nodes_to_check = fgraph.apply_nodes
                 for node in apply_nodes_to_check:
                     for output in node.outputs:
-                        if not hasattr(output.tag, "trace") or not output.tag.trace:
+                        if not (hasattr(output.tag, "trace") and output.tag.trace):
                             output.tag.trace = [
                                 [
                                     (

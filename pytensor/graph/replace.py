@@ -1,7 +1,7 @@
 import warnings
 from collections.abc import Iterable, Mapping, Sequence
 from functools import partial, singledispatch
-from typing import Optional, Union, cast, overload
+from typing import cast, overload
 
 from pytensor.graph.basic import (
     Apply,
@@ -14,10 +14,10 @@ from pytensor.graph.fg import FunctionGraph
 from pytensor.graph.op import Op
 
 
-ReplaceTypes = Union[Iterable[tuple[Variable, Variable]], dict[Variable, Variable]]
+ReplaceTypes = Iterable[tuple[Variable, Variable]] | dict[Variable, Variable]
 
 
-def _format_replace(replace: Optional[ReplaceTypes] = None) -> dict[Variable, Variable]:
+def _format_replace(replace: ReplaceTypes | None = None) -> dict[Variable, Variable]:
     items: dict[Variable, Variable]
     if isinstance(replace, dict):
         # PyLance has issues with type resolution
@@ -38,28 +38,26 @@ def _format_replace(replace: Optional[ReplaceTypes] = None) -> dict[Variable, Va
 @overload
 def clone_replace(
     output: Sequence[Variable],
-    replace: Optional[ReplaceTypes] = None,
+    replace: ReplaceTypes | None = None,
     **rebuild_kwds,
-) -> list[Variable]:
-    ...
+) -> list[Variable]: ...
 
 
 @overload
 def clone_replace(
     output: Variable,
-    replace: Optional[
-        Union[Iterable[tuple[Variable, Variable]], dict[Variable, Variable]]
-    ] = None,
+    replace: Iterable[tuple[Variable, Variable]]
+    | dict[Variable, Variable]
+    | None = None,
     **rebuild_kwds,
-) -> Variable:
-    ...
+) -> Variable: ...
 
 
 def clone_replace(
-    output: Union[Sequence[Variable], Variable],
-    replace: Optional[ReplaceTypes] = None,
+    output: Sequence[Variable] | Variable,
+    replace: ReplaceTypes | None = None,
     **rebuild_kwds,
-) -> Union[list[Variable], Variable]:
+) -> list[Variable] | Variable:
     """Clone a graph and replace subgraphs within it.
 
     It returns a copy of the initial subgraph with the corresponding
@@ -80,7 +78,7 @@ def clone_replace(
     items = list(_format_replace(replace).items())
 
     tmp_replace = [(x, x.type()) for x, y in items]
-    new_replace = [(x, y) for ((_, x), (_, y)) in zip(tmp_replace, items)]
+    new_replace = [(x, y) for ((_, x), (_, y)) in zip(tmp_replace, items, strict=True)]
     _, _outs, _ = rebuild_collect_shared(output, [], tmp_replace, [], **rebuild_kwds)
 
     # TODO Explain why we call it twice ?!
@@ -92,29 +90,27 @@ def clone_replace(
 @overload
 def graph_replace(
     outputs: Variable,
-    replace: Optional[ReplaceTypes] = None,
+    replace: ReplaceTypes | None = None,
     *,
     strict=True,
-) -> Variable:
-    ...
+) -> Variable: ...
 
 
 @overload
 def graph_replace(
     outputs: Sequence[Variable],
-    replace: Optional[ReplaceTypes] = None,
+    replace: ReplaceTypes | None = None,
     *,
     strict=True,
-) -> list[Variable]:
-    ...
+) -> list[Variable]: ...
 
 
 def graph_replace(
-    outputs: Union[Sequence[Variable], Variable],
-    replace: Optional[ReplaceTypes] = None,
+    outputs: Sequence[Variable] | Variable,
+    replace: ReplaceTypes | None = None,
     *,
     strict=True,
-) -> Union[list[Variable], Variable]:
+) -> list[Variable] | Variable:
     """Replace variables in ``outputs`` by ``replace``.
 
     Parameters
@@ -229,22 +225,20 @@ def _vectorize_not_needed(op, node, *batched_inputs):
 def vectorize_graph(
     outputs: Variable,
     replace: Mapping[Variable, Variable],
-) -> Variable:
-    ...
+) -> Variable: ...
 
 
 @overload
 def vectorize_graph(
     outputs: Sequence[Variable],
     replace: Mapping[Variable, Variable],
-) -> Sequence[Variable]:
-    ...
+) -> Sequence[Variable]: ...
 
 
 def vectorize_graph(
-    outputs: Union[Variable, Sequence[Variable]],
+    outputs: Variable | Sequence[Variable],
     replace: Mapping[Variable, Variable],
-) -> Union[Variable, Sequence[Variable]]:
+) -> Variable | Sequence[Variable]:
     """Vectorize outputs graph given mapping from old variables to expanded counterparts version.
 
     Expanded dimensions must be on the left. Behavior is similar to the functional `numpy.vectorize`.
@@ -301,11 +295,16 @@ def vectorize_graph(
     inputs = truncated_graph_inputs(seq_outputs, ancestors_to_include=replace.keys())
     new_inputs = [replace.get(inp, inp) for inp in inputs]
 
-    vect_vars = dict(zip(inputs, new_inputs))
+    vect_vars = dict(zip(inputs, new_inputs, strict=True))
     for node in io_toposort(inputs, seq_outputs):
         vect_inputs = [vect_vars.get(inp, inp) for inp in node.inputs]
         vect_node = vectorize_node(node, *vect_inputs)
-        for output, vect_output in zip(node.outputs, vect_node.outputs):
+        for output, vect_output in zip(node.outputs, vect_node.outputs, strict=True):
+            if output in vect_vars:
+                # This can happen when some outputs of a multi-output node are given a replacement,
+                # while some of the remaining outputs are still needed in the graph.
+                # We make sure we don't overwrite the provided replacement with the newly vectorized output
+                continue
             vect_vars[output] = vect_output
 
     seq_vect_outputs = [vect_vars[out] for out in seq_outputs]

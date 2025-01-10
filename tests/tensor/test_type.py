@@ -1,4 +1,4 @@
-import os.path as path
+from pathlib import Path
 from tempfile import mkdtemp
 
 import numpy as np
@@ -187,7 +187,7 @@ def test_filter_memmap():
     r"""Make sure `TensorType.filter` can handle NumPy `memmap`\s subclasses."""
     data = np.arange(12, dtype=config.floatX)
     data.resize((3, 4))
-    filename = path.join(mkdtemp(), "newfile.dat")
+    filename = Path(mkdtemp()) / "newfile.dat"
     fp = np.memmap(filename, dtype=config.floatX, mode="w+", shape=(3, 4))
 
     test_type = TensorType(config.floatX, shape=(None, None))
@@ -463,7 +463,7 @@ def test_tensor_creator_helpers(helper, ndims):
         helper(shape=list(default_shape))
 
     with pytest.raises(ValueError, match=f"Shape must be a tuple of length {ndims}"):
-        helper(shape=(None,) + default_shape)
+        helper(shape=(None, *default_shape))
 
     with pytest.raises(TypeError, match="Shape entries must be None or integer"):
         helper(shape=(1.0,) * ndims)
